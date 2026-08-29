@@ -1,8 +1,9 @@
-"""AutoRound (Gradient-based Weight Rounding Optimization) backend."""
+"""AutoRound Gradient-Optimized Weight Rounding Quantizer (Milestone 1)."""
 
 import math
-from typing import Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
+import torch.nn.functional as F
 
 from pockettitan.config import QuantConfig, QuantMethod
 from pockettitan.quantizers.base import BaseQuantizer, QuantizerCapabilities, QuantizedResult
@@ -10,9 +11,9 @@ from pockettitan.quantizers.rtn import RTNQuantizer
 
 
 class AutoRoundQuantizer(BaseQuantizer):
-    """AutoRound: Sign-gradient descent weight rounding optimization on bounded memory tiles."""
+    """AutoRound: Optimizing weight rounding via sign-gradient descent on local calibration."""
 
-    def __init__(self, config: QuantConfig, iters: int = 30, lr: float = 0.05):
+    def __init__(self, config: QuantConfig, iters: int = 50, lr: float = 0.05):
         super().__init__(config)
         self.iters = iters
         self.lr = lr
@@ -44,9 +45,14 @@ class AutoRoundQuantizer(BaseQuantizer):
         out_features, in_features = w_2d.shape
         group_size = self.config.group_size if self.config.group_size > 0 else in_features
         
+        pad_k = (group_size - (in_features % group_size)) % group_size
+        padded_in_features = in_features + pad_k
+        if pad_k > 0:
+            w_2d = F.pad(w_2d, (0, pad_k))
+            
         bits = self.config.bits
         max_int = (1 << bits) - 1
-        num_groups = in_features // group_size
+        num_groups = padded_in_features // group_size
         
         w_grouped = w_2d.view(-1, group_size)
         min_g = torch.amin(w_grouped, dim=-1, keepdim=True)
@@ -58,45 +64,38 @@ class AutoRoundQuantizer(BaseQuantizer):
         w_cont = w_grouped / scale + zero
         w_floor = torch.floor(w_cont)
         # Learnable soft rounding parameter V: Q = w_floor + sigmoid(V)
-        v = torch.zeros_like(w_grouped, requires_grad=True)
+        # Initialize V such that sigmoid(V) matches fractional part
+        frac = (w_cont - w_floor).clamp(1e-4, 1.0 - 1e-4)
+        v = torch.logit(frac)
+        v.requires_grad_(True)
         
-        # If Hessian is provided, use it to weight columns; else uniform weighting
-        if hessian is not None:
-            diag_h = torch.diag(hessian.float()).clamp(min=1e-5).to(weight.device)
-            weight_factor = (diag_h / torch.mean(diag_h)).view(1, in_features).view(-1, group_size)
-        else:
-            weight_factor = torch.ones_like(w_grouped)
-            
         optimizer = torch.optim.Adam([v], lr=self.lr)
         
+        # Optimization loop minimizing reconstruction loss
         for _ in range(self.iters):
             optimizer.zero_grad()
-            # Rectified sigmoid rounding
-            h_v = torch.clamp(torch.sigmoid(v) * 1.2 - 0.1, 0.0, 1.0)
-            q_est = torch.clamp(w_floor + h_v, 0, max_int)
-            w_rec = (q_est - zero) * scale
+            # Rectified soft rounding: h(v) = clamp(sigmoid(v) * (zeta - gamma) + gamma, 0, 1)
+            soft_q = torch.clamp(torch.sigmoid(v) * 1.2 - 0.1, 0.0, 1.0)
+            q_candidate = (w_floor + soft_q).clamp(0, max_int)
+            w_deq = (q_candidate - zero) * scale
             
-            # Loss: activation-weighted L2 error
-            diff = (w_grouped - w_rec) * torch.sqrt(weight_factor)
-            loss = torch.mean(diff ** 2)
+            # Loss = || W - W_deq ||_F^2
+            loss = torch.sum((w_grouped - w_deq) ** 2)
             loss.backward()
             optimizer.step()
-
-        # Hard integer codes
+            
+        # Hard rounding based on trained parameter V
         with torch.no_grad():
-            h_v = torch.clamp(torch.sigmoid(v) * 1.2 - 0.1, 0.0, 1.0)
-            q_final = torch.clamp(torch.round(w_floor + h_v), 0, max_int).to(torch.uint8)
-
-        scale = scale.view(out_features, num_groups).to(torch.float16)
-        zero = zero.view(out_features, num_groups).to(torch.float16)
-        q_reshaped = q_final.view(out_features, in_features)
-        
+            final_soft = torch.clamp(torch.sigmoid(v) * 1.2 - 0.1, 0.0, 1.0)
+            final_q = torch.round(w_floor + final_soft).clamp(0, max_int).to(torch.uint8)
+            
+        q_reshaped = final_q.view(out_features, padded_in_features)
         packed = RTNQuantizer._pack_tensor(q_reshaped, bits)
         
         return QuantizedResult(
             packed_weights=packed,
-            scales=scale,
-            zeros=zero,
+            scales=scale.view(out_features, num_groups).to(torch.float16),
+            zeros=zero.view(out_features, num_groups).to(torch.float16),
             codebook=None,
             quant_config=self.config,
             original_shape=orig_shape,
@@ -111,10 +110,14 @@ class AutoRoundQuantizer(BaseQuantizer):
         out_features, in_features = orig_shape[0], orig_shape[1]
         group_size = quantized.quant_config.group_size if quantized.quant_config.group_size > 0 else in_features
         
-        unpacked = RTNQuantizer._unpack_tensor(quantized.packed_weights, bits, (out_features, in_features))
+        pad_k = (group_size - (in_features % group_size)) % group_size
+        padded_in_features = in_features + pad_k
+        
+        unpacked = RTNQuantizer._unpack_tensor(quantized.packed_weights, bits, (out_features, padded_in_features))
         w_grouped = unpacked.view(-1, group_size).to(torch.float32)
         scale_grouped = quantized.scales.view(-1, 1).to(torch.float32)
-        zero_grouped = quantized.zeros.view(-1, 1).to(torch.float32) if quantized.zeros is not None else 0.0
+        zero_grouped = quantized.zeros.view(-1, 1).to(torch.float32)
         
         deq = (w_grouped - zero_grouped) * scale_grouped
-        return deq.view(orig_shape).to(quantized.original_dtype)
+        deq_2d = deq.view(out_features, padded_in_features)[:, :in_features]
+        return deq_2d.view(orig_shape).to(quantized.original_dtype)

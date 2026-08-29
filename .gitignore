@@ -75,6 +75,10 @@ quantized_output/
 valid_model/
 vllm_model/
 test_cli_output/
+qwen_2bit_model/
+qwen3.6_2bit_vllm/
+*_model/
+*_vllm/
 pockettitan_spool/
 *.gguf
 *.safetensors

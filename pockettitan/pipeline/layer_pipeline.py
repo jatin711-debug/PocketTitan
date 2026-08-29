@@ -1,6 +1,7 @@
-"""Layer-by-layer external memory streaming pipeline and incremental ShardWriter."""
+"""Layer-by-layer external memory execution pipeline with live stream progress and resumable state tracking."""
 
 import json
+import os
 import shutil
 import time
 from pathlib import Path
@@ -8,60 +9,73 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import safetensors.torch
 import torch
 from rich.console import Console
-from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn
+from rich.progress import (
+    BarColumn,
+    DownloadColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+    TransferSpeedColumn,
+)
 
-from pockettitan.config import MemoryBudgetConfig, ModelMetadata, QuantConfig, QuantMethod, TensorAddress
-from pockettitan.manifest import ManifestManager, TensorStatus
+from pockettitan.config import (
+    MemoryBudgetConfig,
+    ModelMetadata,
+    QuantConfig,
+    QuantMethod,
+    TensorAddress,
+)
+from pockettitan.manifest import JobManifest, ManifestManager, TensorJobRecord, TensorStatus
 from pockettitan.metadata.repo import fetch_model_config
-from pockettitan.metadata.tensor_index import TensorAddressTable, build_tensor_address_table
+from pockettitan.metadata.tensor_index import build_tensor_address_table
 from pockettitan.quantizers import get_quantizer
-from pockettitan.quantizers.base import QuantizedResult
+from pockettitan.quantizers.base import BaseQuantizer, QuantizedResult
+from pockettitan.scheduler.budget import compute_work_unit_bounds
 from pockettitan.scheduler.tiler import MatrixTiler
 from pockettitan.streaming.reader import LocalTensorReader, RemoteTensorSliceReader
 
 
 class ShardWriter:
-    """Incrementally writes quantized tensors to Safetensors files with strict memory cap."""
+    """Writes quantized tensors into bounded Safetensors shards continuously."""
 
-    def __init__(
-        self,
-        output_dir: Union[str, Path],
-        max_shard_size_mb: float = 2048.0,
-    ):
+    def __init__(self, output_dir: Union[str, Path], max_shard_size_mb: float = 2048.0):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.max_shard_bytes = max_shard_size_mb * 1024 * 1024
+        self.max_shard_bytes = int(max_shard_size_mb * 1024 * 1024)
         
         self.current_shard_idx = 1
         self.current_buffer: Dict[str, torch.Tensor] = {}
         self.current_buffer_bytes = 0
-        self.weight_map: Dict[str, str] = {}
         self.written_shards: List[str] = []
+        self.weight_map: Dict[str, str] = {}
         self.total_written_bytes = 0
 
     def add_tensor(self, name: str, tensor: torch.Tensor) -> None:
-        """Add tensor to staging buffer, flushing shard to disk if size limit reached."""
-        tensor_cpu = tensor.cpu().contiguous()
-        t_bytes = tensor_cpu.nbytes
-        
-        if self.current_buffer_bytes + t_bytes > self.max_shard_bytes and self.current_buffer:
+        """Stage an unquantized or passthrough tensor (e.g. norm, bias, embedding)."""
+        tensor_bytes = tensor.nbytes
+        if self.current_buffer_bytes + tensor_bytes > self.max_shard_bytes and self.current_buffer:
             self.flush()
             
-        self.current_buffer[name] = tensor_cpu
-        self.current_buffer_bytes += t_bytes
+        self.current_buffer[name] = tensor.contiguous().cpu()
+        self.current_buffer_bytes += tensor_bytes
 
-    def add_quantized_result(self, name_prefix: str, result: QuantizedResult) -> None:
-        """Store packed weights, scales, and zeros with standard naming convention."""
-        base_name = name_prefix[:-7] if name_prefix.endswith(".weight") else name_prefix
-        self.add_tensor(f"{base_name}.packed_weight", result.packed_weights)
-        self.add_tensor(f"{base_name}.scales", result.scales)
-        if result.zeros is not None:
-            self.add_tensor(f"{base_name}.zeros", result.zeros)
-        if result.codebook is not None:
-            self.add_tensor(f"{base_name}.codebook", result.codebook)
+    def add_quantized_result(self, name: str, quant_res: QuantizedResult) -> None:
+        """Stage a quantized result (packed weights, scales, zeros)."""
+        packed_tensors = quant_res.to_packed_tensors(name_prefix=name)
+        res_bytes = quant_res.size_bytes()
+        
+        if self.current_buffer_bytes + res_bytes > self.max_shard_bytes and self.current_buffer:
+            self.flush()
+            
+        for k, v in packed_tensors.items():
+            self.current_buffer[k] = v.contiguous().cpu()
+            
+        self.current_buffer_bytes += res_bytes
 
     def flush(self) -> None:
-        """Write current in-memory buffer to disk as a Safetensors file."""
+        """Write current buffer to a new Safetensors shard file."""
         if not self.current_buffer:
             return
             
@@ -69,9 +83,8 @@ class ShardWriter:
         shard_path = self.output_dir / shard_filename
         
         safetensors.torch.save_file(self.current_buffer, str(shard_path))
-        
-        for name in self.current_buffer.keys():
-            self.weight_map[name] = shard_filename
+        for t_name in self.current_buffer.keys():
+            self.weight_map[t_name] = shard_filename
             
         self.written_shards.append(shard_filename)
         self.total_written_bytes += self.current_buffer_bytes
@@ -87,7 +100,6 @@ class ShardWriter:
             with open(self.output_dir / "model.safetensors.index.json", "r", encoding="utf-8") as f:
                 return json.load(f)
 
-        # Rename shards with total count: model-00001-of-00005.safetensors
         total_shards = max(1, len(self.written_shards))
         new_weight_map: Dict[str, str] = {}
         
@@ -103,7 +115,6 @@ class ShardWriter:
 
         self.weight_map = new_weight_map
 
-        # Write model.safetensors.index.json
         index_data = {
             "metadata": {
                 "total_size": self.total_written_bytes,
@@ -114,12 +125,10 @@ class ShardWriter:
         with open(self.output_dir / "model.safetensors.index.json", "w", encoding="utf-8") as f:
             json.dump(index_data, f, indent=2)
 
-        # Write config.json
         if base_config:
             with open(self.output_dir / "config.json", "w", encoding="utf-8") as f:
                 json.dump(base_config, f, indent=2)
                 
-        # Write quant_config.json
         if quant_config:
             with open(self.output_dir / "quant_config.json", "w", encoding="utf-8") as f:
                 json.dump(quant_config.model_dump(), f, indent=2)
@@ -128,7 +137,7 @@ class ShardWriter:
 
 
 class QuantizationPipeline:
-    """Layer-by-layer external memory execution pipeline."""
+    """Layer-by-layer external memory execution pipeline with live stream progress."""
 
     def __init__(
         self,
@@ -159,13 +168,10 @@ class QuantizationPipeline:
 
     def _should_quantize_tensor(self, name: str, shape: List[int]) -> bool:
         """Determine if a tensor should be quantized or preserved in FP16/BF16."""
-        # 1. 1D tensors (biases, norms, scales) are preserved in full precision
         if len(shape) <= 1:
             return False
             
-        # 2. Embeddings, LM heads, and MoE routers preserved by default for stability
         preserve_keywords = ["embed_tokens", "wte", "lm_head", "router", "gate.weight"]
-        # If user explicitly requested all linear layers
         for kw in preserve_keywords:
             if kw in name and "mlp.experts" not in name:
                 return False
@@ -173,7 +179,7 @@ class QuantizationPipeline:
         return True
 
     def run(self) -> Dict[str, Any]:
-        """Execute complete external memory quantization pipeline with resume support."""
+        """Execute complete external memory quantization pipeline with live stream progress."""
         start_time = time.time()
         self.console.print(f"[bold cyan]Starting PocketTitan Quantization Pipeline for {self.model_id_or_path}[/bold cyan]")
         
@@ -195,29 +201,42 @@ class QuantizationPipeline:
             )
             
         self.console.print(f"Total Tensors in Index: {total_tensors} | Execution Device: {self.quant_config.device}")
-        
         base_config = fetch_model_config(self.model_id_or_path, token=self.token)
         
-        with Progress(
+        progress = Progress(
+            SpinnerColumn(),
             TextColumn("[bold blue]{task.description}"),
             BarColumn(),
             TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            DownloadColumn(),
+            TransferSpeedColumn(),
             TimeRemainingColumn(),
             console=self.console,
-        ) as progress:
-            task_id = progress.add_task("Quantizing model...", total=total_tensors)
+        )
+        
+        with progress:
+            main_task = progress.add_task(f"[bold green]Overall Progress ({total_tensors} tensors)", total=total_tensors)
+            stream_task = progress.add_task("[cyan]Streaming tensor...", total=100, visible=False)
             
             for idx, addr in enumerate(all_tensors, start=1):
                 rec = manifest.records.get(addr.name)
                 if rec and rec.status == TensorStatus.COMPLETED:
-                    progress.update(task_id, description=f"Skipping completed {addr.name[:25]}...", advance=1)
+                    progress.update(main_task, description=f"[green]Skipping completed {addr.name[:25]}...", advance=1)
                     continue
                     
-                progress.update(task_id, description=f"Processing {addr.name[:35]}...", advance=1)
+                progress.update(main_task, description=f"[blue]Processing ({idx}/{total_tensors}): {addr.name[:32]}...")
                 
-                # Check if tensor should be quantized
+                # Setup download callback for this tensor
+                expected_bytes = addr.size_bytes
+                progress.reset(stream_task, total=expected_bytes, visible=True, description=f"[cyan]Streaming {addr.name[:25]}...")
+                
+                def on_chunk(downloaded_chunk_len: int, total_b: int):
+                    progress.advance(stream_task, downloaded_chunk_len)
+                    
+                # Fetch tensor data with chunk callback
                 if self._should_quantize_tensor(addr.name, addr.shape):
-                    tensor_data = self.reader.read_tensor(addr)
+                    tensor_data = self.reader.read_tensor(addr, chunk_callback=on_chunk if not self.is_local else None)
+                    progress.update(stream_task, visible=False)
                     
                     q_res, peak_vram = self.tiler.quantize_matrix(
                         tensor_data,
@@ -228,7 +247,8 @@ class QuantizationPipeline:
                     self.shard_writer.add_quantized_result(addr.name, q_res)
                     del tensor_data, q_res
                 else:
-                    tensor_data = self.reader.read_tensor(addr)
+                    tensor_data = self.reader.read_tensor(addr, chunk_callback=on_chunk if not self.is_local else None)
+                    progress.update(stream_task, visible=False)
                     self.shard_writer.add_tensor(addr.name, tensor_data)
                     del tensor_data
                     
@@ -237,6 +257,7 @@ class QuantizationPipeline:
                     manifest.completed_tensors += 1
                     manifest_mgr.save(manifest)
                     
+                progress.advance(main_task, 1)
                 if self.progress_callback:
                     self.progress_callback(addr.name, idx, total_tensors)
 

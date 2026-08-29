@@ -3,7 +3,7 @@
 import io
 import math
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import numpy as np
 import safetensors.torch
 import torch
@@ -16,24 +16,15 @@ from pockettitan.metadata.safetensors_header import (
 )
 
 
-DTYPE_MAP_TORCH = {
-    "F64": torch.float64,
-    "F32": torch.float32,
-    "F16": torch.float16,
-    "BF16": torch.bfloat16,
-    "I64": torch.int64,
-    "I32": torch.int32,
-    "I16": torch.int16,
-    "I8": torch.int8,
-    "U8": torch.uint8,
-    "BOOL": torch.bool,
-}
-
 DTYPE_MAP_NUMPY = {
     "F64": np.float64,
     "F32": np.float32,
     "F16": np.float16,
-    "BF16": np.uint16,  # NumPy does not natively support bfloat16 in older versions, view as uint16
+    "BF16": np.uint16,
+    "F8_E4M3": np.uint8,
+    "F8_E5M2": np.uint8,
+    "FLOAT8_E4M3FN": np.uint8,
+    "FLOAT8_E5M2": np.uint8,
     "I64": np.int64,
     "I32": np.int32,
     "I16": np.int16,
@@ -60,10 +51,17 @@ class LocalTensorReader:
             )
         return self._handles[shard_name]
 
-    def read_tensor(self, tensor_addr: TensorAddress) -> torch.Tensor:
+    def read_tensor(
+        self,
+        tensor_addr: TensorAddress,
+        chunk_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> torch.Tensor:
         """Read full tensor via zero-copy memory mapping."""
         handle = self._get_handle(tensor_addr.shard)
-        return handle.get_tensor(tensor_addr.name)
+        t = handle.get_tensor(tensor_addr.name)
+        if t.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+            t = t.to(torch.float16)
+        return t
 
     def read_slice(
         self,
@@ -73,9 +71,11 @@ class LocalTensorReader:
     ) -> torch.Tensor:
         """Read a sub-slice of a 2D matrix directly without loading the full tensor."""
         handle = self._get_handle(tensor_addr.shard)
-        # safetensors get_slice supports slice indexing
         tensor_slice = handle.get_slice(tensor_addr.name)
-        return tensor_slice[row_start:row_end, :]
+        t = tensor_slice[row_start:row_end, :]
+        if t.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+            t = t.to(torch.float16)
+        return t
 
     def close(self) -> None:
         """Close open file handles."""
@@ -97,7 +97,11 @@ class RemoteTensorSliceReader:
         if token:
             self.headers["Authorization"] = f"Bearer {token}"
 
-    def read_tensor(self, tensor_addr: TensorAddress) -> torch.Tensor:
+    def read_tensor(
+        self,
+        tensor_addr: TensorAddress,
+        chunk_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> torch.Tensor:
         """Fetch exact tensor bytes over network using HTTP Range header."""
         url = hf_hub_url(repo_id=self.model_id, filename=tensor_addr.shard)
         raw_bytes = fetch_remote_bytes(
@@ -105,6 +109,7 @@ class RemoteTensorSliceReader:
             byte_start=tensor_addr.byte_start,
             byte_end=tensor_addr.byte_end - 1,
             headers=self.headers,
+            chunk_callback=chunk_callback,
         )
         return self._bytes_to_tensor(raw_bytes, tensor_addr.dtype, tensor_addr.shape)
 
@@ -117,7 +122,6 @@ class RemoteTensorSliceReader:
         """Fetch exact row chunk over network using computed byte offsets."""
         shape = tensor_addr.shape
         if len(shape) != 2:
-            # Fallback to full tensor
             full_t = self.read_tensor(tensor_addr)
             return full_t[row_start:row_end]
             
@@ -143,11 +147,18 @@ class RemoteTensorSliceReader:
         dtype_str: str,
         shape: List[int],
     ) -> torch.Tensor:
-        """Convert raw bytes to PyTorch tensor matching dtype and shape."""
-        np_dtype = DTYPE_MAP_NUMPY.get(dtype_str, np.float16)
+        """Convert raw bytes to PyTorch tensor matching dtype and shape with full FP8/BF16 conversion."""
+        dtype_upper = dtype_str.upper()
+        np_dtype = DTYPE_MAP_NUMPY.get(dtype_upper, np.float16)
         arr = np.frombuffer(raw_bytes, dtype=np_dtype)
         
-        if dtype_str == "BF16":
+        if dtype_upper in ["F8_E4M3", "FLOAT8_E4M3FN"]:
+            # PyTorch FP8 E4M3 format -> cast to float16 for standard computation
+            torch_tensor = torch.from_numpy(arr.copy()).view(torch.float8_e4m3fn).to(torch.float16)
+        elif dtype_upper in ["F8_E5M2", "FLOAT8_E5M2"]:
+            # PyTorch FP8 E5M2 format -> cast to float16
+            torch_tensor = torch.from_numpy(arr.copy()).view(torch.float8_e5m2).to(torch.float16)
+        elif dtype_upper == "BF16":
             # Reinterpret uint16 array as bfloat16 tensor
             torch_tensor = torch.from_numpy(arr.copy()).view(torch.bfloat16)
         else:

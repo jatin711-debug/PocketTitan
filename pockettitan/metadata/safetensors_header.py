@@ -1,61 +1,56 @@
-"""Fast Safetensors header parser for local files and remote HTTP ranges."""
+"""Fast binary header parser for Safetensors files (Milestone 0)."""
 
 import json
 import struct
-import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 
 class RedirectRangeHandler(urllib.request.HTTPRedirectHandler):
-    """Preserve HTTP Range headers when following CDN redirects."""
+    """Custom HTTP redirect handler that preserves Range and Authorization headers across 302/307 redirects."""
+
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return urllib.request.Request(
-            newurl,
-            headers={
-                "Range": req.get_header("Range"),
-                "User-Agent": "PocketTitan/0.1.0",
-            },
-        )
+        new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new_req is None:
+            return None
+            
+        # Copy critical streaming headers across redirect hops
+        for header_name in ["Range", "Authorization", "User-Agent"]:
+            val = req.get_header(header_name, None)
+            if val is not None:
+                new_req.add_unredirected_header(header_name, val)
+        return new_req
 
 
-def parse_safetensors_header_from_bytes(raw_bytes: bytes) -> Tuple[Dict[str, Any], int]:
-    """Parse Safetensors JSON header from raw byte sequence.
-    
-    Returns:
-        (header_dict, total_header_bytes) where total_header_bytes = 8 + header_length.
-    """
-    if len(raw_bytes) < 8:
-        raise ValueError(f"Payload too short for Safetensors header: {len(raw_bytes)} bytes")
-    
-    header_length = struct.unpack("<Q", raw_bytes[:8])[0]
+def parse_safetensors_header_from_bytes(data: bytes) -> Tuple[Dict[str, Any], int]:
+    """Parse header from in-memory bytes."""
+    if len(data) < 8:
+        raise ValueError("Data smaller than 8 bytes, invalid Safetensors.")
+    header_length = struct.unpack("<Q", data[:8])[0]
     total_header_bytes = 8 + header_length
-    
-    if len(raw_bytes) < total_header_bytes:
-        raise ValueError(
-            f"Buffer contains {len(raw_bytes)} bytes, but header requires {total_header_bytes} bytes"
-        )
-    
-    header_json_str = raw_bytes[8:total_header_bytes].decode("utf-8")
-    header_dict = json.loads(header_json_str)
-    return header_dict, total_header_bytes
+    if len(data) < total_header_bytes:
+        raise ValueError(f"Incomplete header. Expected {header_length} bytes.")
+    header_json_str = data[8:total_header_bytes].decode("utf-8")
+    return json.loads(header_json_str), total_header_bytes
 
 
 def parse_local_safetensors_header(file_path: Union[str, Path]) -> Tuple[Dict[str, Any], int]:
-    """Read only the header portion of a local Safetensors file."""
+    """Read only the first 8 bytes + N header bytes of a local Safetensors file."""
     path = Path(file_path)
     if not path.exists():
-        raise FileNotFoundError(f"File not found: {path}")
-    
+        raise FileNotFoundError(f"Safetensors file not found: {path}")
+
     with open(path, "rb") as f:
         header_len_bytes = f.read(8)
         if len(header_len_bytes) < 8:
-            raise ValueError(f"Invalid Safetensors file {path}: less than 8 bytes")
+            raise ValueError(f"File {path} is smaller than 8 bytes, invalid Safetensors.")
+        
         header_length = struct.unpack("<Q", header_len_bytes)[0]
         header_json_bytes = f.read(header_length)
         if len(header_json_bytes) < header_length:
-            raise ValueError(f"Incomplete header in Safetensors file {path}")
+            raise ValueError(f"Incomplete header in {path}. Expected {header_length} bytes.")
+
         header_json_str = header_json_bytes.decode("utf-8")
         return json.loads(header_json_str), 8 + header_length
 
@@ -100,9 +95,10 @@ def fetch_remote_bytes(
     byte_start: int,
     byte_end: int,
     headers: Optional[Dict[str, str]] = None,
-    timeout: int = 30,
+    timeout: int = 60,
+    chunk_callback: Optional[Callable[[int, int], None]] = None,
 ) -> bytes:
-    """Fetch exact byte range from remote URL with redirect range preservation."""
+    """Fetch exact byte range from remote URL with redirect range preservation and chunk callback."""
     opener = urllib.request.build_opener(RedirectRangeHandler)
     req_headers = {
         "User-Agent": "PocketTitan/0.1.0",
@@ -111,9 +107,22 @@ def fetch_remote_bytes(
     if headers:
         req_headers.update(headers)
         
+    total_expected = (byte_end - byte_start) + 1
     req = urllib.request.Request(url, headers=req_headers)
+    
     with opener.open(req, timeout=timeout) as resp:
-        return resp.read()
+        if chunk_callback is None:
+            return resp.read()
+            
+        chunks = []
+        chunk_size = 4 * 1024 * 1024  # 4 MiB buffer
+        while True:
+            c = resp.read(chunk_size)
+            if not c:
+                break
+            chunks.append(c)
+            chunk_callback(len(c), total_expected)
+        return b"".join(chunks)
 
 
 def parse_safetensors_header(

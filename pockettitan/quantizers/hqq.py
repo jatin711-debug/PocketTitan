@@ -1,8 +1,9 @@
-"""Half-Quadratic Quantization (HQQ) optimization backend."""
+"""Half-Quadratic Quantization (HQQ) Backend with Proximal Coordinate Descent (Milestone 1)."""
 
 import math
-from typing import Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
+import torch.nn.functional as F
 
 from pockettitan.config import QuantConfig, QuantMethod
 from pockettitan.quantizers.base import BaseQuantizer, QuantizerCapabilities, QuantizedResult
@@ -10,9 +11,9 @@ from pockettitan.quantizers.rtn import RTNQuantizer
 
 
 class HQQQuantizer(BaseQuantizer):
-    """Half-Quadratic Quantization (HQQ) for ultra-low bit-widths (1b, 2b, 3b, 4b, 8b)."""
+    """HQQ Quantizer using proximal alternating optimization for scale and zero points."""
 
-    def __init__(self, config: QuantConfig, max_iters: int = 15):
+    def __init__(self, config: QuantConfig, max_iters: int = 5):
         super().__init__(config)
         self.max_iters = max_iters
 
@@ -21,8 +22,8 @@ class HQQQuantizer(BaseQuantizer):
         return QuantizerCapabilities(
             name="hqq",
             requires_calibration=False,
-            legal_split_axes=(0, 1),
-            requires_full_input_dim=False,
+            legal_split_axes=(0,),
+            requires_full_input_dim=True,
             requires_full_output_dim=False,
             global_state=None,
             supports_cpu=True,
@@ -43,10 +44,12 @@ class HQQQuantizer(BaseQuantizer):
         out_features, in_features = w_2d.shape
         group_size = self.config.group_size if self.config.group_size > 0 else in_features
         
-        if in_features % group_size != 0:
-            raise ValueError(f"in_features ({in_features}) must be divisible by group_size ({group_size})")
+        pad_k = (group_size - (in_features % group_size)) % group_size
+        padded_in_features = in_features + pad_k
+        if pad_k > 0:
+            w_2d = F.pad(w_2d, (0, pad_k))
             
-        num_groups_per_row = in_features // group_size
+        num_groups_per_row = padded_in_features // group_size
         w_grouped = w_2d.view(-1, group_size)
         
         bits = self.config.bits
@@ -78,7 +81,7 @@ class HQQQuantizer(BaseQuantizer):
         
         scale = scale.view(out_features, num_groups_per_row).to(torch.float16)
         zero = zero.view(out_features, num_groups_per_row).to(torch.float16)
-        q_reshaped = q_uint.view(out_features, in_features)
+        q_reshaped = q_uint.view(out_features, padded_in_features)
         
         packed = RTNQuantizer._pack_tensor(q_reshaped, bits)
         del q_reshaped, q_uint
@@ -101,10 +104,14 @@ class HQQQuantizer(BaseQuantizer):
         out_features, in_features = orig_shape[0], orig_shape[1]
         group_size = quantized.quant_config.group_size if quantized.quant_config.group_size > 0 else in_features
         
-        unpacked = RTNQuantizer._unpack_tensor(quantized.packed_weights, bits, (out_features, in_features))
+        pad_k = (group_size - (in_features % group_size)) % group_size
+        padded_in_features = in_features + pad_k
+        
+        unpacked = RTNQuantizer._unpack_tensor(quantized.packed_weights, bits, (out_features, padded_in_features))
         w_grouped = unpacked.view(-1, group_size).to(torch.float32)
         scale_grouped = quantized.scales.view(-1, 1).to(torch.float32)
         zero_grouped = quantized.zeros.view(-1, 1).to(torch.float32)
         
         deq = (w_grouped - zero_grouped) * scale_grouped
-        return deq.view(orig_shape).to(quantized.original_dtype)
+        deq_2d = deq.view(out_features, padded_in_features)[:, :in_features]
+        return deq_2d.view(orig_shape).to(quantized.original_dtype)

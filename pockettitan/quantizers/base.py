@@ -43,6 +43,19 @@ class QuantizedResult:
             total += self.codebook.nbytes
         return total
 
+    def to_packed_tensors(self, name_prefix: str = "weight") -> Dict[str, torch.Tensor]:
+        """Convert quantized result to standard named tensors for Safetensors serialization."""
+        base_name = name_prefix.rsplit(".weight", 1)[0] if name_prefix.endswith(".weight") else name_prefix
+        tensors = {
+            f"{base_name}.packed_weight": self.packed_weights,
+            f"{base_name}.scales": self.scales,
+        }
+        if self.zeros is not None:
+            tensors[f"{base_name}.zeros"] = self.zeros
+        if self.codebook is not None:
+            tensors[f"{base_name}.codebook"] = self.codebook
+        return tensors
+
 
 class BaseQuantizer(ABC):
     """Abstract base class for all pluggable PocketTitan quantizers."""
@@ -61,19 +74,12 @@ class BaseQuantizer(ABC):
         self,
         weight: torch.Tensor,
         hessian: Optional[torch.Tensor] = None,
+        outlier_indices: Optional[torch.Tensor] = None,
     ) -> QuantizedResult:
-        """Quantize a 2D weight matrix (or sliced tile) under memory constraints.
-        
-        Args:
-            weight: Input weight tensor of shape [out_features, in_features] on target device.
-            hessian: Optional second-order Hessian matrix [in_features, in_features] for activation-aware methods.
-            
-        Returns:
-            QuantizedResult containing packed weights, scales, zeros, and metadata.
-        """
+        """Quantize a full weight matrix or micro-tile."""
         pass
 
     @abstractmethod
     def dequantize(self, quantized: QuantizedResult) -> torch.Tensor:
-        """Reconstruct float/half weight tensor from quantized representation for verification."""
+        """Reconstruct float approximation from quantized representations."""
         pass
