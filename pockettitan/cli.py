@@ -1,6 +1,8 @@
 """PocketTitan Command Line Interface."""
 
 import json
+import sys
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Optional
 import torch
@@ -12,6 +14,8 @@ from rich.panel import Panel
 from rich.table import Table
 
 from pockettitan import __version__
+from pockettitan.audit import Capability, build_audit_report, get_precision_preset, scan_checkpoint
+from pockettitan.audit.report import render_report
 from pockettitan.config import MemoryBudgetConfig, QuantConfig, QuantMethod, parse_memory_to_mb
 from pockettitan.export.validator import CheckpointValidator
 from pockettitan.exporters.gguf import GGUFExporter
@@ -32,6 +36,30 @@ app = typer.Typer(
     help="External-memory post-training quantization engine for extreme-scale LLMs.",
     add_completion=False,
 )
+
+
+def _configure_stdio_encoding() -> None:
+    """Make stdout/stderr safe for the report glyphs.
+
+    Windows consoles default to a legacy codepage (cp1252) that cannot encode
+    the box-drawing and status characters Rich emits, which crashes mid-render
+    once output is piped. Prefer UTF-8; degrade to replacement characters rather
+    than raising.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            try:
+                reconfigure(errors="replace")
+            except (ValueError, OSError):
+                pass
+
+
+_configure_stdio_encoding()
 console = Console()
 
 
@@ -434,6 +462,71 @@ def inspect_layer(
     runner = PocketTitanModelRunner(checkpoint_dir)
     res = runner.inspect_layer_sample(layer)
     console.print(f"[bold green]Inspection Result:[/bold green] {res}")
+
+
+@app.command()
+def audit(
+    model: str = typer.Argument(..., help="Hugging Face repo ID (e.g. Qwen/Qwen3.8-Flash-Next) or local directory path"),
+    token: Optional[str] = typer.Option(None, "--token", "-t", help="Hugging Face API token"),
+    precision: str = typer.Option("pt-q4e", "--precision", "-p", help="Precision preset: pt-q4e, pt-q2e, bf16, int8, int4, int3, int2, ternary"),
+    features: str = typer.Option("text", "--features", help="Comma-separated capabilities to keep: text,vision,mtp"),
+    ram_budget: str = typer.Option("7GB", "--ram-budget", help="RAM available for the expert cache (drives roofline slot count)"),
+    workers: int = typer.Option(16, "--workers", help="Parallel shard header requests"),
+    no_strict: bool = typer.Option(False, "--no-strict", help="Continue past unreadable shards instead of failing"),
+    json_output: bool = typer.Option(False, "--json", help="Emit the report as JSON instead of tables"),
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Write the report JSON to this path"),
+):
+    """R0: Audit a checkpoint — component decomposition, activated params/token, storage, state, and SSD roofline."""
+    try:
+        selected = [Capability(f.strip().lower()) for f in features.split(",") if f.strip()]
+    except ValueError:
+        console.print(
+            f"[bold red]Invalid --features '{features}'.[/bold red] Valid values: "
+            + ", ".join(c.value for c in Capability)
+        )
+        raise typer.Exit(code=1)
+
+    if not selected:
+        console.print("[bold red]--features must name at least one capability.[/bold red]")
+        raise typer.Exit(code=1)
+
+    try:
+        precision_map = get_precision_preset(precision)
+    except KeyError as e:
+        console.print(f"[bold red]{e}[/bold red]")
+        raise typer.Exit(code=1)
+
+    ram_budget_bytes = parse_memory_to_mb(ram_budget) * 1024.0 * 1024.0
+
+    if not json_output:
+        console.print(
+            f"[bold green]Auditing [cyan]{model}[/cyan][/bold green] "
+            f"[dim](precision={precision_map.name}, features={','.join(c.value for c in selected)})[/dim]"
+        )
+
+    try:
+        with console.status("[green]Reading shard headers...", spinner="dots") if not json_output else nullcontext():
+            scan = scan_checkpoint(model, token=token, max_workers=workers, strict=not no_strict)
+        report = build_audit_report(
+            scan, precision_map=precision_map, features=selected, ram_budget_bytes=ram_budget_bytes
+        )
+    except Exception as e:
+        console.print(f"[bold red]Audit failed for {model}:[/bold red] {escape(str(e))}")
+        raise typer.Exit(code=1)
+
+    if output is not None:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(report.model_dump_json(indent=2), encoding="utf-8")
+
+    if json_output:
+        console.print_json(report.model_dump_json())
+    else:
+        render_report(console, report)
+        if output is not None:
+            console.print(f"\n[dim]Report written to {output}[/dim]")
+
+    if report.discrepancies:
+        raise typer.Exit(code=2)
 
 
 if __name__ == "__main__":

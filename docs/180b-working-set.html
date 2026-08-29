@@ -1,0 +1,860 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Feasibility audit for running Qwen3.8-Flash-Next out-of-core on 4 GB VRAM + 12 GB RAM + NVMe, verified against the live 180B checkpoint.">
+<title>The 180B Working Set</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;500;700&display=swap">
+
+<style>
+:root{
+  --ground:#F1F3F6; --surface:#FFFFFF; --surface-2:#E7EBF1; --sunk:#EDF0F4;
+  --ink:#121A24; --ink-2:#3B4756; --muted:#697585; --line:#D3D9E1; --line-2:#BFC8D4;
+  --accent:#A81F52; --accent-2:#7E1740; --accent-soft:#FAE8EF;
+  --teal:#1B6575; --teal-soft:#E0EFF2;
+  --warn:#8A5300; --warn-soft:#FBEEDA;
+  --good:#1F6B45;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --ground:#0C1118; --surface:#141C26; --surface-2:#1B2530; --sunk:#101822;
+    --ink:#E9EEF4; --ink-2:#BAC6D4; --muted:#8593A4; --line:#293440; --line-2:#3A4756;
+    --accent:#FF6E9C; --accent-2:#FF9BBB; --accent-soft:#361321;
+    --teal:#5FC4D6; --teal-soft:#0D272E;
+    --warn:#E0A64B; --warn-soft:#2C2110;
+    --good:#5FBF8E;
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#0C1118; --surface:#141C26; --surface-2:#1B2530; --sunk:#101822;
+  --ink:#E9EEF4; --ink-2:#BAC6D4; --muted:#8593A4; --line:#293440; --line-2:#3A4756;
+  --accent:#FF6E9C; --accent-2:#FF9BBB; --accent-soft:#361321;
+  --teal:#5FC4D6; --teal-soft:#0D272E;
+  --warn:#E0A64B; --warn-soft:#2C2110;
+  --good:#5FBF8E;
+}
+
+*{box-sizing:border-box}
+body{
+  background:var(--ground); color:var(--ink);
+  font-family:"Source Serif 4",Georgia,serif; font-size:17px; line-height:1.62;
+  margin:0; padding:0;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:1180px;margin:0 auto;padding:0 28px 100px}
+.col{max-width:70ch}
+
+h1,h2,h3,h4,.disp{font-family:Archivo,"Helvetica Neue",Arial,sans-serif;text-wrap:balance}
+h1{font-size:clamp(2.4rem,5.6vw,4rem);line-height:1.03;letter-spacing:-.028em;font-weight:700;margin:0}
+h2{font-size:1.62rem;line-height:1.15;letter-spacing:-.018em;font-weight:700;margin:0 0 .2em}
+h3{font-size:1.1rem;letter-spacing:-.008em;font-weight:600;margin:2.2em 0 .5em}
+h4{font-size:.83rem;text-transform:uppercase;letter-spacing:.1em;font-weight:600;color:var(--muted);margin:2em 0 .6em}
+p{margin:0 0 1.05em}
+a{color:var(--accent);text-decoration-thickness:1px;text-underline-offset:2px}
+a:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:3px;border-radius:3px}
+strong{font-weight:600;color:var(--ink)}
+code,.mono,td.n,th.n{font-family:"JetBrains Mono",ui-monospace,monospace;font-variant-numeric:tabular-nums}
+code{font-size:.85em;background:var(--surface-2);padding:.1em .34em;border-radius:3px}
+
+/* ---- masthead ---- */
+header.top{padding:72px 0 34px;border-bottom:1px solid var(--line)}
+.kicker{font-family:"JetBrains Mono",monospace;font-size:.72rem;letter-spacing:.17em;text-transform:uppercase;color:var(--accent);font-weight:700;margin-bottom:1.5em}
+.sub{font-family:Archivo,sans-serif;font-size:1.16rem;line-height:1.45;color:var(--ink-2);max-width:60ch;margin:1.1em 0 0;font-weight:500}
+.byline{font-family:"JetBrains Mono",monospace;font-size:.72rem;color:var(--muted);margin-top:2.2em;letter-spacing:.04em}
+
+/* ---- section ---- */
+section{padding:52px 0;border-bottom:1px solid var(--line)}
+.snum{font-family:"JetBrains Mono",monospace;font-size:.72rem;color:var(--accent);letter-spacing:.14em;font-weight:700;display:block;margin-bottom:.7em}
+
+/* ---- verdict ---- */
+.verdict{background:var(--surface);border:1px solid var(--line);border-left:4px solid var(--accent);border-radius:4px;padding:28px 30px;margin:26px 0}
+.verdict p:last-child{margin-bottom:0}
+.vlead{font-family:Archivo,sans-serif;font-size:1.2rem;font-weight:600;line-height:1.38;letter-spacing:-.012em;margin-bottom:.7em}
+
+/* ---- stat band ---- */
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(158px,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:4px;overflow:hidden;margin:28px 0}
+.stat{background:var(--surface);padding:17px 18px}
+.stat .v{font-family:"JetBrains Mono",monospace;font-size:1.42rem;font-weight:700;letter-spacing:-.03em;line-height:1.1;font-variant-numeric:tabular-nums}
+.stat .l{font-family:Archivo,sans-serif;font-size:.71rem;text-transform:uppercase;letter-spacing:.075em;color:var(--muted);margin-top:.5em;font-weight:600;line-height:1.35}
+.stat .s{font-size:.78rem;color:var(--muted);margin-top:.3em;font-family:"JetBrains Mono",monospace}
+
+/* ---- tables ---- */
+.tw{overflow-x:auto;margin:20px 0;border:1px solid var(--line);border-radius:4px;background:var(--surface)}
+table{border-collapse:collapse;width:100%;font-size:.85rem;min-width:520px}
+th,td{padding:8px 13px;text-align:left;border-bottom:1px solid var(--line)}
+thead th{background:var(--surface-2);font-family:Archivo,sans-serif;font-size:.7rem;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);font-weight:600;white-space:nowrap;position:sticky;top:0}
+td.n,th.n{text-align:right;white-space:nowrap}
+tbody tr:last-child td{border-bottom:0}
+tbody tr.tot td{background:var(--sunk);font-weight:600}
+tbody tr.hi td{background:var(--accent-soft)}
+caption{caption-side:bottom;text-align:left;padding:9px 13px;font-size:.76rem;color:var(--muted);border-top:1px solid var(--line);font-family:Archivo,sans-serif}
+.bar{display:inline-block;height:8px;background:var(--accent);border-radius:1px;vertical-align:middle}
+.bar.t{background:var(--teal)}
+
+/* ---- tier diagram ---- */
+.tiers{display:grid;gap:10px;margin:26px 0}
+.tier{display:grid;grid-template-columns:104px 1fr;gap:18px;align-items:start;background:var(--surface);border:1px solid var(--line);border-radius:4px;padding:15px 18px;border-left:4px solid var(--tc,var(--muted))}
+.tier .tn{font-family:Archivo,sans-serif;font-weight:700;font-size:.9rem;letter-spacing:.04em;color:var(--tc)}
+.tier .tcap{font-family:"JetBrains Mono",monospace;font-size:.72rem;color:var(--muted);margin-top:.25em}
+.tier .tb{font-size:.87rem;line-height:1.5}
+.tier .tb ul{margin:.4em 0 0;padding-left:1.1em}
+.tier .tb li{margin:.16em 0}
+.hot{--tc:var(--accent)} .warm{--tc:var(--warn)} .cold{--tc:var(--teal)}
+
+/* ---- callouts ---- */
+.note{border:1px solid var(--line);background:var(--surface);border-radius:4px;padding:17px 20px;margin:22px 0;font-size:.91rem}
+.note.warnb{border-left:3px solid var(--warn);background:var(--warn-soft)}
+.note.killb{border-left:3px solid var(--accent);background:var(--accent-soft)}
+.note.goodb{border-left:3px solid var(--teal);background:var(--teal-soft)}
+.note h4{margin-top:0}
+.note p:last-child{margin-bottom:0}
+
+/* ---- code ---- */
+pre{background:var(--sunk);border:1px solid var(--line);border-radius:4px;padding:16px 18px;overflow-x:auto;font-family:"JetBrains Mono",monospace;font-size:.78rem;line-height:1.62;margin:20px 0;color:var(--ink-2)}
+pre b{color:var(--accent);font-weight:500}
+pre i{color:var(--muted);font-style:normal}
+pre em{color:var(--teal);font-style:normal}
+
+/* ---- ledger (corrections) ---- */
+.led{display:grid;gap:1px;background:var(--line);border:1px solid var(--line);border-radius:4px;overflow:hidden;margin:24px 0}
+.led .r{background:var(--surface);padding:16px 19px;display:grid;grid-template-columns:1fr 1fr;gap:18px}
+.led .r>div:first-child{color:var(--muted)}
+.led .lab{font-family:Archivo,sans-serif;font-size:.66rem;text-transform:uppercase;letter-spacing:.09em;font-weight:600;margin-bottom:.4em;display:block}
+.led .r>div:first-child .lab{color:var(--muted)}
+.led .r>div:last-child .lab{color:var(--accent)}
+.led .r p{margin:0;font-size:.88rem;line-height:1.5}
+
+/* ---- roadmap ---- */
+.road{display:grid;gap:1px;background:var(--line);border:1px solid var(--line);border-radius:4px;overflow:hidden;margin:24px 0}
+.ph{background:var(--surface);padding:14px 18px;display:grid;grid-template-columns:74px 1fr 96px;gap:16px;align-items:baseline;font-size:.88rem}
+.ph .p{font-family:"JetBrains Mono",monospace;font-size:.75rem;color:var(--accent);font-weight:700}
+.ph .w{font-family:"JetBrains Mono",monospace;font-size:.72rem;color:var(--muted);text-align:right}
+.ph strong{font-family:Archivo,sans-serif;font-size:.92rem}
+.ph.done{background:var(--sunk)}
+
+/* ---- toc ---- */
+nav.toc{position:sticky;top:0;z-index:20;background:color-mix(in srgb,var(--ground) 92%,transparent);backdrop-filter:blur(9px);border-bottom:1px solid var(--line);padding:9px 0;margin-bottom:0}
+nav.toc .inner{max-width:1180px;margin:0 auto;padding:0 28px;display:flex;gap:5px;overflow-x:auto;scrollbar-width:thin}
+nav.toc a{font-family:"JetBrains Mono",monospace;font-size:.7rem;color:var(--muted);text-decoration:none;padding:5px 9px;border-radius:3px;white-space:nowrap;letter-spacing:.02em}
+nav.toc a:hover{color:var(--accent);background:var(--accent-soft)}
+
+ul.tight{padding-left:1.15em;margin:.5em 0 1.1em}
+ul.tight li{margin:.34em 0}
+dl.spec{margin:16px 0;display:grid;grid-template-columns:126px 1fr;gap:9px 18px;font-size:.89rem}
+dl.spec dt{font-family:Archivo,sans-serif;font-size:.68rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-weight:600;padding-top:.3em}
+dl.spec dd{margin:0}
+.pill{display:inline-block;font-family:"JetBrains Mono",monospace;font-size:.68rem;padding:2px 7px;border-radius:99px;border:1px solid var(--line-2);color:var(--muted);letter-spacing:.03em}
+.pill.m{border-color:var(--teal);color:var(--teal);background:var(--teal-soft)}
+.pill.p{border-color:var(--warn);color:var(--warn);background:var(--warn-soft)}
+.pill.u{border-color:var(--line-2);color:var(--muted)}
+.srcs{font-size:.8rem;color:var(--muted)}
+.srcs li{margin:.3em 0}
+@media (max-width:720px){
+  body{font-size:16px}
+  .wrap{padding:0 18px 70px}
+  .tier{grid-template-columns:1fr;gap:8px}
+  .led .r{grid-template-columns:1fr;gap:12px}
+  .ph{grid-template-columns:56px 1fr;}
+  .ph .w{display:none}
+  dl.spec{grid-template-columns:1fr;gap:2px 0}
+  dl.spec dd{margin-bottom:.7em}
+}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+<nav class="toc"><div class="inner">
+<a href="#verdict">verdict</a><a href="#method">method</a><a href="#audit">audit</a><a href="#corrections">corrections</a><a href="#strip">stripping</a><a href="#quant">quantization</a><a href="#budget">budgets</a><a href="#paging">expert&nbsp;paging</a><a href="#ple">PLE</a><a href="#compute">compute</a><a href="#runtime">runtime</a><a href="#sim">simulator</a><a href="#exp">experiments</a><a href="#road">roadmap</a><a href="#risk">dead&nbsp;ends</a><a href="#novel">novelty</a><a href="#next">next&nbsp;milestone</a>
+</div></nav>
+
+<div class="wrap">
+
+<header class="top">
+  <div class="kicker">PocketTitan / feasibility audit</div>
+  <h1>The 180B<br>Working Set</h1>
+  <p class="sub">Qwen3.8-Flash-Next is 179,999,981,459 parameters. Exactly 2,359,296,000 of them — 1.3% — are expert weights touched to produce one token. That gap, not the headline number, is what decides whether this runs on 4&nbsp;GB of VRAM.</p>
+  <p class="byline">Verified against the live HF checkpoint · 131 shards · 1,658 tensor headers read · 2026-08-29</p>
+</header>
+
+<section id="verdict">
+  <span class="snum">01 — EXECUTIVE CONCLUSION</span>
+  <h2>Yes, and the ceiling is higher than you assumed</h2>
+
+  <div class="verdict">
+    <p class="vlead">On 4&nbsp;GB VRAM + 12&nbsp;GB RAM + NVMe, a text-only Qwen3.8-Flash-Next should reach 1–4 tok/s with 4-bit experts, and 3–8 tok/s with 2-bit experts — not 0.1 tok/s.</p>
+    <p>The hypothesis survives. Total model size is genuinely decoupled from resident working set here, for three structural reasons that I verified rather than assumed: the <strong>dense always-resident core quantizes to ~2.1&nbsp;GiB</strong> and fits in VRAM outright; the <strong>51.2B-parameter PLE table costs ~64&nbsp;KiB of I/O per token</strong> despite being 28% of the model; and <strong>expert traffic is 633&nbsp;MiB/token at 2-bit, before any caching</strong>, which a 3&nbsp;GB/s SSD serves at 4.5 tok/s even at a 0% hit rate.</p>
+    <p>The binding constraint is <strong>expert bytes per token</strong>. Nothing else is close. Every design decision should be scored against that one number.</p>
+  </div>
+
+  <div class="stats">
+    <div class="stat"><div class="v">180.0B</div><div class="l">Total parameters</div><div class="s">335.3 GiB bf16</div></div>
+    <div class="stat"><div class="v">6.671B</div><div class="l">Activated / token</div><div class="s">3.7% of model</div></div>
+    <div class="stat"><div class="v" style="color:var(--accent)">2.359B</div><div class="l">Routed-expert params / token</div><div class="s">the whole problem</div></div>
+    <div class="stat"><div class="v">2.13<span style="font-size:.62em"> GiB</span></div><div class="l">Dense resident core</div><div class="s">fits 4 GB VRAM</div></div>
+    <div class="stat"><div class="v" style="color:var(--teal)">64<span style="font-size:.62em"> KiB</span></div><div class="l">PLE I/O per token</div><div class="s">from a 95 GiB table</div></div>
+  </div>
+
+  <p>What "work" means, concretely, in ascending order of difficulty: correct greedy decoding with bounded residency is <em>very likely</em> (comparable systems already do it); 1 tok/s is <em>likely</em>; 2–4 tok/s is <em>plausible and is the honest target</em>; above 5 tok/s requires expert cache hit rates that nobody has yet measured on this specific model — which is exactly the gap your first milestone should close.</p>
+
+  <div class="note warnb">
+    <h4>The one number that should worry you</h4>
+    <p>12&nbsp;GB of RAM leaves roughly <strong>7&nbsp;GiB</strong> for an expert cache after OS and runtime. That is 5,437 of 24,576 expert slots at 2-bit (22%), or 2,880 slots at 4-bit (<strong>11.7%</strong>). The 56–64% LRU hit rates measured on Qwen3-Next-80B were obtained at far higher cache-to-model ratios. Whether that locality survives at 12% capacity on a 512-expert / top-10 router is <em>the</em> open question, and it is cheap to answer before building anything.</p>
+  </div>
+</section>
+
+<section id="method">
+  <span class="snum">02 — METHOD &amp; PROVENANCE</span>
+  <h2>What I verified, and what I could not</h2>
+  <div class="col">
+  <p>Every architecture number below was derived from the live checkpoint, not from a model card. I read the 8-byte length prefix and JSON header of all 131 safetensors shards over HTTP range requests, recovered shapes and dtypes for all 1,658 tensors, and summed them. Two independent cross-checks agree with that sum, which is the main reason I trust it:</p>
+  <ul class="tight">
+    <li>My computed total, <code>179,999,981,459</code>, matches the index's declared <code>total_size</code> of 359,999,963,128 bytes at 2 bytes/param exactly.</li>
+    <li>My computed text-only core — total minus PLE table, MTP and vision — is <strong>125.74B</strong>, which matches to the decimal the <code>125.74 B</code> that llama.cpp independently reports for its converted GGUF of this model.</li>
+    <li>My computed vision total (448.9M params, 0.84 GiB bf16) matches the published <code>mmproj-BF16.gguf</code> at 0.85 GiB.</li>
+  </ul>
+  </div>
+
+  <div class="tw"><table>
+    <caption>Provenance of every claim class in this report.</caption>
+    <thead><tr><th>Claim class</th><th>Status</th><th>Source</th></tr></thead>
+    <tbody>
+      <tr><td>Parameter counts, shapes, layer types, PLE addressing</td><td><span class="pill m">measured</span></td><td>Direct read of <code>Qwen/Qwen3.8-Flash-Next</code> config + 131 safetensors headers, sha <code>de4b8e4d</code></td></tr>
+      <tr><td>Quantized file sizes at IQ4_NL / Q5_K</td><td><span class="pill m">measured</span></td><td>Published GGUF conversion, file sizes from HF API</td></tr>
+      <tr><td>PLE-on-SSD decode cost (−8.8%)</td><td><span class="pill m">measured</span></td><td>llama.cpp discussion #27864, on this exact model</td></tr>
+      <tr><td>Expert residency gains, LRU hit rates</td><td><span class="pill m">measured</span></td><td>llama.cpp #27712 / oversized-moe-runtime, on Qwen3-Next-80B</td></tr>
+      <tr><td>SSD expert streaming at scale, 2-bit quality loss</td><td><span class="pill m">measured</span></td><td>Flash-MoE, Qwen3.5-397B-A17B on M3 Max</td></tr>
+      <tr><td>Bytes/token, roofline throughput, budgets</td><td><span class="pill p">projected</span></td><td>Arithmetic on measured params; assumptions stated inline</td></tr>
+      <tr><td>Expert cache hit rate on <em>this</em> model at 12% capacity</td><td><span class="pill u">unknown</span></td><td>No published measurement exists — see §17</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="note">
+    <p><strong>Two caveats on my own work.</strong> Web search was returning a backend error throughout this session, so my literature sweep is narrower than you asked for: I verified the six llama.cpp discussions and Flash-MoE directly through the GitHub API, but I could <em>not</em> run the broad arXiv/2026-proceedings sweep. Treat §16's novelty claims as provisional pending that sweep. Second, the per-token activation figure of 6.671B counts a full <code>lm_head</code> matvec; Qwen's published "~6B activated" likely excludes it. Both are correct, they measure different things.</p>
+  </div>
+</section>
+
+<section id="audit">
+  <span class="snum">03 — VERIFIED ARCHITECTURE</span>
+  <h2>Where the 180 billion parameters actually are</h2>
+
+  <div class="tw"><table>
+    <caption>Exact component decomposition, 1,658 tensors, all BF16 except 3 int64 index tensors.</caption>
+    <thead><tr><th>Component</th><th class="n">Tensors</th><th class="n">Parameters</th><th class="n">Share</th><th class="n">GiB bf16</th><th></th></tr></thead>
+    <tbody>
+      <tr class="hi"><td><strong>Routed experts</strong> <span class="mono" style="font-size:.85em;color:var(--muted)">48 × (512,1280,2560)+(512,2560,640)</span></td><td class="n">96</td><td class="n">120,795,955,200</td><td class="n">67.11%</td><td class="n">225.00</td><td><span class="bar" style="width:96px"></span></td></tr>
+      <tr class="hi"><td><strong>PLE n-gram table</strong> <span class="mono" style="font-size:.85em;color:var(--muted)">128 × (2500012,160)</span></td><td class="n">128</td><td class="n">51,200,245,760</td><td class="n">28.44%</td><td class="n">95.37</td><td><span class="bar t" style="width:41px"></span></td></tr>
+      <tr><td>MTP block (incl. its own 512-expert MoE)</td><td class="n">31</td><td class="n">2,607,150,848</td><td class="n">1.45%</td><td class="n">4.86</td><td><span class="bar" style="width:2px"></span></td></tr>
+      <tr><td>Gated DeltaNet (36 layers)</td><td class="n">324</td><td class="n">2,086,510,464</td><td class="n">1.16%</td><td class="n">3.89</td><td><span class="bar" style="width:2px"></span></td></tr>
+      <tr><td>Hyper-connections</td><td class="n">387</td><td class="n">640,624,640</td><td class="n">0.36%</td><td class="n">1.19</td><td></td></tr>
+      <tr><td><code>embed_tokens</code></td><td class="n">1</td><td class="n">635,699,200</td><td class="n">0.35%</td><td class="n">1.18</td><td></td></tr>
+      <tr><td><code>lm_head</code></td><td class="n">1</td><td class="n">635,699,200</td><td class="n">0.35%</td><td class="n">1.18</td><td></td></tr>
+      <tr><td>Sparse full attention + indexer (12 layers)</td><td class="n">108</td><td class="n">617,358,336</td><td class="n">0.34%</td><td class="n">1.15</td><td></td></tr>
+      <tr><td>Vision encoder + merger</td><td class="n">333</td><td class="n">448,931,056</td><td class="n">0.25%</td><td class="n">0.84</td><td></td></tr>
+      <tr><td>Shared experts (48)</td><td class="n">192</td><td class="n">236,052,480</td><td class="n">0.13%</td><td class="n">0.44</td><td></td></tr>
+      <tr><td>Routers / gates</td><td class="n">48</td><td class="n">62,914,560</td><td class="n">0.03%</td><td class="n">0.12</td><td></td></tr>
+      <tr><td>PLE projections + conv</td><td class="n">9</td><td class="n">32,839,715</td><td class="n">0.02%</td><td class="n">0.06</td><td></td></tr>
+      <tr class="tot"><td>TOTAL</td><td class="n">1,658</td><td class="n">179,999,981,459</td><td class="n">100%</td><td class="n">335.28</td><td></td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Topology, as built</h3>
+  <div class="tw"><table>
+    <caption>From <code>config.json</code>, cross-checked against the tensor names actually present.</caption>
+    <thead><tr><th>Property</th><th>Value</th><th>Consequence for PocketTitan</th></tr></thead>
+    <tbody>
+      <tr><td>Layers</td><td class="mono">48 — 36 linear_attention + 12 full_attention</td><td>Pattern is 3×GDN then 1×attention, repeating. Confirmed.</td></tr>
+      <tr><td>Hidden size</td><td class="mono">2560</td><td>Small. Activations are cheap; weights dominate everything.</td></tr>
+      <tr><td>Experts</td><td class="mono">512/layer, top-10 + 1 shared, ffn 640</td><td>24,576 expert slots, 4.915M params each</td></tr>
+      <tr><td>Expert storage</td><td class="mono">fused 3-D per layer, not per expert</td><td><strong>Requires slicing, not tensor-level addressing</strong></td></tr>
+      <tr><td>PLE blocks</td><td class="mono">exactly 1, at layer 1</td><td>Not per-layer. One lookup, at the bottom of the stack.</td></tr>
+      <tr><td>n-gram heads</td><td class="mono">16 heads × 160 dims = 2560</td><td>16 row reads per token, total</td></tr>
+      <tr><td>KV heads</td><td class="mono">2, head_dim 256, only 12 layers</td><td>KV is 24 KiB/token — negligible</td></tr>
+      <tr><td>Sparse attention</td><td class="mono">indexer_budget 2048, 4 heads, dim 128</td><td>Attends to 2048 selected positions; full KV still stored</td></tr>
+      <tr><td>GDN state</td><td class="mono">48 v-heads × 128 × 128, fp32</td><td>113.6 MiB, <strong>constant in context length</strong></td></tr>
+      <tr><td>MTP</td><td class="mono">1 hybrid layer, own MoE + own router</td><td>Cleanly separable, prefixed <code>mtp.</code></td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="corrections">
+  <span class="snum">04 — CORRECTIONS</span>
+  <h2>Five assumptions in the brief that the checkpoint contradicts</h2>
+  <p class="col">You asked to be told when the research disagrees with the direction. It does, in five places, and two of them redirect significant effort.</p>
+
+  <div class="led">
+    <div class="r">
+      <div><span class="lab">Brief assumed</span><p>Stripping vision is a major win, worth a capability-analysis subsystem and selective shard downloads.</p></div>
+      <div><span class="lab">Checkpoint says</span><p>Vision is <strong>448.9M params — 0.25% of the model, 0.84 GiB</strong>. It also lives inside a single mixed shard, so you cannot skip downloading anything. Standard GGUF conversion already splits it into a separate <code>mmproj</code>. This is a rounding error, not a strategy.</p></div>
+    </div>
+    <div class="r">
+      <div><span class="lab">Brief assumed</span><p>PLE parameters are distributed across layers and need per-layer prefetch policy.</p></div>
+      <div><span class="lab">Checkpoint says</span><p>There is <strong>exactly one PLE block, at layer 1</strong>. All 51.2B parameters are one flat table consulted once per token, near the bottom of the network. This makes the prefetch problem dramatically easier than the brief supposes — see §09.</p></div>
+    </div>
+    <div class="r">
+      <div><span class="lab">Brief assumed</span><p>Experts can be addressed as individual tensors and reordered on disk by co-activation.</p></div>
+      <div><span class="lab">Checkpoint says</span><p>Experts are stored <strong>fused</strong>: one <code>(512,1280,2560)</code> tensor and one <code>(512,2560,640)</code> per layer. Expert <em>e</em>'s two halves are in different tensors, ~120 GB apart on disk. Repacking to <code>[e: gate_up ‖ down]</code> halves your read count before any clever layout work. Do that first; co-activation reordering is a later, smaller win.</p></div>
+    </div>
+    <div class="r">
+      <div><span class="lab">Brief assumed</span><p>Extreme quantization (1-bit / 1.58-bit) is the headline lever, and the repo currently ships a ternary quantizer.</p></div>
+      <div><span class="lab">Checkpoint + literature say</span><p>Going 4-bit → 2-bit halves expert I/O and roughly doubles the throughput ceiling. Going 2-bit → 1-bit buys only a further 1.8× <em>and</em> Flash-MoE measured 2-bit already breaking JSON and tool calling on a sibling Qwen MoE. The residency win comes from <strong>sparsity, not bit-width</strong>. Sub-2-bit is a research branch, not the plan.</p></div>
+    </div>
+    <div class="r">
+      <div><span class="lab">Brief assumed</span><p>A sophisticated custom expert cache (TinyLFU, SLRU, predictive promotion) is a core deliverable.</p></div>
+      <div><span class="lab">Literature says</span><p>Flash-MoE tested Metal LRU, malloc cache, and LZ4 compressed cache — <strong>every one was slower than just trusting the OS page cache</strong>, which reached ~71% hit naturally. And #27712 found LRU64 (3.79 tok/s) no better than LRU32 (3.80). Build the measurement harness before the cache; the null hypothesis is that <code>mmap</code> + <code>madvise</code> wins.</p></div>
+    </div>
+  </div>
+
+  <div class="note goodb">
+    <h4>One assumption that held up better than expected</h4>
+    <p>"~6B activated per token" is essentially right: I compute <strong>6.671B</strong>, of which routed experts are 2.359B (35.4%) and the always-dense remainder is 4.312B. And your instinct that only part of the network uses sparse attention is confirmed — 36 of 48 layers are Gated DeltaNet with <strong>constant-size state</strong>, which is why KV cost here is trivial compared to a dense transformer of this scale.</p>
+  </div>
+</section>
+
+<section id="strip">
+  <span class="snum">05 — TEXT-ONLY STRIPPING PLAN</span>
+  <h2>What is safe to remove, and exactly what it saves</h2>
+
+  <div class="tw"><table>
+    <caption>Savings are given at bf16 and at the recommended mixed precision. Percentages are of the 335.3 GiB bf16 total.</caption>
+    <thead><tr><th>Action</th><th>Tensor selector</th><th class="n">Params</th><th class="n">bf16</th><th class="n">@ rec. quant</th><th>Safety</th></tr></thead>
+    <tbody>
+      <tr><td>Drop vision encoder + merger</td><td class="mono">model.visual.*</td><td class="n">448.9M</td><td class="n">0.84 GiB</td><td class="n">0.24 GiB</td><td><span class="pill m">safe</span></td></tr>
+      <tr><td>Drop MTP block</td><td class="mono">mtp.*</td><td class="n">2.607B</td><td class="n">4.86 GiB</td><td class="n">0.75 GiB</td><td><span class="pill m">safe</span></td></tr>
+      <tr class="tot"><td>Total capability stripping</td><td></td><td class="n">3.056B</td><td class="n">5.70 GiB</td><td class="n">0.99 GiB</td><td><strong>1.7%</strong></td></tr>
+      <tr><td colspan="6" style="background:var(--sunk);font-size:.8rem;color:var(--muted);padding:6px 13px">— compare against what quantization and tiering do —</td></tr>
+      <tr><td>PLE table → NVMe cold tier</td><td class="mono">*.ngram_embedding.shard_*</td><td class="n">51.200B</td><td class="n">95.37 GiB</td><td class="n">18.48 GiB</td><td>removed from RAM entirely</td></tr>
+      <tr><td>Experts → NVMe cold tier</td><td class="mono">*.mlp.experts.*</td><td class="n">120.796B</td><td class="n">225.00 GiB</td><td class="n">31.64 GiB</td><td>bounded residency</td></tr>
+    </tbody>
+  </table></div>
+
+  <p class="col">The honest read: capability stripping is <strong>1.7% of the problem</strong>. It is still worth doing — it is nearly free, it removes a whole MoE layer's worth of router complexity from the MTP path, and <code>--features text</code> is a clean interface. But it should be a 200-line filter in the packager, not an architectural subsystem, and it must not be the thing you build first.</p>
+
+  <h3>Rules for the stripper</h3>
+  <ul class="tight col">
+    <li><strong>Safe to drop, no behavioral change:</strong> <code>model.visual.*</code> and <code>mtp.*</code>. Both are structurally disjoint — nothing in the language-model forward path reads from either. MTP is a speculative multi-token head; ordinary autoregressive decoding never invokes it. This is also what the published GGUF conversion already does.</li>
+    <li><strong>Do not touch the vocabulary.</strong> Confirmed: <code>vocab_size 248320</code>, with <code>image_token_id 248056</code>, <code>video_token_id 248057</code>, <code>vision_start/end 248053/248054</code> sitting <em>inside</em> the embedding matrix. Removing those rows would require renumbering and would desynchronize <code>embed_tokens</code>, <code>lm_head</code>, and the tokenizer. The cost of keeping them is 5 rows × 2560 — literally nothing. Keep them.</li>
+    <li><strong>Behavior-changing, requires validation, out of scope for v1:</strong> expert pruning, head pruning, layer dropping, PLE row eviction. Do not conflate these with capability stripping. In particular, PLE rows are hash-addressed with prime moduli (§09) — dropping rows changes the hash range and corrupts every lookup.</li>
+    <li><strong>Shard-skipping is not available.</strong> Of 131 shards, exactly one contains vision tensors and it is mixed with GDN and hyper-connection weights. 48 shards are pure experts and 31 are pure PLE table — that purity is useful for <em>layout</em>, but there is no shard you can decline to download for capability reasons.</li>
+  </ul>
+</section>
+
+<section id="quant">
+  <span class="snum">06 — QUANTIZATION STRATEGY</span>
+  <h2>Start at 4-bit experts. Earn your way down.</h2>
+
+  <p class="col">Effective bits below include real metadata overhead — a group of 128 with an fp16 scale and fp16 zero costs <code>b + 32/128 = b + 0.25</code> bits/weight. This is why nominal-bits arithmetic understates footprint, exactly as you suspected.</p>
+
+  <div class="tw"><table>
+    <caption>Text-only model (no vision, no MTP) at uniform precision. Measured GGUF row is the published conversion of this model.</caption>
+    <thead><tr><th>Nominal</th><th class="n">Eff. bits</th><th class="n">Experts</th><th class="n">PLE table</th><th class="n">Dense core</th><th class="n">Total on NVMe</th></tr></thead>
+    <tbody>
+      <tr><td>bf16</td><td class="n">16.00</td><td class="n">225.0</td><td class="n">95.4</td><td class="n">9.2</td><td class="n">329.6 GiB</td></tr>
+      <tr><td>8-bit</td><td class="n">8.25</td><td class="n">116.0</td><td class="n">49.2</td><td class="n">4.75</td><td class="n">169.9 GiB</td></tr>
+      <tr style="background:var(--sunk)"><td><em>IQ4_NL (measured)</em></td><td class="n">4.67 / 4.50</td><td colspan="2" class="n" style="text-align:center">68.4 GiB LM + 26.8 GiB ngram</td><td class="n">incl.</td><td class="n">95.2 GiB</td></tr>
+      <tr><td>4-bit</td><td class="n">4.25</td><td class="n">59.8</td><td class="n">25.3</td><td class="n">2.45</td><td class="n">87.5 GiB</td></tr>
+      <tr><td>3-bit</td><td class="n">3.25</td><td class="n">45.7</td><td class="n">19.4</td><td class="n">1.87</td><td class="n">66.9 GiB</td></tr>
+      <tr><td>2-bit</td><td class="n">2.25</td><td class="n">31.6</td><td class="n">13.4</td><td class="n">1.30</td><td class="n">46.3 GiB</td></tr>
+      <tr><td>1.58-bit ternary</td><td class="n">1.83</td><td class="n">25.7</td><td class="n">10.9</td><td class="n">1.05</td><td class="n">37.7 GiB</td></tr>
+      <tr><td>1-bit</td><td class="n">1.25</td><td class="n">17.6</td><td class="n">7.5</td><td class="n">0.72</td><td class="n">25.7 GiB</td></tr>
+    </tbody>
+  </table></div>
+
+  <p class="col">Note what this table does <em>not</em> say. Storage is not the constraint — every row fits on a 256 GB NVMe partition. The reason to quantize is bandwidth: bits/weight is a direct multiplier on bytes/token, and therefore on the throughput ceiling. Which means precision should be assigned by <em>how often a tensor is read</em>, not only by how sensitive it is.</p>
+
+  <h3>Recommended first serious configuration — <span class="mono">PT-Q4E</span></h3>
+  <div class="tw"><table>
+    <caption>Recommended mixed-precision map. Total 80.7 GiB on NVMe; 2.13 GiB VRAM-resident.</caption>
+    <thead><tr><th>Tensor class</th><th class="n">Params</th><th class="n">Bits</th><th class="n">Size</th><th>Rationale</th></tr></thead>
+    <tbody>
+      <tr><td>Routers / gates</td><td class="n">62.9M</td><td class="n">16.0</td><td class="n">0.12 GiB</td><td><strong>Never quantize.</strong> A wrong top-10 costs far more than 126 MB.</td></tr>
+      <tr><td>Norms, biases, A_log, dt_bias</td><td class="n">~3M</td><td class="n">16.0</td><td class="n">0.01 GiB</td><td>Free at any precision</td></tr>
+      <tr><td>GDN linear attention</td><td class="n">2.087B</td><td class="n">3.25</td><td class="n">0.79 GiB</td><td>Largest dense block; recurrent state is fp32 regardless</td></tr>
+      <tr><td>Full attention + indexer</td><td class="n">617M</td><td class="n">4.25</td><td class="n">0.31 GiB</td><td>Indexer errors corrupt sparse retrieval — keep headroom</td></tr>
+      <tr><td>Hyper-connections</td><td class="n">641M</td><td class="n">4.25</td><td class="n">0.32 GiB</td><td>Low-rank (320); rank-deficient tensors quantize badly</td></tr>
+      <tr><td>Shared experts</td><td class="n">236M</td><td class="n">4.25</td><td class="n">0.12 GiB</td><td>Executed on <em>every</em> token — highest read frequency of any expert weight</td></tr>
+      <tr><td><code>lm_head</code></td><td class="n">636M</td><td class="n">6.25</td><td class="n">0.46 GiB</td><td>Full matvec per token, directly sets output distribution</td></tr>
+      <tr><td><code>embed_tokens</code></td><td class="n">636M</td><td class="n">4.25</td><td class="n">0.31 GiB</td><td>Row-addressed; RAM tier, not VRAM</td></tr>
+      <tr class="hi"><td><strong>Routed experts</strong></td><td class="n">120.8B</td><td class="n">4.25</td><td class="n">59.76 GiB</td><td>The bandwidth term. Start here, measure, then try 3-bit.</td></tr>
+      <tr><td>PLE n-gram table</td><td class="n">51.2B</td><td class="n">3.10</td><td class="n">18.48 GiB</td><td>Row-granular, 160-elem groups, symmetric scale. Read rate is negligible so precision is nearly free — but see §09.</td></tr>
+      <tr class="tot"><td>Total</td><td class="n">125.7B</td><td class="n">~5.5</td><td class="n">80.7 GiB</td><td>2.13 GiB of it VRAM-resident</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="note killb">
+    <h4>Why not 1-bit, stated as a falsifiable claim</h4>
+    <p>Flash-MoE ran the same expert-streaming design at both 4-bit and 2-bit on Qwen3.5-397B and reported: 4-bit 4.36 tok/s with "full tool calling", 2-bit 5.74 tok/s but producing <code>\name\</code> instead of <code>"name"</code> in JSON, making tool use unreliable. That is a 32% speedup for a categorical capability loss, measured on a closely related architecture. <strong>Prediction to falsify:</strong> on Qwen3.8-Flash-Next, uniform ≤2-bit experts will degrade exact-format outputs (JSON validity, tool-call schema conformance) measurably before they degrade perplexity noticeably. If your eval suite only measures perplexity you will not see this and will ship a broken model.</p>
+  </div>
+
+  <h3>Where runtime-aware precision genuinely helps</h3>
+  <p class="col">Your hypothesis — precision as a function of <code>saliency × routing frequency × tier × backend</code> — is sound, but only the middle two terms pay here, and only after profiling. The defensible version is a <strong>two-population expert split</strong>: profile routing over a calibration corpus, keep the hot head of the distribution at 4-bit where it is read constantly, and push the cold tail to 2-bit where reads are rare and the compression buys SSD bandwidth precisely when you take a miss. Storing an expert at two precisions costs 6.5 bits/weight but lets the runtime choose per-read. Do not build this until §11's profiler tells you the distribution is actually skewed.</p>
+</section>
+
+<section id="budget">
+  <span class="snum">07 — MEMORY HIERARCHY &amp; BUDGETS</span>
+  <h2>Three tiers, with the numbers filled in</h2>
+
+  <div class="tiers">
+    <div class="tier hot">
+      <div><div class="tn">VRAM</div><div class="tcap">4 GB<br>~3.5 GiB usable</div></div>
+      <div class="tb">
+        <strong>Hot: everything read on every token.</strong>
+        <ul>
+          <li>Dense weights (GDN, attn, hyper-conn, shared expert, routers, lm_head) — <strong>2.13 GiB</strong></li>
+          <li>GDN recurrent state, fp32, constant — <strong>114 MiB</strong></li>
+          <li>KV + indexer cache @ 8K ctx — <strong>216 MiB</strong> (24 KiB/token, 12 layers only)</li>
+          <li>Activations, logits, workspace — <strong>~200 MiB</strong></li>
+          <li>Double-buffered expert staging (2 × 16 experts) — <strong>~80 MiB</strong></li>
+          <li>Free for VRAM hot-expert cache — <strong>~0.8 GiB ≈ 320 experts</strong></li>
+        </ul>
+      </div>
+    </div>
+    <div class="tier warm">
+      <div><div class="tn">RAM</div><div class="tcap">12 GB<br>~8.5 GiB usable</div></div>
+      <div class="tb">
+        <strong>Warm: bounded expert residency + row caches.</strong>
+        <ul>
+          <li>OS + Python/runtime + allocator slack — <strong>~3.5 GiB reserved</strong></li>
+          <li><code>embed_tokens</code> @4.25b, row-addressed — <strong>0.31 GiB</strong></li>
+          <li>PLE row cache (LRU over 160-dim rows) — <strong>0.5 GiB</strong></li>
+          <li>Pinned DMA staging buffers — <strong>0.25 GiB</strong></li>
+          <li>Expert cache — <strong>~7 GiB</strong> = 2,880 experts @4-bit (11.7%) or 5,437 @2-bit (22.1%)</li>
+        </ul>
+      </div>
+    </div>
+    <div class="tier cold">
+      <div><div class="tn">NVMe</div><div class="tcap">80.7 GiB<br>PT-Q4E package</div></div>
+      <div class="tb">
+        <strong>Cold: the model of record.</strong>
+        <ul>
+          <li>Routed experts, repacked <code>[e: gate_up ‖ down]</code> — <strong>59.8 GiB</strong>, 2.49 MiB per contiguous expert record</li>
+          <li>PLE table, row-aligned, 16 head regions — <strong>18.5 GiB</strong></li>
+          <li>Dense core (mirror of VRAM copy, for cold start) — <strong>2.1 GiB</strong></li>
+          <li>Manifest, routing profile, layout map — <strong>&lt;50 MiB</strong></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <h3>State growth with context</h3>
+  <div class="tw"><table>
+    <caption>KV is 24 KiB/token across only 12 full-attention layers with 2 KV heads. GDN state does not grow at all.</caption>
+    <thead><tr><th class="n">Context</th><th class="n">KV + indexer</th><th class="n">GDN state</th><th class="n">Total</th><th>Verdict</th></tr></thead>
+    <tbody>
+      <tr><td class="n">2,048</td><td class="n">54 MiB</td><td class="n">114 MiB</td><td class="n">168 MiB</td><td>trivial</td></tr>
+      <tr><td class="n">4,096</td><td class="n">108 MiB</td><td class="n">114 MiB</td><td class="n">222 MiB</td><td>trivial</td></tr>
+      <tr class="hi"><td class="n">8,192</td><td class="n">216 MiB</td><td class="n">114 MiB</td><td class="n">330 MiB</td><td><strong>recommended v1 cap</strong></td></tr>
+      <tr><td class="n">32,768</td><td class="n">864 MiB</td><td class="n">114 MiB</td><td class="n">978 MiB</td><td>fits, tightens expert cache</td></tr>
+      <tr><td class="n">131,072</td><td class="n">3.4 GiB</td><td class="n">114 MiB</td><td class="n">3.5 GiB</td><td>spill KV to RAM</td></tr>
+    </tbody>
+  </table></div>
+  <p class="col">This is a genuinely pleasant surprise and it changes your plan: <strong>you do not need to artificially constrain context to simplify memory.</strong> The hybrid architecture means 75% of layers carry constant-size state, and the 12 attention layers use only 2 KV heads. Cap at 8K for v1 to keep VRAM simple, but long context is a tuning exercise here, not a redesign.</p>
+
+  <h3>Throughput roofline</h3>
+  <div class="tw"><table>
+    <caption>SSD-bound ceiling from expert misses alone. Per-expert record: 1.32 MiB @2-bit, 2.49 MiB @4-bit. 480 expert reads/token (48 layers × top-10).</caption>
+    <thead><tr><th>Config</th><th class="n">Cache hit</th><th class="n">SSD MiB/tok</th><th class="n">@3 GB/s</th><th class="n">@5 GB/s</th><th class="n">@7 GB/s</th></tr></thead>
+    <tbody>
+      <tr><td rowspan="4"><strong>4-bit experts</strong><br><span style="color:var(--muted);font-size:.85em">1195 MiB cold</span></td><td class="n">0%</td><td class="n">1195</td><td class="n">2.4 tok/s</td><td class="n">4.0</td><td class="n">5.6</td></tr>
+      <tr><td class="n">40%</td><td class="n">717</td><td class="n">4.0</td><td class="n">6.6</td><td class="n">9.3</td></tr>
+      <tr class="hi"><td class="n">60%</td><td class="n">478</td><td class="n"><strong>6.0</strong></td><td class="n"><strong>10.0</strong></td><td class="n"><strong>14.0</strong></td></tr>
+      <tr><td class="n">75%</td><td class="n">299</td><td class="n">9.6</td><td class="n">16.0</td><td class="n">22.3</td></tr>
+      <tr><td rowspan="4"><strong>2-bit experts</strong><br><span style="color:var(--muted);font-size:.85em">633 MiB cold</span></td><td class="n">0%</td><td class="n">633</td><td class="n">4.5</td><td class="n">7.5</td><td class="n">10.5</td></tr>
+      <tr><td class="n">40%</td><td class="n">380</td><td class="n">7.5</td><td class="n">12.6</td><td class="n">17.6</td></tr>
+      <tr class="hi"><td class="n">60%</td><td class="n">253</td><td class="n"><strong>11.3</strong></td><td class="n"><strong>18.8</strong></td><td class="n"><strong>26.4</strong></td></tr>
+      <tr><td class="n">75%</td><td class="n">158</td><td class="n">18.1</td><td class="n">30.1</td><td class="n">42.2</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="note warnb">
+    <p><strong>Read these as ceilings, not predictions.</strong> They count SSD time only. Real throughput lands well below because compute, PCIe transfer, and stall time do not perfectly overlap. Calibration against measured systems: Flash-MoE achieved 4.36 tok/s with a <em>17.5 GB/s</em> SSD and 1.62 GiB/token of expert traffic — roughly 25% of its own SSD ceiling. Applying that same 25% efficiency factor to the highlighted 60%-hit rows gives <strong>~1.5–2.5 tok/s at 4-bit and ~3–4.7 tok/s at 2-bit on a 5 GB/s drive</strong>. That is the honest expectation, and it is the basis for the verdict in §01.</p>
+  </div>
+
+  <h4>Lower bounds per token</h4>
+  <div class="tw"><table>
+    <thead><tr><th>Quantity</th><th class="n">Value</th><th>Note</th></tr></thead>
+    <tbody>
+      <tr><td>Arithmetic</td><td class="n">13.3 GFLOP</td><td>2 × 6.671B, batch 1</td></tr>
+      <tr><td>Dense weight traffic</td><td class="n">2185 MiB</td><td>@200 GB/s VRAM = <strong>11.5 ms</strong> — never the bottleneck</td></tr>
+      <tr><td>Expert traffic @2-bit</td><td class="n">633 MiB</td><td>CPU @20 GB/s: <strong>33 ms</strong> · PCIe4×8: 55 ms · PCIe3×4: <strong>207 ms</strong></td></tr>
+      <tr><td>PLE traffic</td><td class="n">64 KiB</td><td>16 random reads; 0.02 ms even at 3 GB/s</td></tr>
+      <tr><td>SSD IOPS</td><td class="n">~496/token</td><td>480 expert + 16 PLE; at 4 tok/s ≈ 2K IOPS — NVMe idles</td></tr>
+    </tbody>
+  </table></div>
+  <p class="col">The PCIe row is the load-bearing one and it dictates §10: on a PCIe 3.0 ×4 laptop link, uploading missed experts to the GPU costs <strong>207 ms/token</strong> — six times the cost of simply executing them on the CPU from RAM. Expert transfer to VRAM is only worth it for weights that will be reused many times.</p>
+</section>
+
+<section id="paging">
+  <span class="snum">08 — EXPERT PAGING</span>
+  <h2>Bounded residency with speculative cross-layer prefetch</h2>
+
+  <p class="col">The structural opportunity: the router for layer <em>ℓ</em> is a 512×2560 matvec on the hidden state, and it is <strong>the only thing needed to know which experts layer ℓ requires</strong>. The hidden state entering layer ℓ+1 differs from that entering ℓ by one attention block and one MoE block. So layer ℓ's post-attention hidden state is a cheap, decent predictor of layer ℓ+1's routing — one extra 1.3 MB matvec buys a full layer of I/O lead time. This is the overlap you sketched, and it is implementable because routers are tiny and permanently resident.</p>
+
+<pre><i># ---- PocketTitan expert residency manager -------------------------------
+# Invariants: |VRAM slots| and |RAM slots| are fixed at init. No unbounded growth.
+# All SSD reads are issued async (io_uring on Linux / OVERLAPPED on Windows).</i>
+
+<b>init</b>:
+    RAM_slots  = 7 GiB / expert_record_bytes      <i># 2880 @4-bit</i>
+    VRAM_slots = 0.8 GiB / expert_record_bytes    <i># ~320 @4-bit</i>
+    ram_cache  = SLRU(RAM_slots)   <i># probationary 20% / protected 80%</i>
+    vram_cache = LFU (VRAM_slots)  <i># promotion needs sustained reuse, not one hit</i>
+    pin(routers, dense_core, norms)               <i># never evictable</i>
+
+<b>on_token</b>(h):
+    <em>issue_ple_prefetch(token_id)</em>              <i># §09 — exact, not speculative</i>
+    inflight = {}
+    <b>for</b> L <b>in</b> 0..47:
+        <i># ---- 1. consume the speculative prefetch issued one layer ago</i>
+        <b>if</b> L <b>in</b> inflight: await_partial(inflight[L])
+
+        h = attention_block(L, h)                 <i># GDN or sparse attn, VRAM-resident</i>
+
+        <i># ---- 2. authoritative routing for THIS layer</i>
+        ids, w = top_k(router[L] @ h, k=10)       <i># router is fp16, always resident</i>
+
+        <i># ---- 3. speculative routing for the NEXT layer, from current h</i>
+        <b>if</b> L &lt; 47:
+            pred = top_m(router[L+1] @ h, m=14)   <i># m &gt; k: over-fetch to absorb drift</i>
+            inflight[L+1] = <em>async_fetch</em>(L+1, pred - resident(L+1))
+
+        <i># ---- 4. execute, placing each expert where it already lives</i>
+        acc = shared_expert(L, h)                 <i># always VRAM</i>
+        <b>for</b> (e, wt) <b>in</b> zip(ids, w):
+            <b>match</b> locate(L, e):
+                <b>case</b> VRAM: acc += wt * gpu_lowbit_ffn(vram_cache[L,e], h)
+                <b>case</b> RAM:  acc += wt * <em>cpu_lowbit_ffn</em>(ram_cache[L,e], h)   <i># §10: cheaper than uploading</i>
+                <b>case</b> MISS:
+                    rec = await sync_fetch(L, e)  <i># 2.49 MiB contiguous, 1 read</i>
+                    ram_cache.insert((L,e), rec)  <i># enters PROBATIONARY only</i>
+                    acc += wt * cpu_lowbit_ffn(rec, h)
+            touch(L, e)                           <i># drives SLRU promotion + LFU counters</i>
+        h = combine(acc, h)
+
+    <i># ---- 5. session adaptation, amortized</i>
+    <b>if</b> token_index == 64:                        <i># after routing profile stabilizes</i>
+        hot = top_n(session_freq, VRAM_slots)
+        vram_cache.<em>pin_promote</em>(hot)             <i># one bulk upload, not per-token churn</i>
+</pre>
+
+  <h3>Design decisions and why</h3>
+  <ul class="tight col">
+    <li><strong>SLRU, not LRU, for RAM.</strong> A cold expert fetched once should not evict a warm one. New arrivals enter probation and only reach the protected segment on a second hit. This directly targets the failure mode behind #27712's finding that LRU64 was no faster than LRU32 — a bigger plain-LRU cache just holds more one-hit wonders.</li>
+    <li><strong>LFU with a promotion threshold for VRAM.</strong> Uploading over PCIe costs ~2.5 MiB of link time; it only pays if the expert is reused several times. Promote on sustained frequency, in bulk, not on demand.</li>
+    <li><strong>Over-fetch on speculation (m=14 for k=10).</strong> Speculative prefetch that misses is worse than useless — it evicts. Over-fetching by 40% absorbs prediction drift; the profiler in §11 sets <code>m</code> empirically.</li>
+    <li><strong>Never block on speculation.</strong> <code>await_partial</code> consumes whatever arrived and lets the rest continue in flight. A prefetch must never be able to make a token slower than no prefetch.</li>
+    <li><strong>Bounded by construction.</strong> Slot counts are fixed at init from measured free memory. There is no code path that grows residency, which is the property that makes "runs in 12 GB" a guarantee rather than a hope.</li>
+  </ul>
+
+  <div class="note">
+    <p><strong>Test the null hypothesis first.</strong> Before any of this: run the same workload with plain <code>mmap</code> + <code>madvise(MADV_RANDOM)</code> and let the OS page cache do it. Flash-MoE got ~71% hit that way and beat all three of its custom caches. If the OS wins at 12 GB too, the correct deliverable is a good <em>on-disk layout</em> plus <code>madvise</code> hints, and this entire manager is dead code. That is a two-day experiment and it gates weeks of work.</p>
+  </div>
+</section>
+
+<section id="ple">
+  <span class="snum">09 — PLE STORAGE ARCHITECTURE</span>
+  <h2>95 GiB that costs 64 KiB per token</h2>
+
+  <p class="col">This is the best-understood and highest-leverage component in the model, and I was able to recover its exact addressing scheme by reading the three int64 index tensors out of the checkpoint.</p>
+
+  <div class="tw"><table>
+    <caption>Recovered from <code>ngram_heads_offsets</code>, <code>ngram_heads_vocab_sizes</code>, <code>layer_multipliers</code> (all int64, read directly from shard data).</caption>
+    <thead><tr><th>Property</th><th>Value</th></tr></thead>
+    <tbody>
+      <tr><td>Heads</td><td class="mono">16, concatenated to form ple_embed_dim 2560</td></tr>
+      <tr><td>Row width</td><td class="mono">160 elements (16 × 160 = 2560)</td></tr>
+      <tr><td>Head vocab sizes</td><td class="mono">20000003, 20000023, 20000033, 20000047, 20000059, 20000063, 20000069, 20000077, 20000081, 20000093, 20000107, 20000147, 20000153, 20000159, 20000161, 20000171</td></tr>
+      <tr><td>Head offsets</td><td class="mono">cumulative: 0, 20000003, 40000026, … 300001275</td></tr>
+      <tr><td>Total rows</td><td class="mono">320,001,536 → split into 128 shards of 2,500,012</td></tr>
+      <tr><td>Hash constants</td><td class="mono">23703573157769, 20109073645365, 8052911324071 (ngram_size 3)</td></tr>
+    </tbody>
+  </table></div>
+
+  <p class="col">Every head vocabulary is a <strong>distinct prime just above 20,000,000</strong>. That is a textbook multi-probe hash: 16 independent moduli decorrelate collisions so that a token colliding in one head is almost certainly clean in the other fifteen. The practical consequence for us is the important part:</p>
+
+  <div class="note goodb">
+    <h4>PLE prefetch is exact, not speculative</h4>
+    <p>Row indices are a pure function of the last three <em>token IDs</em> — three multiply-mod operations against fixed constants. No hidden state, no model evaluation. So: for a prompt, all 16N rows are computable before the first layer runs. During decode, the moment token <em>t</em> is sampled you can issue its 16 reads, and they are not needed until layer 1 of the <em>next</em> forward pass — an entire pass of lead time for 16 random 4 KiB reads. <strong>This latency is fully hideable, with certainty.</strong> Contrast with expert prefetch, which is irreducibly speculative.</p>
+  </div>
+
+  <p class="col">This is independently confirmed by measurement on this exact model: llama.cpp discussion #27864 reports the n-gram table on SSD in on-demand <code>read</code> mode at <strong>36.08 tok/s decode versus 39.56 tok/s fully resident — an 8.8% cost</strong> to eliminate 26.8 GiB of RAM, with no caching beyond the filesystem page cache. Prefill suffers much more (554 → 273 tok/s, −51%) because prefill touches 16 rows per prompt token in a burst; batching and sorting those reads is the obvious fix and nobody has done it.</p>
+
+<pre><i># ---- PLE lookup path ----------------------------------------------------</i>
+<b>row_id</b>(head h, tokens [t0,t1,t2]):
+    x = (t0*M0) ^ (t1*M1) ^ (t2*M2)           <i># M = layer_multipliers</i>
+    <b>return</b> offsets[h] + (x mod vocab_sizes[h])
+
+<b>on_token_sampled</b>(t):                          <i># runs at sampling time, off critical path</i>
+    rows = [row_id(h, ctx[-3:]) for h in 0..15]
+    <b>for</b> r <b>in</b> rows:
+        <b>if</b> r <b>not in</b> row_cache: <em>io_uring_submit</em>(READ, ple_fd, byte_offset(r), 4096)
+
+<b>at_layer_1</b>(t):
+    e = concat([dequant(row_cache[r]) for r in rows])   <i># 16 × 160 → 2560</i>
+</pre>
+
+  <h4>On-disk layout rules</h4>
+  <ul class="tight col">
+    <li><strong>Separate addressable object</strong>, as you proposed — <code>ple/table.bin</code> + <code>ple/index.json</code>, not a tensor in the main package. Confirmed correct by #27864, which had to split it into its own GGUF to make offloading tractable.</li>
+    <li><strong>Row-aligned, group-per-row.</strong> Quantize each 160-element row as one symmetric group with an fp16 scale: 160×3 bits + 16 = 62 bytes at 3-bit. Pad to a power of two so a row never straddles two pages. A whole row must be readable in exactly one I/O.</li>
+    <li><strong>Order by head, then by row id</strong> — matching the natural offset layout. Rows within a head are hash-scattered, so there is no better locality to exploit; do not waste effort trying.</li>
+    <li><strong>Batch and sort prefill reads.</strong> A 2K prompt needs 32,768 row reads. Issued sorted, in one <code>io_uring</code> batch with depth 128, that is a coalesced sweep instead of a random walk — the fix for the −51% prefill regression measured upstream.</li>
+    <li><strong>Precision is nearly free here.</strong> At 64 KiB/token the read rate is irrelevant; choose PLE precision purely on quality. 3-bit costs 18.5 GiB, 4-bit costs 25.3 GiB. Neither affects throughput. Start at 4-bit and only shrink if disk space actually binds.</li>
+  </ul>
+</section>
+
+<section id="compute">
+  <span class="snum">10 — COMPUTE ARCHITECTURE</span>
+  <h2>CPU executes experts; GPU owns the dense spine</h2>
+
+  <p class="col">The PCIe arithmetic in §07 forces this split, and it is the opposite of the instinct to put everything on the GPU. For an expert already sitting in RAM, executing it on the CPU costs a 2.49 MiB streaming read at ~20 GB/s ≈ 0.12 ms. Uploading that same expert over a PCIe 3.0 ×4 laptop link costs ~0.78 ms before any compute happens. <strong>CPU-resident expert execution is ~6× cheaper than shipping the weights to the GPU</strong>, and the gap widens on narrower links.</p>
+
+  <div class="tw"><table>
+    <caption>Per-token cost by placement, 480 expert executions, 4-bit.</caption>
+    <thead><tr><th>Placement</th><th>Execution</th><th class="n">Cost/token</th><th>When to choose it</th></tr></thead>
+    <tbody>
+      <tr><td>Dense core</td><td>GPU, VRAM-resident</td><td class="n">11.5 ms</td><td>Always. Read every token, fits, no transfer.</td></tr>
+      <tr><td>Expert in VRAM</td><td>GPU low-bit GEMV</td><td class="n">~6 ms</td><td>Only for the sustained-hot head of the distribution</td></tr>
+      <tr class="hi"><td><strong>Expert in RAM</strong></td><td><strong>CPU low-bit GEMV</strong></td><td class="n"><strong>~62 ms</strong></td><td><strong>Default path.</strong> No PCIe cost.</td></tr>
+      <tr><td>Expert in RAM</td><td>Upload + GPU</td><td class="n">104–390 ms</td><td>Effectively never at batch 1</td></tr>
+      <tr><td>Expert on SSD</td><td>Fetch → RAM → CPU</td><td class="n">+ I/O from §07</td><td>The miss path</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>Kernels</h3>
+  <p class="col">Do not write your own from scratch, and do not dequantize to fp16 before multiplying — that is the anti-pattern you correctly identified, and it converts a bandwidth win into a bandwidth loss. Two concrete techniques from the measured systems:</p>
+  <ul class="tight col">
+    <li><strong>CPU: LUT-based low-bit GEMV (T-MAC style).</strong> For W2A8/W4A8 at batch 1, precompute partial products into a lookup table and replace multiply-accumulate with table lookups plus adds. This is the right primitive for the expert path, where the weights are low-bit and the activation is a single vector.</li>
+    <li><strong>GPU: fuse dequant into the FMA.</strong> Flash-MoE measured a 12% gain purely by rewriting <code>(nibble*scale + bias)*x</code> as <code>fma(nibble, scale*x, bias*x)</code>, precomputing <code>scale*x</code> and <code>bias*x</code> so the FMA unit does dequantization and multiplication in one instruction. Cheap, and it applies directly to any CUDA port.</li>
+    <li><strong>Keep the GDN recurrence on BLAS.</strong> The 48-head × 128×128 fp32 state update is a <code>sgemv</code>/<code>sger</code> pattern; Flash-MoE reported 64% over scalar code by calling into a tuned BLAS. Do not hand-roll it.</li>
+  </ul>
+
+  <div class="note goodb">
+    <h4>An advantage your hardware has over every system cited here</h4>
+    <p>Flash-MoE's headline constraint was that on Apple Silicon, SSD DMA and GPU compute contend for one memory controller, so the pipeline had to be <em>serial</em>: GPU → SSD → GPU. On x86 with a discrete GPU, NVMe DMA lands in system RAM over its own PCIe lanes while the GPU works out of VRAM. <strong>You can genuinely overlap expert I/O with dense compute; they could not.</strong> This is the one place where 4 GB VRAM + 12 GB RAM + NVMe is architecturally <em>better</em> than a 48 GB M3 Max, and the design should exploit it aggressively — it is what makes the §08 prefetch pipeline worth building.</p>
+  </div>
+</section>
+
+<section id="runtime">
+  <span class="snum">11 — RUNTIME RECOMMENDATION</span>
+  <h2>Fork llama.cpp. Do not build a runtime, and do not use vLLM or SGLang.</h2>
+
+  <div class="tw"><table>
+    <caption>Scored against what this project actually needs.</caption>
+    <thead><tr><th>Requirement</th><th>llama.cpp</th><th>vLLM</th><th>SGLang</th><th>MLC</th><th>Custom</th></tr></thead>
+    <tbody>
+      <tr><td>Qwen3.8 <code>qwen4_exp</code> support today</td><td>✅ shipped + GGUFs published</td><td>❌</td><td>❌</td><td>❌</td><td>❌</td></tr>
+      <tr><td>Run model ≫ RAM</td><td>✅ mmap-native</td><td>❌ assumes resident</td><td>❌</td><td>❌</td><td>✅</td></tr>
+      <tr><td>PLE / n-gram offload</td><td>✅ branch exists (#27864)</td><td>❌</td><td>❌</td><td>❌</td><td>✅</td></tr>
+      <tr><td>Expert paging precedent</td><td>✅ 4 discussions, working forks</td><td>❌</td><td>❌</td><td>❌</td><td>✅</td></tr>
+      <tr><td>CPU/GPU heterogeneous exec</td><td>✅ core design</td><td>⚠️ CPU offload only</td><td>⚠️</td><td>❌</td><td>✅</td></tr>
+      <tr><td>Custom quant formats</td><td>✅ GGUF type registry</td><td>⚠️ via compressed-tensors</td><td>⚠️</td><td>⚠️</td><td>✅</td></tr>
+      <tr><td>Effort to first correct token</td><td><strong>low</strong></td><td>very high</td><td>very high</td><td>very high</td><td>extreme</td></tr>
+    </tbody>
+  </table></div>
+
+  <p class="col">vLLM and SGLang are throughput servers built on the assumption of a resident model and paged <em>KV</em>, not paged <em>weights</em>. Their strengths — continuous batching, prefix caching, high-occupancy CUDA graphs — are all irrelevant at batch 1 on 4 GB, and their core memory manager is the thing you would have to tear out. Choosing either means fighting the framework for months.</p>
+
+  <p class="col">llama.cpp is not merely tolerable, it is where this problem is <em>already being worked on</em>: it has the architecture support, the published GGUFs for this exact checkpoint, a PLE-offload branch, and four separate expert-paging efforts. Your realistic path is a fork with a PocketTitan storage layer beneath <code>ggml</code>.</p>
+
+  <h3>Division of labor</h3>
+  <div class="tw"><table>
+    <thead><tr><th>PocketTitan owns</th><th>llama.cpp / ggml owns</th></tr></thead>
+    <tbody>
+      <tr><td>Capability-filtered streaming conversion &amp; packaging</td><td>Tokenizer, chat template, sampling</td></tr>
+      <tr><td>Mixed-precision assignment &amp; calibration</td><td>GDN recurrence, attention, indexer, RMSNorm</td></tr>
+      <tr><td>On-disk expert repacking &amp; layout</td><td>Graph scheduling, backend dispatch</td></tr>
+      <tr><td>Expert residency manager &amp; prefetch</td><td>Low-bit GEMV kernels (extend, don't replace)</td></tr>
+      <tr><td>PLE row store &amp; async lookup</td><td>KV cache management</td></tr>
+      <tr><td>Routing profiler &amp; simulator</td><td>—</td></tr>
+    </tbody>
+  </table></div>
+  <p class="col">Keep the Python packaging pipeline you have; it is genuinely useful and independent of the runtime choice. Retire the ambition to implement transformer ops yourself.</p>
+</section>
+
+<section id="sim">
+  <span class="snum">12 — SIMULATOR DESIGN</span>
+  <h2>Trace schema and evaluation harness</h2>
+  <p class="col">You asked whether the simulator should be the immediate milestone. Nearly — but a simulator fed by <em>assumed</em> routing distributions would only tell you about your assumptions. It needs a real trace first, which is why §17 pairs them. The schema below is deliberately narrow: one record per expert access, and everything else derivable.</p>
+
+<pre><i># trace record — one per (token, layer, expert), ~2 KB/token uncompressed</i>
+{ "tok": 412, "layer": 17, "slot": 8, "expert": 331, "weight": 0.093,
+  "rank": 2, "router_entropy": 1.84, "prompt_id": "gsm8k-041", "phase": "decode" }
+
+<i># separate PLE stream</i>
+{ "tok": 412, "rows": [17_442_919, 20_918_233, ...] }   <i># 16 ids</i>
+
+<i># hardware model (config, not trace)</i>
+{ "ssd": {"bw_GBs": 5.0, "lat_us": 90, "qd": 32},
+  "pcie": {"bw_GBs": 6.0}, "ram_bw_GBs": 20, "vram_bw_GBs": 200,
+  "ram_budget_GiB": 7.0, "vram_budget_GiB": 0.8,
+  "expert_bytes": 2_611_200, "cpu_gflops": 60 }
+</pre>
+
+  <div class="tw"><table>
+    <caption>Simulator sweep axes and reported metrics.</caption>
+    <thead><tr><th>Sweep</th><th>Values</th></tr></thead>
+    <tbody>
+      <tr><td>Policy</td><td>OS-page-cache (baseline) · LRU · LFU · SLRU · TinyLFU · session-pinned · oracle</td></tr>
+      <tr><td>RAM slots</td><td>512 · 1024 · 2048 · 2880 · 5437 · ∞ (oracle upper bound)</td></tr>
+      <tr><td>Prefetch</td><td>none · next-layer speculative (m = 10,12,14,16) · perfect oracle</td></tr>
+      <tr><td>Expert bits</td><td>4.25 · 3.25 · 2.25 · split hot4/cold2</td></tr>
+      <tr><td>SSD</td><td>3 / 5 / 7 GB/s × latency 60/90/150 µs</td></tr>
+      <tr><td><strong>Reports</strong></td><td>hit rate by tier · SSD bytes &amp; IOPS/token · PCIe bytes/token · stall vs compute vs I/O ms · <strong>modelled tok/s</strong> · eviction churn · working-set size over time</td></tr>
+    </tbody>
+  </table></div>
+
+  <p class="col">Two properties matter more than sophistication. First, the <strong>oracle bound</strong>: replay with perfect knowledge of future accesses to get the maximum achievable hit rate at each cache size. If oracle at 2,880 slots is only 35%, no policy will save you and the answer is 2-bit experts or more RAM — you learn that in an afternoon instead of a quarter. Second, <strong>validation against a real run</strong>: the simulator's predicted tok/s must be checked against measured llama.cpp throughput on the same trace, or it is fiction.</p>
+</section>
+
+<section id="exp">
+  <span class="snum">13 — EXPERIMENTAL PLAN</span>
+  <h2>Incremental, measurable, each gating the next</h2>
+
+  <div class="tw"><table>
+    <thead><tr><th>#</th><th>Experiment</th><th>Measures</th><th>Gate — proceed only if</th></tr></thead>
+    <tbody>
+      <tr><td class="n">E1</td><td>Replicate #27864: run published IQ4_NL GGUF with <code>--ngram-load-mode read</code></td><td>tok/s, RSS, correctness on 20 prompts</td><td>Model produces coherent text on your hardware at all</td></tr>
+      <tr><td class="n">E2</td><td>Instrument top-k routing; capture 50K-token trace across 5 task types</td><td>Expert frequency distribution, entropy, per-layer skew</td><td>Trace is complete and reproducible</td></tr>
+      <tr><td class="n">E3</td><td>Offline cache simulation + oracle bound on E2 trace</td><td>Hit rate vs slots vs policy</td><td><strong>Oracle @2880 slots ≥ 50%</strong>, else pivot to 2-bit</td></tr>
+      <tr><td class="n">E4</td><td>OS page cache vs custom cache, matched workload</td><td>tok/s, hit rate, RSS stability</td><td>Custom beats <code>mmap</code> by &gt;15%, else drop §08</td></tr>
+      <tr><td class="n">E5</td><td>Expert repacking <code>[gate_up‖down]</code> contiguous</td><td>Reads/token, effective SSD bandwidth</td><td>≥1.3× effective bandwidth</td></tr>
+      <tr><td class="n">E6</td><td>Next-layer speculative prefetch, sweep m</td><td>Prediction accuracy, stall ms, net tok/s</td><td>Net positive after eviction cost</td></tr>
+      <tr><td class="n">E7</td><td>Quality: 4-bit vs 3-bit vs 2-bit experts</td><td><strong>JSON validity, tool-call schema conformance</strong>, GSM8K, HumanEval, IFEval, long-context retrieval, and perplexity last</td><td>Chosen config passes structured-output evals</td></tr>
+      <tr><td class="n">E8</td><td>Sorted/batched PLE prefill reads</td><td>Prefill tok/s vs upstream's −51%</td><td>Recover ≥half the regression</td></tr>
+      <tr><td class="n">E9</td><td>Session-adaptive pinning after 64 tokens</td><td>tok/s at token 100 vs token 1000</td><td>Sustained gain, not just warmup</td></tr>
+    </tbody>
+  </table></div>
+  <p class="col">E7's ordering is deliberate and is the lesson from Flash-MoE: perplexity is the <em>last</em> metric, because it is the one that will fail to detect the failure mode that actually matters.</p>
+</section>
+
+<section id="road">
+  <span class="snum">14 — ROADMAP</span>
+  <h2>Revised sequence</h2>
+  <p class="col">Your proposed ordering front-loads the capability stripper and streaming quantizer — the two things §05 shows are worth 1.7% — and defers profiling to Phase 3. I would invert that. Profile first, because the profile determines whether phases 6–8 are worth building at all.</p>
+
+  <div class="road">
+    <div class="ph done"><span class="p">P0</span><div><strong>Tensor/model audit</strong> — exact component sizes, dependency graph, PLE addressing</div><span class="w">done (§03)</span></div>
+    <div class="ph"><span class="p">P1</span><div><strong>Routing profiler</strong> — instrument llama.cpp top-k, capture real traces on the published GGUF</div><span class="w">1–2 wks</span></div>
+    <div class="ph"><span class="p">P2</span><div><strong>Memory hierarchy simulator</strong> — policy sweep + oracle bound on P1 traces</div><span class="w">1 wk</span></div>
+    <div class="ph"><span class="p">P3</span><div><strong>Packager v1</strong> — capability filter (text-only) + expert repacking + mixed-precision map, streaming, shard-at-a-time</div><span class="w">2–3 wks</span></div>
+    <div class="ph"><span class="p">P4</span><div><strong>PLE SSD row store</strong> — separate object, exact prefetch, sorted prefill batching</div><span class="w">2 wks</span></div>
+    <div class="ph"><span class="p">P5</span><div><strong>Expert paging</strong> — bounded residency, policy chosen by P2, only if it beat <code>mmap</code></div><span class="w">3–4 wks</span></div>
+    <div class="ph"><span class="p">P6</span><div><strong>Speculative prefetch</strong> — next-layer routing, I/O–compute overlap</div><span class="w">2 wks</span></div>
+    <div class="ph"><span class="p">P7</span><div><strong>VRAM hot tier</strong> — LFU promotion, session pinning</div><span class="w">2 wks</span></div>
+    <div class="ph"><span class="p">P8</span><div><strong>Low-bit kernels</strong> — LUT CPU GEMV, fused-dequant CUDA</div><span class="w">4+ wks</span></div>
+    <div class="ph"><span class="p">P9</span><div><strong>Runtime-aware precision</strong> — hot/cold expert split, informed by production traces</div><span class="w">open</span></div>
+  </div>
+
+  <p class="col">Three changes from your draft, each with a reason: the <strong>capability stripper folds into P3</strong> because it is a filter, not a phase. The <strong>profiler moves ahead of everything</strong> because it is the cheapest way to invalidate the expensive phases. And the <strong>streaming quantizer moves after the simulator</strong>, because P2 tells you which precision to actually target and you would otherwise quantize the model twice.</p>
+</section>
+
+<section id="risk">
+  <span class="snum">15 — RISKS &amp; LIKELY DEAD ENDS</span>
+  <h2>What I would not spend effort on</h2>
+
+  <div class="tw"><table>
+    <thead><tr><th>Idea</th><th>Verdict</th><th>Reasoning</th></tr></thead>
+    <tbody>
+      <tr><td>Uniform 1-bit / 1.58-bit experts</td><td><strong>Drop</strong></td><td>1.8× bandwidth over 2-bit for a measured categorical loss in structured output. The repo's ternary quantizer is aimed at the wrong target.</td></tr>
+      <tr><td>Selective shard downloading for capability pruning</td><td><strong>Drop</strong></td><td>Vision occupies 1 mixed shard of 131. There is nothing to skip.</td></tr>
+      <tr><td>Vocabulary trimming of vision tokens</td><td><strong>Drop</strong></td><td>Saves ~5 rows; risks desynchronizing embed/lm_head/tokenizer.</td></tr>
+      <tr><td>Elaborate cache hierarchy before measurement</td><td><strong>Defer</strong></td><td>Three independent custom caches lost to the OS page cache in Flash-MoE; LRU64 ≈ LRU32 in #27712.</td></tr>
+      <tr><td>Co-activation-based expert reordering</td><td><strong>Defer</strong></td><td>Real but second-order. Contiguous <code>[gate_up‖down]</code> repacking captures most of the win for a fraction of the effort. Revisit after E5.</td></tr>
+      <tr><td>Building a runtime from scratch</td><td><strong>Drop</strong></td><td>You would reimplement GDN, sparse-attention indexing, mRoPE, hyper-connections — all already working upstream.</td></tr>
+      <tr><td>vLLM / SGLang as the base</td><td><strong>Drop</strong></td><td>No architecture support, resident-model assumption, wrong optimization target at batch 1.</td></tr>
+      <tr><td>Uploading missed experts to VRAM for execution</td><td><strong>Drop at batch 1</strong></td><td>PCIe transfer costs ~6× CPU execution from RAM.</td></tr>
+      <tr><td>Artificially capping context to save memory</td><td><strong>Unnecessary</strong></td><td>8K context costs 330 MiB total. The hybrid architecture already solved this.</td></tr>
+      <tr><td>Dropping MTP</td><td><strong>Do it</strong></td><td>Safe, saves 4.86 GiB bf16 — 10× more than vision, and nobody was talking about it.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Live risks</h4>
+  <ul class="tight col">
+    <li><strong>Cache capacity may be too small.</strong> 11.7% of experts at 4-bit. If oracle hit rate at that size is low, 4-bit becomes unaffordable and you are pushed to 2-bit — into the quality regime Flash-MoE flagged. E3 resolves this and it is the single highest-information experiment available.</li>
+    <li><strong>Windows I/O.</strong> Every cited result is Linux or macOS. <code>io_uring</code> has no Windows equivalent; you need overlapped I/O with <code>FILE_FLAG_NO_BUFFERING</code>, and Windows' page cache behaves differently under memory pressure. Budget real time, or develop under WSL2 and accept its filesystem penalty.</li>
+    <li><strong>4 GB VRAM is genuinely tight.</strong> The 2.13 GiB dense core assumes 3-bit GDN. If GDN needs 4-bit for quality, that becomes 2.4 GiB and the VRAM hot-expert tier nearly disappears. Not fatal — CPU execution is the default path anyway — but it removes an optimization.</li>
+    <li><strong>Speculative prefetch may not pay.</strong> Cross-layer routing correlation in a 512-expert top-10 router is unmeasured. If accuracy is near chance, prefetch causes evictions and net harm. E6 has an explicit kill condition; honor it.</li>
+  </ul>
+</section>
+
+<section id="novel">
+  <span class="snum">16 — NOVELTY</span>
+  <h2>What is actually new here</h2>
+  <p class="col">Held to your standard — combination is not contribution — most of the proposed ideas are already occupied. Honest assessment, with the caveat from §02 that I could not complete a full literature sweep:</p>
+
+  <div class="tw"><table>
+    <thead><tr><th>Proposed contribution</th><th>Status</th><th>Prior art</th></tr></thead>
+    <tbody>
+      <tr><td>A. Capability-aware streaming compiler</td><td>Not novel</td><td>GGUF conversion already separates <code>mmproj</code> and drops MTP</td></tr>
+      <tr><td>C. Three-level NVMe↔RAM↔VRAM virtual memory</td><td>Not novel</td><td>FlexGen, PowerInfer-2, MoE-Infinity, #24528</td></tr>
+      <tr><td>D. Unified sparse storage for PLE + experts</td><td>Weakly novel</td><td>Both offloaded separately upstream; no unified manager exists, but the value of unifying them is unproven</td></tr>
+      <tr><td>F. Session-adaptive residency</td><td>Weakly novel</td><td>#27712 does bounded residency; session-scoped <em>adaptation</em> is less explored</td></tr>
+      <tr class="hi"><td><strong>B. Runtime-aware precision</strong> — bits assigned by routing frequency × tier</td><td><strong>Plausibly novel</strong></td><td>Saliency-based mixed precision is well covered (PTQ1.61, ParetoQ). Assigning precision from <em>measured routing frequency</em> so that cold experts compress harder <em>because</em> SSD bandwidth is the bottleneck is a storage-aware objective I have not seen posed.</td></tr>
+      <tr class="hi"><td><strong>G. Exact-prefetch PLE store</strong> — hash-derived, fully hideable row prefetch</td><td><strong>Plausibly novel</strong></td><td>#27864 demonstrated naive on-demand reads (−8.8% decode, −51% prefill) with no prefetch at all. Exploiting the fact that row ids are a pure function of token ids — so prefetch is exact, batchable and sortable — is unclaimed and directly fixes the measured prefill regression.</td></tr>
+    </tbody>
+  </table></div>
+
+  <h4>Research gaps nobody appears to have filled</h4>
+  <ul class="tight col">
+    <li><strong>No published expert-locality characterization for a 512-expert top-10 router at &lt;15% cache capacity.</strong> The 56–64% figures come from a different model at a far more generous ratio. This is a clean, publishable measurement and you are well positioned to make it.</li>
+    <li><strong>No measurement of cross-layer routing predictability</strong> in hybrid GDN/attention MoE stacks — i.e. does layer ℓ's hidden state predict layer ℓ+1's top-k above chance? This determines whether prefetch is viable for a whole class of systems.</li>
+    <li><strong>No quality-vs-bitwidth study that leads with structured output.</strong> Flash-MoE observed the JSON failure anecdotally; nobody has curve-fitted tool-call conformance against expert bit-width. Given how much agentic use depends on it, this is the most practically valuable result on this list.</li>
+    <li><strong>No comparison of OS page cache against custom expert caches under 12 GB pressure.</strong> Flash-MoE's "trust the OS" finding was on a 48 GB machine with ~35 GB of page cache. Whether it survives at 7 GiB is genuinely open and cheap to test.</li>
+  </ul>
+</section>
+
+<section id="next">
+  <span class="snum">17 — RECOMMENDED IMMEDIATE MILESTONE</span>
+  <h2>Build the routing profiler and the cache oracle</h2>
+
+  <div class="verdict">
+    <p class="vlead">One milestone: capture real expert-routing traces from Qwen3.8-Flash-Next, and compute the oracle hit-rate bound at your actual cache size.</p>
+    <p>It is the cheapest experiment that can invalidate the most work. If oracle hit rate at 2,880 slots is above ~50%, phases P5–P7 are justified and you know which policy to build. If it is below ~35%, you stop, switch to 2-bit experts, and skip the entire cache subsystem — saving a quarter. No other two weeks of work has that decision value.</p>
+  </div>
+
+  <dl class="spec">
+    <dt>Goal</dt><dd>Produce a reproducible expert-access trace for this model and a validated offline simulator that reports achievable hit rate and modelled tok/s under the 4 GB / 12 GB / NVMe budget.</dd>
+    <dt>Modules</dt><dd><code>pockettitan/profile/tracer.py</code> · <code>pockettitan/profile/schema.py</code> · <code>pockettitan/sim/cache.py</code> · <code>pockettitan/sim/hardware.py</code> · <code>pockettitan/sim/report.py</code> · <code>patches/llama-cpp-routing-trace.patch</code></dd>
+    <dt>Inputs</dt><dd>Published <code>Qwen3.8-Flash-Next-IQ4_NL</code> GGUF (95.2 GiB, mmap — it need not fit in RAM) · 5 prompt sets × ~10K tokens: chat, code, math, long-context retrieval, tool-calling · hardware profile JSON</dd>
+    <dt>Outputs</dt><dd><code>traces/*.jsonl.zst</code> (~2 KB/token) · <code>reports/oracle.md</code> with hit-rate-vs-slots curves per policy · a single go/no-go number for P5</dd>
+    <dt>Interfaces</dt><dd><code>Tracer.capture(prompt_set) -&gt; Trace</code> · <code>CachePolicy.access(layer, expert) -&gt; HIT|MISS</code> (implementations: <code>OSPageCache</code>, <code>LRU</code>, <code>SLRU</code>, <code>TinyLFU</code>, <code>Oracle</code>) · <code>HardwareModel.cost(bytes, reads) -&gt; ms</code> · <code>simulate(trace, policy, hw) -&gt; Report</code></dd>
+    <dt>Metrics</dt><dd>Hit rate by policy × slot count · oracle upper bound · SSD bytes and IOPS per token · Gini coefficient of expert frequency · per-layer routing entropy · cross-layer top-k overlap (the prefetch feasibility number) · modelled tok/s</dd>
+    <dt>Tests</dt><dd>Trace schema round-trips · <code>Oracle</code> ≥ every online policy at every size (correctness invariant) · <code>LRU(∞)</code> hit rate = 1 − (unique experts / accesses) · replaying a trace twice is bit-identical · hardware model reproduces §07's table to within 5%</dd>
+    <dt>Success</dt><dd><strong>Primary:</strong> ≥50K tokens traced across all 5 task types, with an oracle curve over 512–8192 slots. <strong>Decision:</strong> a stated go/no-go on P5 with the number behind it. <strong>Validation:</strong> simulator-predicted tok/s within 25% of measured llama.cpp throughput on the same trace — without this the simulator is not evidence.</dd>
+  </dl>
+
+  <div class="note">
+    <p><strong>Getting the trace is the only hard part, and it is tractable.</strong> The instrumentation is small: llama.cpp already computes router logits and top-k per MoE layer; you are appending <code>(token, layer, expert, weight)</code> to a buffer. Throughput will be poor on 12 GB — the 95 GiB GGUF will thrash through mmap at well under 1 tok/s — but that does not matter. Routing is a property of the model and the prompt, not of how fast you ran it. A weekend of slow generation produces a trace that answers a question worth a quarter of engineering time.</p>
+  </div>
+
+  <h3>On the hypothesis itself</h3>
+  <p class="col">You asked me to challenge it. I tried to, and it held: the working set really is decoupled from the model size here, and the numbers say so with more margin than the framing assumed. But the framing has one flaw worth naming. "Treat weights as a virtual address space" implies the runtime's job is <em>paging</em> — reacting to misses. The measurements suggest the opposite emphasis. Flash-MoE's best result came from removing custom paging and letting the OS handle it; #27864's PLE result works because the addresses are <em>knowable in advance</em>; #27712's gain came from bounding residency, not from smarter replacement. The reframing I would offer:</p>
+  <div class="note goodb">
+    <p style="font-family:Archivo,sans-serif;font-size:1.02rem;font-weight:600;line-height:1.45;margin:0">A sparse model is not a virtual address space to be paged. It is a <em>schedule of reads that is largely knowable before it is needed</em> — exactly knowable for PLE, statistically knowable for experts. The engineering problem is issuing those reads early enough, in large enough units, in the right order. Paging is what you do when you failed to schedule.</p>
+  </div>
+  <p class="col">That reframing is what makes §09 exact rather than speculative, what makes contiguous repacking matter more than clever eviction, and what turns the roadmap from "build a cache" into "build a profiler, then decide." It is also, I think, where the defensible novelty is.</p>
+</section>
+
+<section style="border-bottom:0">
+  <h4>Primary sources</h4>
+  <ul class="srcs">
+    <li><a href="https://huggingface.co/Qwen/Qwen3.8-Flash-Next">Qwen/Qwen3.8-Flash-Next</a> — config.json, model.safetensors.index.json, and all 131 safetensors headers, sha <code>de4b8e4d43b917e7706784d8bb445c9af86a3540</code>, read 2026-08-29</li>
+    <li><a href="https://huggingface.co/tarruda/Qwen3.8-Flash-Next-GGUF">tarruda/Qwen3.8-Flash-Next-GGUF</a> — IQ4_NL / Q5_K conversions, mmproj, file sizes via HF API</li>
+    <li><a href="https://github.com/ggml-org/llama.cpp/discussions/27864">llama.cpp #27864</a> — Qwen 4 PLE SSD offloading (2026-08-28), resident vs read benchmarks</li>
+    <li><a href="https://github.com/ggml-org/llama.cpp/discussions/27712">llama.cpp #27712</a> — Oversized MoE Runtime, Qwen3-Next-80B on 16 GB M1 (2026-08-25)</li>
+    <li><a href="https://github.com/ggml-org/llama.cpp/discussions/27149">llama.cpp #27149</a> — Expert-Aware SSD Streaming (2026-08-15)</li>
+    <li><a href="https://github.com/ggml-org/llama.cpp/discussions/25779">llama.cpp #25779</a> — Explicit-read expert prefetch, +31–52% tok/s (2026-07-16)</li>
+    <li><a href="https://github.com/ggml-org/llama.cpp/discussions/24528">llama.cpp #24528</a> — RFC: MoE expert cache, VRAM caching of hot experts (2026-06-12)</li>
+    <li><a href="https://github.com/ggml-org/llama.cpp/discussions/23324">llama.cpp #23324</a> — RFC+PoC: MoE offload to disk with on-demand paging (2026-05-19)</li>
+    <li><a href="https://github.com/danveloper/flash-moe">danveloper/flash-moe</a> — Qwen3.5-397B-A17B on M3 Max, 4.36 tok/s at 4-bit, "trust the OS" finding</li>
+    <li><a href="https://github.com/dimitripavlov/oversized-moe-runtime">dimitripavlov/oversized-moe-runtime</a> — bounded residency benchmarks</li>
+  </ul>
+  <p class="byline" style="margin-top:2.4em">Unverified this session: broad arXiv/2026 proceedings sweep (T-MAC, PTQ1.61, ParetoQ, AQLM, QuIP#, MoE-Infinity, PowerInfer-2 are cited from prior knowledge, not re-checked — web search returned a backend error throughout).</p>
+</section>
+
+</div>
+</body>
+</html>
