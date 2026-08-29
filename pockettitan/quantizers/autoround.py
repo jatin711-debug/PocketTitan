@@ -1,11 +1,11 @@
-"""AutoRound Gradient-Optimized Weight Rounding Quantizer (Milestone 1)."""
+"""AutoRound Gradient-Optimized Weight Rounding Quantizer."""
 
 import math
 from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 
-from pockettitan.config import QuantConfig, QuantMethod
+from pockettitan.config import CalibrationRequiredError, QuantConfig, QuantMethod
 from pockettitan.quantizers.base import BaseQuantizer, QuantizerCapabilities, QuantizedResult
 from pockettitan.quantizers.rtn import RTNQuantizer
 
@@ -23,12 +23,13 @@ class AutoRoundQuantizer(BaseQuantizer):
         return QuantizerCapabilities(
             name="autoround",
             requires_calibration=True,
-            legal_split_axes=(0,),
+            legal_split_axes=("out_features",),
             requires_full_input_dim=True,
             requires_full_output_dim=False,
             global_state="hessian",
             supports_cpu=True,
             supports_cuda=True,
+            supports_remote_streaming=True,
             workspace_multiplier=3.5,
         )
 
@@ -36,11 +37,18 @@ class AutoRoundQuantizer(BaseQuantizer):
         self,
         weight: torch.Tensor,
         hessian: Optional[torch.Tensor] = None,
+        outlier_indices: Optional[torch.Tensor] = None,
     ) -> QuantizedResult:
         orig_shape = weight.shape
         orig_dtype = weight.dtype
         device = str(weight.device)
         
+        # Enforce Calibration Safety Contract: AutoRound strictly requires calibration activations/Hessian
+        if hessian is None:
+            raise CalibrationRequiredError(
+                "AutoRound quantization strictly requires calibration data/activations for gradient descent optimization."
+            )
+
         w_2d = weight.view(-1, orig_shape[-1]).clone().float()
         out_features, in_features = w_2d.shape
         group_size = self.config.group_size if self.config.group_size > 0 else in_features
@@ -63,8 +71,6 @@ class AutoRoundQuantizer(BaseQuantizer):
         # Initial continuous code
         w_cont = w_grouped / scale + zero
         w_floor = torch.floor(w_cont)
-        # Learnable soft rounding parameter V: Q = w_floor + sigmoid(V)
-        # Initialize V such that sigmoid(V) matches fractional part
         frac = (w_cont - w_floor).clamp(1e-4, 1.0 - 1e-4)
         v = torch.logit(frac)
         v.requires_grad_(True)
@@ -74,12 +80,10 @@ class AutoRoundQuantizer(BaseQuantizer):
         # Optimization loop minimizing reconstruction loss
         for _ in range(self.iters):
             optimizer.zero_grad()
-            # Rectified soft rounding: h(v) = clamp(sigmoid(v) * (zeta - gamma) + gamma, 0, 1)
             soft_q = torch.clamp(torch.sigmoid(v) * 1.2 - 0.1, 0.0, 1.0)
             q_candidate = (w_floor + soft_q).clamp(0, max_int)
             w_deq = (q_candidate - zero) * scale
             
-            # Loss = || W - W_deq ||_F^2
             loss = torch.sum((w_grouped - w_deq) ** 2)
             loss.backward()
             optimizer.step()

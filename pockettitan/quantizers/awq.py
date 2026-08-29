@@ -1,11 +1,11 @@
-"""Activation-Weighted Quantization (AWQ) Backend (Milestone 1)."""
+"""Activation-Weighted Quantization (AWQ) Backend."""
 
 import math
 from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 
-from pockettitan.config import QuantConfig, QuantMethod
+from pockettitan.config import CalibrationRequiredError, QuantConfig, QuantMethod
 from pockettitan.quantizers.base import BaseQuantizer, QuantizerCapabilities, QuantizedResult
 from pockettitan.quantizers.rtn import RTNQuantizer
 
@@ -22,12 +22,13 @@ class AWQQuantizer(BaseQuantizer):
         return QuantizerCapabilities(
             name="awq",
             requires_calibration=True,
-            legal_split_axes=(0,),
+            legal_split_axes=("out_features",),
             requires_full_input_dim=True,
             requires_full_output_dim=False,
             global_state="hessian",
             supports_cpu=True,
             supports_cuda=True,
+            supports_remote_streaming=True,
             workspace_multiplier=2.5,
         )
 
@@ -35,11 +36,19 @@ class AWQQuantizer(BaseQuantizer):
         self,
         weight: torch.Tensor,
         hessian: Optional[torch.Tensor] = None,
+        outlier_indices: Optional[torch.Tensor] = None,
     ) -> QuantizedResult:
         orig_shape = weight.shape
         orig_dtype = weight.dtype
         device = str(weight.device)
         
+        # Enforce Calibration Safety Contract: AWQ strictly requires empirical activation statistics/Hessian
+        if hessian is None:
+            raise CalibrationRequiredError(
+                "AWQ quantization strictly requires activation statistics or Hessian diagonal from calibration data. "
+                "Silent fallback to uniform weights is prohibited to guarantee quantization fidelity."
+            )
+
         w_2d = weight.view(-1, orig_shape[-1]).clone().float()
         out_features, in_features = w_2d.shape
         group_size = self.config.group_size if self.config.group_size > 0 else in_features
@@ -52,12 +61,9 @@ class AWQQuantizer(BaseQuantizer):
         num_groups = padded_in_features // group_size
         
         # 1. Extract activation scales from diagonal of Hessian: s = diag(H)^0.5
-        if hessian is not None:
-            act_scales = torch.sqrt(torch.clamp(torch.diag(hessian.float()), min=1e-5)).to(weight.device)
-            if pad_k > 0:
-                act_scales = F.pad(act_scales, (0, pad_k), value=1.0)
-        else:
-            act_scales = torch.ones(padded_in_features, device=weight.device)
+        act_scales = torch.sqrt(torch.clamp(torch.diag(hessian.float()), min=1e-5)).to(weight.device)
+        if pad_k > 0:
+            act_scales = F.pad(act_scales, (0, pad_k), value=1.0)
             
         act_scales = act_scales / torch.mean(act_scales).clamp(min=1e-5)
         
@@ -69,7 +75,6 @@ class AWQQuantizer(BaseQuantizer):
         
         for step in range(self.grid_search_steps):
             ratio = step / max(1, self.grid_search_steps - 1)
-            # Candidate scales: s = act_scales ^ ratio
             scales = (act_scales ** ratio).clamp(min=1e-4)
             
             # Scale weights
@@ -108,7 +113,7 @@ class AWQQuantizer(BaseQuantizer):
             packed_weights=packed,
             scales=scale_grouped.view(out_features, num_groups).to(torch.float16),
             zeros=zero_grouped.view(out_features, num_groups).to(torch.float16),
-            codebook=best_scales.to(torch.float16),  # Store AWQ channel scales in codebook field
+            codebook=best_scales.to(torch.float16),
             quant_config=self.config,
             original_shape=orig_shape,
             original_dtype=orig_dtype,
@@ -133,7 +138,6 @@ class AWQQuantizer(BaseQuantizer):
         deq_scaled = (w_grouped - zero_grouped) * scale_grouped
         deq = deq_scaled.view(out_features, padded_in_features)
         
-        # Undo AWQ channel scales
         if quantized.codebook is not None:
             deq = deq / quantized.codebook.float().view(1, -1)
             

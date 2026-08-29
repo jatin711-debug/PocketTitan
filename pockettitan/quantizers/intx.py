@@ -20,12 +20,13 @@ class INTxQuantizer(BaseQuantizer):
         return QuantizerCapabilities(
             name=f"int{self.config.bits}",
             requires_calibration=False,
-            legal_split_axes=(0, 1),
-            requires_full_input_dim=False,
+            legal_split_axes=("out_features",),
+            requires_full_input_dim=True,
             requires_full_output_dim=False,
             global_state=None,
             supports_cpu=True,
             supports_cuda=True,
+            supports_remote_streaming=True,
             workspace_multiplier=1.5,
         )
 
@@ -33,6 +34,7 @@ class INTxQuantizer(BaseQuantizer):
         self,
         weight: torch.Tensor,
         hessian: Optional[torch.Tensor] = None,
+        outlier_indices: Optional[torch.Tensor] = None,
     ) -> QuantizedResult:
         return self._rtn.quantize(weight, hessian)
 

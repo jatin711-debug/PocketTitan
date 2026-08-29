@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from huggingface_hub import HfApi, hf_hub_url
 
 from pockettitan.config import ModelMetadata, TensorAddress
+from pockettitan.models.adapters import get_model_adapter
 
 
 def is_remote_repo(model_id_or_path: str) -> bool:
@@ -82,87 +83,25 @@ def fetch_model_index(
 
 
 def extract_moe_specs(config: Dict[str, Any]) -> Dict[str, Any]:
-    """Extract MoE routing and expert dimensions across diverse model families."""
-    is_moe = False
-    num_experts = None
-    num_experts_per_tok = None
-    expert_intermediate_size = None
-    shared_expert_intermediate_size = None
-    
-    # Check common MoE keys (Mixtral, DeepSeek, Qwen-MoE, GLM, DBRX, JetMoE)
-    moe_keys = [
-        "n_routed_experts", "num_local_experts", "num_experts", "moe_num_experts",
-        "n_experts", "num_routed_experts"
-    ]
-    for key in moe_keys:
-        if key in config and config[key] is not None:
-            num_experts = int(config[key])
-            is_moe = True
-            break
-            
-    # Active experts per token
-    top_k_keys = [
-        "num_experts_per_tok", "n_active_experts", "num_experts_per_token",
-        "top_k", "moe_top_k", "moe_num_experts_per_tok"
-    ]
-    for key in top_k_keys:
-        if key in config and config[key] is not None:
-            num_experts_per_tok = int(config[key])
-            is_moe = True
-            break
-            
-    # Expert intermediate sizes
-    exp_size_keys = [
-        "moe_intermediate_size", "expert_intermediate_size",
-        "intermediate_size_moe", "moe_dim"
-    ]
-    for key in exp_size_keys:
-        if key in config and config[key] is not None:
-            expert_intermediate_size = int(config[key])
-            break
-            
-    # Shared experts (DeepSeek / GLM style)
-    shared_keys = ["n_shared_experts", "num_shared_experts"]
-    for key in shared_keys:
-        if key in config and config[key] is not None:
-            num_shared = int(config[key])
-            if num_shared > 0:
-                is_moe = True
-                if "shared_expert_intermediate_size" in config:
-                    shared_expert_intermediate_size = int(config["shared_expert_intermediate_size"])
-                elif expert_intermediate_size is not None:
-                    shared_expert_intermediate_size = expert_intermediate_size * num_shared
-            break
-
-    return {
-        "is_moe": is_moe,
-        "num_experts": num_experts,
-        "num_experts_per_tok": num_experts_per_tok,
-        "expert_intermediate_size": expert_intermediate_size,
-        "shared_expert_intermediate_size": shared_expert_intermediate_size,
-    }
+    """Extract MoE routing and expert dimensions via model adapter."""
+    adapter = get_model_adapter(config)
+    return adapter.extract_moe_topology()
 
 
 def inspect_model_repository(
     model_id_or_path: str,
     token: Optional[str] = None,
 ) -> ModelMetadata:
-    """Inspect repository metadata and build complete model descriptor."""
+    """Inspect repository metadata and build complete model descriptor using model adapter."""
     repo_files = list_repository_files(model_id_or_path, token=token)
     config = fetch_model_config(model_id_or_path, token=token)
     index = fetch_model_index(model_id_or_path, available_files=repo_files, token=token)
-    moe_specs = extract_moe_specs(config)
     
-    architectures = config.get("architectures", ["UnknownModel"])
-    architecture = architectures[0] if isinstance(architectures, list) and architectures else "UnknownModel"
-    
-    hidden_size = config.get("hidden_size", config.get("d_model", 4096))
-    num_hidden_layers = config.get("num_hidden_layers", config.get("n_layer", config.get("num_layers", 32)))
-    num_attention_heads = config.get("num_attention_heads", config.get("n_head", 32))
-    num_key_value_heads = config.get("num_key_value_heads", num_attention_heads)
-    intermediate_size = config.get("intermediate_size", config.get("n_inner", None))
-    vocab_size = config.get("vocab_size", 32000)
-    source_dtype = config.get("torch_dtype", "bfloat16")
+    adapter = get_model_adapter(config)
+    dims = adapter.extract_dimensions()
+    moe_specs = adapter.extract_moe_topology()
+    architecture = adapter.extract_architecture_name()
+    source_dtype, is_fp8 = adapter.extract_source_dtype()
     
     shards: List[str] = []
     
@@ -180,18 +119,20 @@ def inspect_model_repository(
     return ModelMetadata(
         model_id_or_path=model_id_or_path,
         architecture=architecture,
-        hidden_size=hidden_size,
-        num_hidden_layers=num_hidden_layers,
-        num_attention_heads=num_attention_heads,
-        num_key_value_heads=num_key_value_heads,
-        intermediate_size=intermediate_size,
-        vocab_size=vocab_size,
+        hidden_size=dims["hidden_size"],
+        num_hidden_layers=dims["num_hidden_layers"],
+        num_attention_heads=dims["num_attention_heads"],
+        num_key_value_heads=dims.get("num_key_value_heads", dims["num_attention_heads"]),
+        intermediate_size=dims.get("intermediate_size"),
+        vocab_size=dims.get("vocab_size", 32000),
         is_moe=moe_specs["is_moe"],
         num_experts=moe_specs["num_experts"],
         num_experts_per_tok=moe_specs["num_experts_per_tok"],
         expert_intermediate_size=moe_specs["expert_intermediate_size"],
         shared_expert_intermediate_size=moe_specs["shared_expert_intermediate_size"],
+        first_k_dense_replace=moe_specs.get("first_k_dense_replace"),
         source_dtype=str(source_dtype),
+        is_fp8_source=is_fp8,
         total_params=total_params,
         active_params=total_params,
         shards=shards,

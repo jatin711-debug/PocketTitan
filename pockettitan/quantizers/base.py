@@ -13,13 +13,14 @@ class QuantizerCapabilities:
     """Explicit mathematical and architectural constraints for a quantizer backend."""
     name: str
     requires_calibration: bool
-    legal_split_axes: Tuple[int, ...]  # (0,) means can split on out_features, (0, 1) means arbitrary 2D tiling
-    requires_full_input_dim: bool     # True if must see entire in_features column
-    requires_full_output_dim: bool    # True if must see entire out_features row
-    global_state: Optional[str]        # e.g. 'hessian', 'activation_max', None
+    legal_split_axes: Tuple[str, ...]   # ("out_features",) means can split on out_features rows
+    requires_full_input_dim: bool      # True if algorithm requires seeing the complete in_features column
+    requires_full_output_dim: bool     # True if algorithm requires seeing the complete out_features row
+    global_state: Optional[str]         # e.g. 'hessian', 'activation_max', None
     supports_cpu: bool
     supports_cuda: bool
-    workspace_multiplier: float        # Temp memory factor during quantization (e.g. 2.0x)
+    supports_remote_streaming: bool
+    workspace_multiplier: float         # Memory factor during quantization (e.g. 2.0x)
 
 
 @dataclass

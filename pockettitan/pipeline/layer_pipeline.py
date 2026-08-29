@@ -183,7 +183,8 @@ class QuantizationPipeline:
         start_time = time.time()
         self.console.print(f"[bold cyan]Starting PocketTitan Quantization Pipeline for {self.model_id_or_path}[/bold cyan]")
         
-        table = build_tensor_address_table(self.model_id_or_path, token=self.token)
+        # Build 100% address table
+        table = build_tensor_address_table(self.model_id_or_path, token=self.token, fast_inspect=False)
         all_tensors = list(table.tensors.values())
         total_tensors = len(all_tensors)
         
@@ -233,29 +234,35 @@ class QuantizationPipeline:
                 def on_chunk(downloaded_chunk_len: int, total_b: int):
                     progress.advance(stream_task, downloaded_chunk_len)
                     
-                # Fetch tensor data with chunk callback
-                if self._should_quantize_tensor(addr.name, addr.shape):
-                    tensor_data = self.reader.read_tensor(addr, chunk_callback=on_chunk if not self.is_local else None)
-                    progress.update(stream_task, visible=False)
-                    
-                    q_res, peak_vram = self.tiler.quantize_matrix(
-                        tensor_data,
-                        quantizer=self.quantizer,
-                        target_device=self.quant_config.device,
-                    )
-                    
-                    self.shard_writer.add_quantized_result(addr.name, q_res)
-                    del tensor_data, q_res
-                else:
-                    tensor_data = self.reader.read_tensor(addr, chunk_callback=on_chunk if not self.is_local else None)
-                    progress.update(stream_task, visible=False)
-                    self.shard_writer.add_tensor(addr.name, tensor_data)
-                    del tensor_data
-                    
-                if rec:
-                    rec.status = TensorStatus.COMPLETED
-                    manifest.completed_tensors += 1
-                    manifest_mgr.save(manifest)
+                try:
+                    if self._should_quantize_tensor(addr.name, addr.shape):
+                        # Enforce tile-before-materialize invariant directly via tiler
+                        q_res, peak_vram = self.tiler.quantize_address(
+                            reader=self.reader,
+                            tensor_addr=addr,
+                            quantizer=self.quantizer,
+                            target_device=self.quant_config.device,
+                            chunk_callback=on_chunk if not self.is_local else None,
+                        )
+                        progress.update(stream_task, visible=False)
+                        self.shard_writer.add_quantized_result(addr.name, q_res)
+                        del q_res
+                    else:
+                        tensor_data = self.reader.read_tensor(addr, chunk_callback=on_chunk if not self.is_local else None)
+                        progress.update(stream_task, visible=False)
+                        self.shard_writer.add_tensor(addr.name, tensor_data)
+                        del tensor_data
+                        
+                    if rec:
+                        rec.status = TensorStatus.COMPLETED
+                        manifest.completed_tensors += 1
+                        manifest_mgr.save(manifest)
+                except Exception as e:
+                    if rec:
+                        rec.status = TensorStatus.FAILED
+                        rec.error_message = str(e)
+                        manifest_mgr.save(manifest)
+                    raise
                     
                 progress.advance(main_task, 1)
                 if self.progress_callback:

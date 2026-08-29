@@ -27,6 +27,8 @@ DTYPE_BYTE_SIZES: Dict[str, int] = {
     "BOOL": 1,
     "F8_E4M3": 1,
     "F8_E5M2": 1,
+    "FLOAT8_E4M3FN": 1,
+    "FLOAT8_E5M2": 1,
 }
 
 
@@ -105,9 +107,7 @@ class TensorAddressTable:
         if not self.metadata.is_moe or not self.metadata.num_experts or not self.metadata.num_experts_per_tok:
             return total
         
-        # In MoE models (DeepSeek, GLM, Mixtral, Qwen-MoE), ~85-90% of total weights reside in routed experts
         moe_ratio = self.metadata.num_experts_per_tok / self.metadata.num_experts
-        # Active params approx: dense base params (~15%) + routed active expert params (~85% * moe_ratio)
         dense_est = total * 0.12
         routed_est = (total * 0.88) * moe_ratio
         return int(dense_est + routed_est)
@@ -141,22 +141,33 @@ def build_tensor_address_table(
     model_id_or_path: str,
     token: Optional[str] = None,
     headers: Optional[Dict[str, str]] = None,
-    max_shards_to_probe: int = 8,
+    fast_inspect: bool = False,
+    max_shards_to_probe: Optional[int] = None,
     max_workers: int = 16,
 ) -> TensorAddressTable:
-    """Build virtual address table fast using index.json and parallel shard header probes."""
+    """Build virtual address table fast using index.json and parallel shard header probes.
+    
+    Args:
+        model_id_or_path: Local directory or Hugging Face repository ID.
+        token: Optional HF auth token.
+        headers: Optional HTTP headers.
+        fast_inspect: If True, samples a small subset of shards (e.g. 8) for fast CLI inspect preview.
+                      If False (default for quantization & full execution), probes 100% of all shards.
+        max_shards_to_probe: Explicit limit on number of shards to probe if fast_inspect is active.
+        max_workers: Parallel worker thread count for remote HTTP range header requests.
+    """
     model_meta = inspect_model_repository(model_id_or_path, token=token)
     table = TensorAddressTable(model_meta)
     
     path = Path(model_id_or_path)
     is_local = path.exists() and path.is_dir()
     
-    # Target shards to probe for detailed tensor dimensions
     target_shards = model_meta.shards
-    if not is_local and len(target_shards) > max_shards_to_probe:
-        # Probe first few shards + last shard (contains lm_head and embeddings)
-        target_shards = target_shards[:max_shards_to_probe - 1] + [target_shards[-1]]
-        
+    if fast_inspect and not is_local:
+        limit = max_shards_to_probe if max_shards_to_probe is not None else 8
+        if len(target_shards) > limit:
+            target_shards = target_shards[:limit - 1] + [target_shards[-1]]
+            
     num_workers = min(max_workers, max(1, len(target_shards)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
         futures = [

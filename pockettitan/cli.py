@@ -416,7 +416,14 @@ def inspect(
             tiling_desc = f"[red]Tiled:[/red] {bounds['num_tiles']} tiles ({bounds['tile_rows']} rows/tile, ~{bounds['estimated_vram_per_tile_mb']:.0f}MB VRAM)"
         else:
             tiling_desc = f"[green]Single Pass[/green] (~{bounds['estimated_vram_per_tile_mb']:.0f}MB VRAM)"
-            
+        tensor_table.add_row(
+            t.name,
+            str(t.shape),
+            format_params(t.num_params),
+            format_size(t.size_bytes),
+            tiling_desc,
+        )
+    console.print(tensor_table)
 @app.command()
 def inspect_layer(
     checkpoint_dir: str = typer.Argument(..., help="Path to PocketTitan quantized checkpoint directory"),

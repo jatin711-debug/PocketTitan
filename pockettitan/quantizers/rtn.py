@@ -1,4 +1,4 @@
-"""Vectorized Round-to-Nearest (RTN) Quantizer with sub-byte bit packing (Milestone 1)."""
+"""Vectorized Round-to-Nearest (RTN) Quantizer with sub-byte bit packing."""
 
 import math
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -20,12 +20,13 @@ class RTNQuantizer(BaseQuantizer):
         return QuantizerCapabilities(
             name="rtn",
             requires_calibration=False,
-            legal_split_axes=(0,),
+            legal_split_axes=("out_features",),
             requires_full_input_dim=True,
             requires_full_output_dim=False,
             global_state=None,
             supports_cpu=True,
             supports_cuda=True,
+            supports_remote_streaming=True,
             workspace_multiplier=2.0,
         )
 
@@ -48,38 +49,33 @@ class RTNQuantizer(BaseQuantizer):
         if pad_k > 0:
             w_2d = F.pad(w_2d, (0, pad_k))
             
-        num_groups_per_row = padded_in_features // group_size
-        # Reshape to [out_features * num_groups_per_row, group_size]
-        w_grouped = w_2d.view(-1, group_size)
-        
+        num_groups = padded_in_features // group_size
         bits = self.config.bits
         max_int = (1 << bits) - 1
         
-        if self.config.symmetric:
-            max_val = torch.amax(torch.abs(w_grouped), dim=-1, keepdim=True).clamp(min=1e-5)
-            scale = max_val / ((1 << (bits - 1)) - 1 if bits > 1 else 1.0)
-            zero = None
-            q_val = torch.round(w_grouped / scale).clamp(-(1 << (bits - 1)), (1 << (bits - 1)) - 1)
-            # Offset to unsigned int for storage
-            q_uint = (q_val + (1 << (bits - 1))).to(torch.uint8)
-        else:
-            min_val = torch.amin(w_grouped, dim=-1, keepdim=True)
-            max_val = torch.amax(w_grouped, dim=-1, keepdim=True)
-            scale = ((max_val - min_val) / max(1, max_int)).clamp(min=1e-5)
-            zero = torch.round(-min_val / scale).clamp(0, max_int)
-            q_uint = torch.round((w_grouped - min_val) / scale).clamp(0, max_int).to(torch.uint8)
-            zero = zero.view(out_features, num_groups_per_row).to(torch.float16)
-
-        scale = scale.view(out_features, num_groups_per_row).to(torch.float16)
-        q_reshaped = q_uint.view(out_features, padded_in_features)
+        w_grouped = w_2d.view(out_features, num_groups, group_size)
         
-        # Pack to bit width
-        packed = self._pack_tensor(q_reshaped, bits)
+        if self.config.symmetric:
+            w_max = torch.amax(torch.abs(w_grouped), dim=-1, keepdim=True)
+            scales = torch.clamp(w_max / (max_int / 2.0), min=1e-8)
+            zeros = None
+            q_grouped = torch.clamp(torch.round(w_grouped / scales), -(max_int // 2), (max_int // 2))
+            q_grouped = q_grouped + (max_int // 2)
+        else:
+            w_min = torch.amin(w_grouped, dim=-1, keepdim=True)
+            w_max = torch.amax(w_grouped, dim=-1, keepdim=True)
+            scales = torch.clamp((w_max - w_min) / float(max_int), min=1e-8)
+            zeros = torch.round(-w_min / scales)
+            zeros = torch.clamp(zeros, 0, max_int)
+            q_grouped = torch.clamp(torch.round(w_grouped / scales) + zeros, 0, max_int)
+
+        q_flat = q_grouped.view(out_features, padded_in_features).to(torch.uint8)
+        packed_weights = self._pack_tensor(q_flat, bits)
         
         return QuantizedResult(
-            packed_weights=packed,
-            scales=scale,
-            zeros=zero,
+            packed_weights=packed_weights,
+            scales=scales.squeeze(-1).to(torch.float16),
+            zeros=zeros.squeeze(-1).to(torch.float16) if zeros is not None else None,
             codebook=None,
             quant_config=self.config,
             original_shape=orig_shape,
@@ -89,67 +85,56 @@ class RTNQuantizer(BaseQuantizer):
         )
 
     def dequantize(self, quantized: QuantizedResult) -> torch.Tensor:
-        bits = quantized.quant_config.bits
         orig_shape = quantized.original_shape
-        out_features, in_features = orig_shape[0], orig_shape[1]
+        out_features = orig_shape[0]
+        in_features = orig_shape[1] if len(orig_shape) > 1 else 1
+        bits = quantized.quant_config.bits
         group_size = quantized.quant_config.group_size if quantized.quant_config.group_size > 0 else in_features
         
         pad_k = (group_size - (in_features % group_size)) % group_size
         padded_in_features = in_features + pad_k
         
         unpacked = self._unpack_tensor(quantized.packed_weights, bits, (out_features, padded_in_features))
-        w_grouped = unpacked.view(-1, group_size).to(torch.float32)
-        scale_grouped = quantized.scales.view(-1, 1).to(torch.float32)
+        num_groups = padded_in_features // group_size
         
-        if quantized.zeros is None:
-            # Symmetric
-            q_signed = w_grouped - (1 << (bits - 1))
-            deq = q_signed * scale_grouped
+        q_grouped = unpacked.view(out_features, num_groups, group_size).to(torch.float32)
+        scales = quantized.scales.view(out_features, num_groups, 1).to(torch.float32)
+        
+        if quantized.zeros is not None:
+            zeros = quantized.zeros.view(out_features, num_groups, 1).to(torch.float32)
+            w_deq = (q_grouped - zeros) * scales
         else:
-            # Asymmetric
-            zero_grouped = quantized.zeros.view(-1, 1).to(torch.float32)
-            deq = (w_grouped - zero_grouped) * scale_grouped
+            max_int = (1 << bits) - 1
+            w_deq = (q_grouped - (max_int // 2)) * scales
             
-        deq_2d = deq.view(out_features, padded_in_features)[:, :in_features]
-        return deq_2d.view(orig_shape).to(quantized.original_dtype)
+        w_flat = w_deq.view(out_features, padded_in_features)[:, :in_features]
+        return w_flat.view(orig_shape).to(quantized.original_dtype)
 
     @staticmethod
-    def _pack_tensor(q_tensor: torch.Tensor, bits: int) -> torch.Tensor:
-        """Pack uint8 tensor into compact bits representation."""
-        if bits == 8:
-            return q_tensor.contiguous()
+    def _pack_tensor(tensor: torch.Tensor, bits: int) -> torch.Tensor:
+        """Packs sub-byte integer tensor into uint8 byte array."""
+        flat = tensor.contiguous().view(-1)
+        vals_per_byte = 8 // bits
+        if flat.numel() % vals_per_byte != 0:
+            pad_len = vals_per_byte - (flat.numel() % vals_per_byte)
+            flat = F.pad(flat, (0, pad_len))
             
-        elements_per_byte = 8 // bits
-        flat = q_tensor.reshape(-1)
-        num_elements = flat.numel()
-        
-        pad_len = (elements_per_byte - (num_elements % elements_per_byte)) % elements_per_byte
-        if pad_len > 0:
-            flat = torch.cat([flat, torch.zeros(pad_len, dtype=torch.uint8, device=flat.device)])
-            
-        reshaped = flat.view(-1, elements_per_byte)
-        packed = torch.zeros(reshaped.shape[0], dtype=torch.uint8, device=flat.device)
-        
-        for i in range(elements_per_byte):
-            packed = packed | (reshaped[:, i] << (i * bits))
-            
+        packed = torch.zeros(flat.numel() // vals_per_byte, dtype=torch.uint8, device=tensor.device)
+        for i in range(vals_per_byte):
+            shift = i * bits
+            packed |= (flat[i::vals_per_byte].to(torch.uint8) << shift)
         return packed
 
     @staticmethod
-    def _unpack_tensor(packed: torch.Tensor, bits: int, original_shape: Tuple[int, ...]) -> torch.Tensor:
-        """Unpack compact bits representation back to uint8 tensor."""
-        if bits == 8:
-            return packed.view(original_shape)
-            
-        elements_per_byte = 8 // bits
+    def _unpack_tensor(packed: torch.Tensor, bits: int, target_shape: Tuple[int, ...]) -> torch.Tensor:
+        """Unpacks uint8 byte array back into integer codes."""
+        vals_per_byte = 8 // bits
         mask = (1 << bits) - 1
+        num_elements = math.prod(target_shape)
         
-        unpacked_chunks = []
-        for i in range(elements_per_byte):
-            chunk = (packed >> (i * bits)) & mask
-            unpacked_chunks.append(chunk)
+        unpacked = torch.zeros(packed.numel() * vals_per_byte, dtype=torch.uint8, device=packed.device)
+        for i in range(vals_per_byte):
+            shift = i * bits
+            unpacked[i::vals_per_byte] = (packed >> shift) & mask
             
-        # Interleave unpacked chunks
-        interleaved = torch.stack(unpacked_chunks, dim=1).view(-1)
-        total_elements = math.prod(original_shape)
-        return interleaved[:total_elements].view(original_shape)
+        return unpacked[:num_elements].view(target_shape)

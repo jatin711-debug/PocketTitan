@@ -1,11 +1,11 @@
-"""Second-order Generalized Post-Training Quantization (GPTQ) Backend (Milestone 1)."""
+"""Second-order Generalized Post-Training Quantization (GPTQ) Backend."""
 
 import math
 from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 
-from pockettitan.config import QuantConfig, QuantMethod
+from pockettitan.config import CalibrationRequiredError, QuantConfig, QuantMethod
 from pockettitan.quantizers.base import BaseQuantizer, QuantizerCapabilities, QuantizedResult
 from pockettitan.quantizers.rtn import RTNQuantizer
 
@@ -23,12 +23,13 @@ class GPTQQuantizer(BaseQuantizer):
         return QuantizerCapabilities(
             name="gptq",
             requires_calibration=True,
-            legal_split_axes=(0,),
+            legal_split_axes=("out_features",),
             requires_full_input_dim=True,
             requires_full_output_dim=False,
             global_state="hessian",
             supports_cpu=True,
             supports_cuda=True,
+            supports_remote_streaming=True,
             workspace_multiplier=3.0,
         )
 
@@ -36,11 +37,19 @@ class GPTQQuantizer(BaseQuantizer):
         self,
         weight: torch.Tensor,
         hessian: Optional[torch.Tensor] = None,
+        outlier_indices: Optional[torch.Tensor] = None,
     ) -> QuantizedResult:
         orig_shape = weight.shape
         orig_dtype = weight.dtype
         device = str(weight.device)
         
+        # Enforce Calibration Safety Contract: GPTQ strictly requires Hessian
+        if hessian is None:
+            raise CalibrationRequiredError(
+                "GPTQ quantization strictly requires an empirical second-order Hessian matrix computed from "
+                "calibration data. Silent fallback to identity matrix is prohibited to guarantee quantization fidelity."
+            )
+
         w_2d = weight.view(-1, orig_shape[-1]).clone().float()
         out_features, in_features = w_2d.shape
         group_size = self.config.group_size if self.config.group_size > 0 else in_features
@@ -54,14 +63,10 @@ class GPTQQuantizer(BaseQuantizer):
         bits = self.config.bits
         max_int = (1 << bits) - 1
         
-        # If no Hessian provided or padded, setup H
-        if hessian is None:
-            H = torch.eye(padded_in_features, dtype=torch.float32, device=weight.device)
-        else:
-            H = hessian.clone().float().to(weight.device)
-            if pad_k > 0:
-                H = F.pad(H, (0, pad_k, 0, pad_k))
-                H.diagonal()[-pad_k:].fill_(1.0)
+        H = hessian.clone().float().to(weight.device)
+        if pad_k > 0:
+            H = F.pad(H, (0, pad_k, 0, pad_k))
+            H.diagonal()[-pad_k:].fill_(1.0)
             
         # 1. Dampening on diagonal: H += percdamp * mean(diag(H)) * I
         damp = self.percdamp * torch.mean(torch.diag(H)).item()

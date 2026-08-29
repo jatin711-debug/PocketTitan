@@ -1,6 +1,7 @@
-"""Core configuration models and data structures for PocketTitan."""
+"""Core configuration models, exceptions, and data structures for PocketTitan."""
 
 from enum import Enum
+import math
 from pathlib import Path
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -25,6 +26,23 @@ class QuantMethod(str, Enum):
     AUTO = "auto"
 
 
+# --- Custom Domain Exceptions ---
+
+class UnsupportedSourceDTypeError(Exception):
+    """Raised when an unrecognized source data type is encountered."""
+    pass
+
+
+class CalibrationRequiredError(Exception):
+    """Raised when an algorithm (e.g., GPTQ, AWQ) requires calibration data that was not provided."""
+    pass
+
+
+class InfeasibleBudgetError(Exception):
+    """Raised when a matrix cannot be legally tiled within the configured memory budget."""
+    pass
+
+
 def parse_memory_to_mb(val: Union[str, float, int]) -> float:
     """Parse user memory string into MiB float.
     
@@ -37,7 +55,6 @@ def parse_memory_to_mb(val: Union[str, float, int]) -> float:
     if not s:
         return 3584.0
         
-    # Match number and optional unit
     match = re.match(r"^([0-9.]+)\s*([A-Z]*)$", s)
     if not match:
         try:
@@ -71,7 +88,6 @@ class MemoryBudgetConfig(BaseModel):
 
     @property
     def usable_vram_mb(self) -> float:
-        # Dynamically scale reserves if user requested a very small budget (e.g. 1000 MB or 1500 MB)
         if self.max_vram_mb <= 2048.0:
             reserve = min(self.runtime_reserve_mb, self.max_vram_mb * 0.15)
             margin = min(self.safety_margin_mb, self.max_vram_mb * 0.10)
@@ -89,6 +105,53 @@ class QuantConfig(BaseModel):
     scale_dtype: str = Field(default="float16", description="Data type for quantization scales")
     zero_dtype: str = Field(default="float16", description="Data type for quantization zero-points")
     device: str = Field(default="cuda", description="Execution device (cuda/cpu)")
+
+
+class StorageAccounting(BaseModel):
+    """Scientific storage accounting distinguishing theoretical, payload, and on-disk metrics."""
+    theoretical_bpw: float = Field(description="Information-theoretic entropy limit (e.g. 1.585 for ternary)")
+    payload_bpw: float = Field(description="Bit-width of physical packed tensor elements (e.g. 2.0)")
+    metadata_bpw: float = Field(description="Overhead of scales, zero-points, and codebooks in bits/weight")
+    on_disk_bpw: float = Field(description="Actual physical storage on disk per parameter")
+    compression_ratio: float = Field(description="Compression factor relative to FP16 source baseline")
+
+    @classmethod
+    def compute(
+        cls,
+        method: QuantMethod,
+        bits: int,
+        group_size: int,
+        shape: List[int],
+        has_zeros: bool = True,
+        scale_bytes_per_elem: int = 2,
+    ) -> "StorageAccounting":
+        num_params = math.prod(shape) if shape else 1
+        if method == QuantMethod.TERNARY:
+            theoretical_bpw = math.log2(3)  # ~1.58496
+            payload_bpw = 2.0  # Packed 4 values per uint8
+        else:
+            theoretical_bpw = float(bits)
+            payload_bpw = float(bits)
+
+        # Scale & zero metadata calculations
+        num_groups = math.ceil(num_params / group_size) if group_size > 0 else 1
+        metadata_bytes = num_groups * scale_bytes_per_elem * (2 if has_zeros else 1)
+        metadata_bpw = (metadata_bytes * 8.0) / num_params
+
+        payload_bytes = math.ceil(num_params * payload_bpw / 8.0)
+        total_on_disk_bytes = payload_bytes + metadata_bytes
+        on_disk_bpw = (total_on_disk_bytes * 8.0) / num_params
+
+        fp16_bytes = num_params * 2
+        compression_ratio = fp16_bytes / max(1, total_on_disk_bytes)
+
+        return cls(
+            theoretical_bpw=round(theoretical_bpw, 4),
+            payload_bpw=round(payload_bpw, 4),
+            metadata_bpw=round(metadata_bpw, 4),
+            on_disk_bpw=round(on_disk_bpw, 4),
+            compression_ratio=round(compression_ratio, 2),
+        )
 
 
 class TensorAddress(BaseModel):
@@ -109,13 +172,18 @@ class ModelMetadata(BaseModel):
     num_hidden_layers: int
     hidden_size: int
     num_attention_heads: int
-    total_params: int
-    active_params: int
+    num_key_value_heads: int = 32
+    intermediate_size: Optional[int] = None
+    vocab_size: int = 32000
+    total_params: int = 0
+    active_params: int = 0
     is_moe: bool = False
     num_experts: Optional[int] = None
     num_experts_per_tok: Optional[int] = None
     expert_intermediate_size: Optional[int] = None
     shared_expert_intermediate_size: Optional[int] = None
+    first_k_dense_replace: Optional[int] = None
     source_dtype: str = "float16"
+    is_fp8_source: bool = False
     shards: List[str] = Field(default_factory=list)
     tensors: Dict[str, TensorAddress] = Field(default_factory=dict)

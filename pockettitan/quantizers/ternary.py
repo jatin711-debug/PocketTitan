@@ -1,7 +1,7 @@
 """BitNet 1.58b / Ternary {-1, 0, +1} groupwise quantizer."""
 
 import math
-from typing import Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 
 from pockettitan.config import QuantConfig, QuantMethod
@@ -9,19 +9,20 @@ from pockettitan.quantizers.base import BaseQuantizer, QuantizerCapabilities, Qu
 
 
 class TernaryQuantizer(BaseQuantizer):
-    """BitNet-style 1.58b ternary {-1, 0, +1} quantizer with 2-bit packing."""
+    """BitNet-style 1.58b ternary {-1, 0, +1} quantizer with 2-bit physical packing."""
 
     @property
     def capabilities(self) -> QuantizerCapabilities:
         return QuantizerCapabilities(
             name="ternary",
             requires_calibration=False,
-            legal_split_axes=(0, 1),
+            legal_split_axes=("out_features", "in_features"),
             requires_full_input_dim=False,
             requires_full_output_dim=False,
             global_state=None,
             supports_cpu=True,
             supports_cuda=True,
+            supports_remote_streaming=True,
             workspace_multiplier=1.2,
         )
 
@@ -29,6 +30,7 @@ class TernaryQuantizer(BaseQuantizer):
         self,
         weight: torch.Tensor,
         hessian: Optional[torch.Tensor] = None,
+        outlier_indices: Optional[torch.Tensor] = None,
     ) -> QuantizedResult:
         orig_shape = weight.shape
         orig_dtype = weight.dtype

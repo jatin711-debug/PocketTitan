@@ -1,10 +1,9 @@
-"""Unit tests for GPTQ, AWQ, and AutoRound quantizer backends."""
+"""Tests for second-order and activation-aware quantizers (GPTQ, AWQ, AutoRound)."""
 
 import pytest
 import torch
 
-from pockettitan.calibration.hessian import HessianAccumulator
-from pockettitan.config import QuantConfig, QuantMethod
+from pockettitan.config import CalibrationRequiredError, QuantConfig, QuantMethod
 from pockettitan.precision.distortion import evaluate_quantization_quality
 from pockettitan.quantizers import get_quantizer
 
@@ -15,17 +14,15 @@ def test_gptq_quantizer():
     out_features = 128
     
     w = torch.randn(out_features, in_features, dtype=torch.float16) * 0.02
-    
-    # Generate synthetic activation Hessian
-    acc = HessianAccumulator(in_features)
-    for _ in range(5):
-        x = torch.randn(16, in_features) * 0.1
-        acc.add_batch(x)
-    H = acc.get_normalized_hessian()
+    H = torch.eye(in_features, dtype=torch.float32)
     
     quant_cfg = QuantConfig(method=QuantMethod.GPTQ, bits=4, group_size=64, device="cpu")
     quantizer = get_quantizer(quant_cfg)
     
+    # Assert missing Hessian raises CalibrationRequiredError
+    with pytest.raises(CalibrationRequiredError):
+        quantizer.quantize(w)
+        
     res = quantizer.quantize(w, hessian=H)
     w_deq = quantizer.dequantize(res)
     
@@ -40,16 +37,15 @@ def test_awq_quantizer():
     out_features = 128
     
     w = torch.randn(out_features, in_features, dtype=torch.float16) * 0.02
-    
-    acc = HessianAccumulator(in_features)
-    for _ in range(5):
-        x = torch.randn(16, in_features) * 0.1
-        acc.add_batch(x)
-    H = acc.get_normalized_hessian()
+    H = torch.diag(torch.rand(in_features) + 0.5)
     
     quant_cfg = QuantConfig(method=QuantMethod.AWQ, bits=4, group_size=64, device="cpu")
     quantizer = get_quantizer(quant_cfg)
     
+    # Assert missing Hessian raises CalibrationRequiredError
+    with pytest.raises(CalibrationRequiredError):
+        quantizer.quantize(w)
+        
     res = quantizer.quantize(w, hessian=H)
     w_deq = quantizer.dequantize(res)
     
@@ -64,11 +60,16 @@ def test_autoround_quantizer():
     out_features = 128
     
     w = torch.randn(out_features, in_features, dtype=torch.float16) * 0.02
+    H = torch.eye(in_features, dtype=torch.float32)
     
     quant_cfg = QuantConfig(method=QuantMethod.AUTOROUND, bits=4, group_size=64, device="cpu")
     quantizer = get_quantizer(quant_cfg)
     
-    res = quantizer.quantize(w)
+    # Assert missing Hessian raises CalibrationRequiredError
+    with pytest.raises(CalibrationRequiredError):
+        quantizer.quantize(w)
+        
+    res = quantizer.quantize(w, hessian=H)
     w_deq = quantizer.dequantize(res)
     
     report = evaluate_quantization_quality(w, w_deq)
