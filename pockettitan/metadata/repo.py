@@ -114,7 +114,9 @@ def inspect_model_repository(
         if not shards:
             shards = ["model.safetensors"]
         
-    total_params = index.get("metadata", {}).get("total_size", 0) if index else 0
+    total_bytes = index.get("metadata", {}).get("total_size", 0) if index else 0
+    bytes_per_elem = 1 if is_fp8 else (4 if "32" in str(source_dtype) else 2)
+    total_params = int(total_bytes // bytes_per_elem) if total_bytes > 0 else 0
     
     return ModelMetadata(
         model_id_or_path=model_id_or_path,
