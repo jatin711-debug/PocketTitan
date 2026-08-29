@@ -1,0 +1,87 @@
+# Internal Specification & Planning Documents
+Design.md
+Plan.md
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C source builds and extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# Environments & Virtual Envs
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE & Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# PocketTitan model checkpoints, spools, and temporary artifacts
+quantized_model/
+quantized_output/
+valid_model/
+vllm_model/
+test_cli_output/
+pockettitan_spool/
+*.gguf
+*.safetensors
+*.pt
+*.bin
+*.log
+*.tmp
+precision_map.json
+test_precision_map.json
+qwen_moe_precision_map.json
