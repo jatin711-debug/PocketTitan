@@ -72,7 +72,7 @@ def test_hqq_quantizer_roundtrip(bits):
     assert report.snr_db > (3.0 if bits == 2 else 12.0)
 
 
-@pytest.mark.parametrize("method", [QuantMethod.HQQ, QuantMethod.RTN])
+@pytest.mark.parametrize("method", [QuantMethod.HQQ, QuantMethod.RTN, QuantMethod.TERNARY])
 def test_non_divisible_shape_quantization(method):
     """Test quantization of matrices with non-standard dimensions (e.g. 4304 with group 128)."""
     cfg = QuantConfig(method=method, bits=2, group_size=128)
