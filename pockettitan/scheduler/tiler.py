@@ -25,14 +25,15 @@ class MatrixTiler:
         target_device: str = "cuda",
         chunk_callback: Optional[Callable[[int, int], None]] = None,
     ) -> Tuple[QuantizedResult, float]:
-        """Stream and quantize a tensor directly from its address without materializing oversized tensors in RAM.
+        """Stream and quantize a tensor directly from its address without materializing oversized tensors in VRAM.
         
-        Calculates work unit row bounds BEFORE fetching tensor bytes over memory-map or network.
+        Calculates work unit row bounds BEFORE moving weights to accelerator memory.
         """
         shape = tensor_addr.shape
         name = tensor_addr.name
         dtype_str = tensor_addr.dtype
         layout = get_layout_adapter(name, shape, dtype_str)
+        is_local = hasattr(reader, "root_dir")
         
         exec_device = target_device if (target_device == "cuda" and torch.cuda.is_available()) else "cpu"
         
@@ -46,28 +47,40 @@ class MatrixTiler:
             zero_experts = []
             peak_vram_mb = 0.0
             
-            for exp_idx in range(num_experts):
-                # Read single expert 2-D slice directly from reader without loading 3-D bank
-                if hasattr(reader, "read_3d_expert_slice"):
+            # For local memory-mapped reader, slice directly via safe_open
+            if is_local and hasattr(reader, "read_3d_expert_slice"):
+                for exp_idx in range(num_experts):
                     exp_tensor = reader.read_3d_expert_slice(tensor_addr, exp_idx)
-                else:
-                    full_3d = reader.read_tensor(tensor_addr)
+                    exp_res, exp_peak = self.quantize_matrix(
+                        exp_tensor,
+                        quantizer=quantizer,
+                        hessian=hessian,
+                        target_device=exec_device,
+                    )
+                    peak_vram_mb = max(peak_vram_mb, exp_peak)
+                    packed_experts.append(exp_res.packed_weights)
+                    scale_experts.append(exp_res.scales)
+                    if exp_res.zeros is not None:
+                        zero_experts.append(exp_res.zeros)
+                    del exp_tensor, exp_res
+            else:
+                # For remote streaming, fetch the tensor in one continuous high-speed stream with live progress
+                full_3d = reader.read_tensor(tensor_addr, chunk_callback=chunk_callback)
+                for exp_idx in range(num_experts):
                     exp_tensor = layout.extract_subunit_tensor(full_3d, exp_idx)
-                    del full_3d
-                    
-                exp_res, exp_peak = self.quantize_matrix(
-                    exp_tensor,
-                    quantizer=quantizer,
-                    hessian=hessian,
-                    target_device=exec_device,
-                )
-                peak_vram_mb = max(peak_vram_mb, exp_peak)
-                
-                packed_experts.append(exp_res.packed_weights)
-                scale_experts.append(exp_res.scales)
-                if exp_res.zeros is not None:
-                    zero_experts.append(exp_res.zeros)
-                del exp_tensor, exp_res
+                    exp_res, exp_peak = self.quantize_matrix(
+                        exp_tensor,
+                        quantizer=quantizer,
+                        hessian=hessian,
+                        target_device=exec_device,
+                    )
+                    peak_vram_mb = max(peak_vram_mb, exp_peak)
+                    packed_experts.append(exp_res.packed_weights)
+                    scale_experts.append(exp_res.scales)
+                    if exp_res.zeros is not None:
+                        zero_experts.append(exp_res.zeros)
+                    del exp_tensor, exp_res
+                del full_3d
                 
             combined_packed = torch.stack(packed_experts, dim=0)
             combined_scales = torch.stack(scale_experts, dim=0)
@@ -106,7 +119,7 @@ class MatrixTiler:
                 target_device=exec_device,
             )
 
-        # 3. Memory-Bounded Sliced Streaming: Fetch only row chunks sequentially
+        # 3. Memory-Bounded Sliced Streaming
         tile_rows = bounds["tile_rows"]
         num_tiles = bounds["num_tiles"]
         
@@ -115,31 +128,43 @@ class MatrixTiler:
         zero_tiles = []
         peak_vram_mb = 0.0
         
-        for i in range(num_tiles):
-            r_start = i * tile_rows
-            r_end = min(out_features, (i + 1) * tile_rows)
-            
-            # Read sub-slice directly via zero-copy slice or HTTP range
-            if hasattr(reader, "read_slice"):
+        if is_local and hasattr(reader, "read_slice"):
+            for i in range(num_tiles):
+                r_start = i * tile_rows
+                r_end = min(out_features, (i + 1) * tile_rows)
                 tile_tensor = reader.read_slice(tensor_addr, r_start, r_end)
-            else:
-                full_t = reader.read_tensor(tensor_addr)
+                tile_res, tile_peak = self.quantize_matrix(
+                    tile_tensor,
+                    quantizer=quantizer,
+                    hessian=hessian,
+                    target_device=exec_device,
+                )
+                peak_vram_mb = max(peak_vram_mb, tile_peak)
+                packed_tiles.append(tile_res.packed_weights)
+                scale_tiles.append(tile_res.scales)
+                if tile_res.zeros is not None:
+                    zero_tiles.append(tile_res.zeros)
+                del tile_tensor, tile_res
+        else:
+            # Remote stream: download in one fast single pass with live progress, then tile sequentially in RAM
+            full_t = reader.read_tensor(tensor_addr, chunk_callback=chunk_callback)
+            for i in range(num_tiles):
+                r_start = i * tile_rows
+                r_end = min(out_features, (i + 1) * tile_rows)
                 tile_tensor = full_t[r_start:r_end, :]
-                del full_t
-                
-            tile_res, tile_peak = self.quantize_matrix(
-                tile_tensor,
-                quantizer=quantizer,
-                hessian=hessian,
-                target_device=exec_device,
-            )
-            peak_vram_mb = max(peak_vram_mb, tile_peak)
-            
-            packed_tiles.append(tile_res.packed_weights)
-            scale_tiles.append(tile_res.scales)
-            if tile_res.zeros is not None:
-                zero_tiles.append(tile_res.zeros)
-            del tile_tensor, tile_res
+                tile_res, tile_peak = self.quantize_matrix(
+                    tile_tensor,
+                    quantizer=quantizer,
+                    hessian=hessian,
+                    target_device=exec_device,
+                )
+                peak_vram_mb = max(peak_vram_mb, tile_peak)
+                packed_tiles.append(tile_res.packed_weights)
+                scale_tiles.append(tile_res.scales)
+                if tile_res.zeros is not None:
+                    zero_tiles.append(tile_res.zeros)
+                del tile_tensor, tile_res
+            del full_t
             
         combined_packed = torch.cat(packed_tiles, dim=0)
         combined_scales = torch.cat(scale_tiles, dim=0)
