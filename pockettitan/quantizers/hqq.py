@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from pockettitan.config import QuantConfig
-from pockettitan.quantizers.base import BaseQuantizer, QuantizerCapabilities, QuantizedResult
+from pockettitan.quantizers.base import BaseQuantizer, QuantizedResult, QuantizerCapabilities, matrix_dims
 from pockettitan.quantizers.rtn import RTNQuantizer
 
 
@@ -61,7 +61,8 @@ class HQQQuantizer(BaseQuantizer):
         w_min = torch.amin(w_grouped, dim=-1, keepdim=True)
         w_max = torch.amax(w_grouped, dim=-1, keepdim=True)
         scales = torch.clamp((w_max - w_min) / float(max_int), min=1e-8)
-        zeros = torch.clamp(torch.round(-w_min / scales), 0, max_int)
+        # Not clamped into the code range: see the note in RTNQuantizer.quantize.
+        zeros = torch.round(-w_min / scales)
 
         # 2. Proximal Coordinate Descent Loop
         for _ in range(self.max_iters):
@@ -73,10 +74,8 @@ class HQQQuantizer(BaseQuantizer):
             scales = torch.clamp(numerator / denominator, min=1e-8)
 
             q_scaled = q_grouped * scales
-            zeros = torch.clamp(
-                torch.round(torch.mean(q_scaled - w_grouped, dim=-1, keepdim=True) / scales),
-                0,
-                max_int,
+            zeros = torch.round(
+                torch.mean(q_scaled - w_grouped, dim=-1, keepdim=True) / scales
             )
 
         q_grouped = torch.clamp(torch.round(w_grouped / scales) + zeros, 0, max_int)
@@ -98,8 +97,7 @@ class HQQQuantizer(BaseQuantizer):
 
     def dequantize(self, quantized: QuantizedResult) -> torch.Tensor:
         orig_shape = quantized.original_shape
-        out_features = orig_shape[0]
-        in_features = orig_shape[1] if len(orig_shape) > 1 else 1
+        out_features, in_features = matrix_dims(orig_shape)
         bits = quantized.quant_config.bits
         group_size = (
             quantized.quant_config.group_size

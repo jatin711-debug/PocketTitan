@@ -4,7 +4,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from pockettitan.quantizers.base import BaseQuantizer, QuantizerCapabilities, QuantizedResult
+from pockettitan.quantizers.base import BaseQuantizer, QuantizedResult, QuantizerCapabilities, matrix_dims
 
 
 class TernaryQuantizer(BaseQuantizer):
@@ -87,8 +87,7 @@ class TernaryQuantizer(BaseQuantizer):
 
     def dequantize(self, quantized: QuantizedResult) -> torch.Tensor:
         orig_shape = quantized.original_shape
-        out_features = orig_shape[0]
-        in_features = orig_shape[1] if len(orig_shape) > 1 else 1
+        out_features, in_features = matrix_dims(orig_shape)
         group_size = (
             quantized.quant_config.group_size
             if quantized.quant_config.group_size > 0

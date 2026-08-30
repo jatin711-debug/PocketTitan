@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from pockettitan.config import QuantConfig
-from pockettitan.quantizers.base import BaseQuantizer, QuantizerCapabilities, QuantizedResult
+from pockettitan.quantizers.base import BaseQuantizer, QuantizedResult, QuantizerCapabilities, matrix_dims
 
 
 class RTNQuantizer(BaseQuantizer):
@@ -69,8 +69,14 @@ class RTNQuantizer(BaseQuantizer):
             w_min = torch.amin(w_grouped, dim=-1, keepdim=True)
             w_max = torch.amax(w_grouped, dim=-1, keepdim=True)
             scales = torch.clamp((w_max - w_min) / float(max_int), min=1e-8)
+            # The affine zero-point is stored as fp16 and only ever used as
+            # `(q - zero) * scale`, so it must NOT be clamped into the code
+            # range. A group that does not straddle zero has its correct
+            # zero-point outside [0, max_int]; clamping forces the
+            # representable interval to include 0 and spends the entire
+            # budget on the empty gap. An all-positive vector clustered away
+            # from zero then collapses to a single code.
             zeros = torch.round(-w_min / scales)
-            zeros = torch.clamp(zeros, 0, max_int)
             q_grouped = torch.clamp(torch.round(w_grouped / scales) + zeros, 0, max_int)
 
         q_flat = q_grouped.view(out_features, padded_in_features).to(torch.uint8)
@@ -90,8 +96,7 @@ class RTNQuantizer(BaseQuantizer):
 
     def dequantize(self, quantized: QuantizedResult) -> torch.Tensor:
         orig_shape = quantized.original_shape
-        out_features = orig_shape[0]
-        in_features = orig_shape[1] if len(orig_shape) > 1 else 1
+        out_features, in_features = matrix_dims(orig_shape)
         bits = quantized.quant_config.bits
         group_size = (
             quantized.quant_config.group_size
@@ -123,6 +128,11 @@ class RTNQuantizer(BaseQuantizer):
     @staticmethod
     def _pack_tensor(tensor: torch.Tensor, bits: int) -> torch.Tensor:
         """Packs sub-byte integer tensor into uint8 byte array."""
+        if bits >= 16 or bits <= 0:
+            raise ValueError(
+                f"bits={bits} is not a packable width; 16-bit and wider tensors are "
+                "stored verbatim and never reach the packer"
+            )
         flat = tensor.contiguous().view(-1)
         vals_per_byte = 8 // bits
         if flat.numel() % vals_per_byte != 0:
