@@ -1,5 +1,6 @@
 """PocketTitan Command Line Interface."""
 
+import json
 import sys
 from contextlib import nullcontext
 from pathlib import Path
@@ -1067,7 +1068,7 @@ def gate(
     )
 
     # Render results table
-    table = Table(title=f"[bold green]Phase R4 — The Oracle Decision Gate[/bold green]", show_header=True)
+    table = Table(title="[bold green]Phase R4 — The Oracle Decision Gate[/bold green]", show_header=True)
     table.add_column("Metric", style="cyan")
     table.add_column("Value", style="green")
 
@@ -1158,6 +1159,55 @@ def profile_analyze(
         console.print(f"\n[dim]Analysis written to {output}[/dim]")
 
 
+@app.command()
+def run(
+    package: Path = typer.Argument(..., help='Path to a .ptitan package directory'),
+    prompt: str = typer.Option('Explain what a memory hierarchy is.', '--prompt', '-p'),
+    max_new_tokens: int = typer.Option(64, '--max-new-tokens', '-n'),
+    temperature: float = typer.Option(0.0, '--temperature', '-t', help='0 = greedy'),
+    device: str = typer.Option('auto', '--device', help='cuda, cpu, or auto'),
+    dtype: str = typer.Option('float32', '--dtype', help='float32, float16, bfloat16'),
+    cache_mb: float = typer.Option(512.0, '--cache-mb', help='Decoded-weight cache ceiling'),
+    chat: bool = typer.Option(True, '--chat/--raw', help='Apply the tokenizer chat template'),
+):
+    """Generate text from a .ptitan package through the reference HF module tree.
+
+    Weights stay on disk and are decoded per use, so a package larger than RAM
+    still runs - slowly. This is a correctness tool, not the fast path.
+    """
+    from pockettitan.runtime.hf import generate as run_generation
+
+    def announce(info):
+        console.print(
+            '  [green]' + str(info['backed_by_package']) + '[/green] tensors from the package, '
+            + '[green]' + str(info['materialized']) + '[/green] materialized, '
+            + format(info['resident_params'], ',') + ' resident params'
+        )
+
+    console.print('[bold cyan]Loading[/bold cyan] ' + str(package))
+    try:
+        result = run_generation(
+            package,
+            prompt=prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            device=device,
+            dtype=dtype,
+            cache_bytes=int(cache_mb * 1024 * 1024),
+            chat=chat,
+            on_load=announce,
+        )
+    except FileNotFoundError as exc:
+        console.print('[bold red]' + escape(str(exc)) + '[/bold red]')
+        raise typer.Exit(code=1)
+
+    console.print()
+    console.print('[bold yellow]Prompt[/bold yellow] ' + escape(result.prompt))
+    console.print('[bold green]Output[/bold green] ' + escape(result.text))
+    console.print()
+    for line in result.summary_lines():
+        console.print('[dim]' + line + '[/dim]')
+
+
 if __name__ == "__main__":
     app()
-
