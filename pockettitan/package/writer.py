@@ -724,7 +724,17 @@ class PackageWriter:
                 return path.read_bytes() if path.is_file() else None
 
         else:
-            from huggingface_hub import EntryNotFoundError, hf_hub_download
+            try:
+                from huggingface_hub.errors import EntryNotFoundError
+            except ImportError:
+                try:
+                    from huggingface_hub.utils import EntryNotFoundError
+                except ImportError:
+                    try:
+                        from huggingface_hub import EntryNotFoundError
+                    except ImportError:
+                        EntryNotFoundError = Exception
+            from huggingface_hub import hf_hub_download
 
             def read_asset(name: str):
                 try:
@@ -734,7 +744,7 @@ class PackageWriter:
                         revision=self.reader.revision,
                         token=self.reader.token,
                     )
-                except EntryNotFoundError:
+                except (EntryNotFoundError, Exception):
                     return None
                 return Path(path).read_bytes()
 
