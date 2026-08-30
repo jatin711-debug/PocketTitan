@@ -16,6 +16,10 @@ from pockettitan.precision.allocator import (
     HeterogeneousPrecisionMap,
     ParetoBitAllocator,
 )
+from pockettitan.precision.two_population import (
+    TwoPopulationAllocator,
+    TwoPopulationPlan,
+)
 
 __all__ = [
     "compute_weight_distortion",
@@ -28,4 +32,6 @@ __all__ = [
     "compute_tensor_sensitivity",
     "HeterogeneousPrecisionMap",
     "ParetoBitAllocator",
+    "TwoPopulationAllocator",
+    "TwoPopulationPlan",
 ]
