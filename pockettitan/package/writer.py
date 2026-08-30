@@ -347,7 +347,10 @@ class PackageWriter:
     # -- regions ---------------------------------------------------------- #
 
     def _write_dense(
-        self, journal: BuildJournal, on_item: Optional[Callable]
+        self,
+        journal: BuildJournal,
+        on_item: Optional[Callable] = None,
+        on_start: Optional[Callable] = None,
     ) -> Tuple[int, int, float]:
         done, _, _ = journal.as_sets()
         pending = [i for i in self.plan.dense if i.address.name not in done]
@@ -363,6 +366,8 @@ class PackageWriter:
             for batch in _batches(pending, DENSE_BATCH_ITEMS):
                 committed = []
                 for item in batch:
+                    if on_start:
+                        on_start("dense", item.address.name)
                     tensor = self.reader.read_tensor(self._address_of(item))
                     payload, item_peak = self._encode_dense(item, tensor)
                     peak = max(peak, item_peak)
@@ -456,7 +461,10 @@ class PackageWriter:
         return item.address
 
     def _write_experts(
-        self, journal: BuildJournal, on_item: Optional[Callable]
+        self,
+        journal: BuildJournal,
+        on_item: Optional[Callable] = None,
+        on_start: Optional[Callable] = None,
     ) -> Tuple[int, int, float]:
         layout = self.plan.manifest.expert_layout
         if layout is None or not self.plan.experts:
@@ -475,6 +483,8 @@ class PackageWriter:
             for batch in _batches(pending, EXPERT_BATCH_ITEMS):
                 committed = []
                 for item in batch:
+                    if on_start:
+                        on_start("expert", f"L{item.layer}E{item.expert}")
                     payload, item_peak = self._encode_expert(item)
                     peak = max(peak, item_peak)
                     bank.seek(item.bank_offset)
@@ -533,7 +543,10 @@ class PackageWriter:
         return bytes(payload), peak
 
     def _write_ple(
-        self, journal: BuildJournal, on_item: Optional[Callable]
+        self,
+        journal: BuildJournal,
+        on_item: Optional[Callable] = None,
+        on_start: Optional[Callable] = None,
     ) -> Tuple[int, int, float]:
         ple = self.plan.ple
         if ple is None:
@@ -554,6 +567,8 @@ class PackageWriter:
             for batch in _batches(pending, 1):
                 committed = []
                 for shard in batch:
+                    if on_start:
+                        on_start("ple", f"shard_{shard.shard_index}")
                     block, shard_peak = self._encode_ple_shard(shard, row_spans)
                     peak = max(peak, shard_peak)
                     # Rows are page-packed, so write row by row rather than as one run.
@@ -630,7 +645,11 @@ class PackageWriter:
 
     # -- entry point ------------------------------------------------------ #
 
-    def build(self, on_item: Optional[Callable[[str, str], None]] = None) -> BuildResult:
+    def build(
+        self,
+        on_item: Optional[Callable[[str, str], None]] = None,
+        on_start: Optional[Callable[[str, str], None]] = None,
+    ) -> BuildResult:
         """Execute the plan. Safe to call repeatedly to resume."""
         started = time.perf_counter()
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -641,7 +660,7 @@ class PackageWriter:
         written = skipped = 0
         peak = 0.0
         for region in (self._write_dense, self._write_experts, self._write_ple):
-            region_bytes, region_skipped, region_peak = region(journal, on_item)
+            region_bytes, region_skipped, region_peak = region(journal, on_item, on_start)
             written += region_bytes
             skipped += region_skipped
             peak = max(peak, region_peak)

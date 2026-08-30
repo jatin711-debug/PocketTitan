@@ -1,0 +1,529 @@
+{
+  "manifest": {
+    "package_version": "1.1",
+    "pockettitan_version": "0.1.0",
+    "created_utc": "2026-08-30T12:31:52+00:00",
+    "source_model": "Qwen/Qwen3.8-27B",
+    "source_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+    "source": {
+      "repository": "Qwen/Qwen3.8-27B",
+      "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+      "config_sha256": "137754ebd46991bec0c0d9e660dc98256be0b20f0e825b28c95c31de6142d041",
+      "index_sha256": "d42012ad951fde57b941ee731ab6016c9fe6662db6e45e538793b6d6f4091582"
+    },
+    "architecture": "Qwen3_5ForConditionalGeneration",
+    "build_profile": "canary",
+    "complete_model": false,
+    "features": [
+      "text"
+    ],
+    "precision_map_name": "PT-Q4E",
+    "precision_map": {
+      "gdn_attn": {
+        "bits": 3.0,
+        "group_size": 128,
+        "symmetric": false,
+        "effective_bits": 3.25
+      },
+      "mlp_dense": {
+        "bits": 4.0,
+        "group_size": 128,
+        "symmetric": false,
+        "effective_bits": 4.25
+      },
+      "norm": {
+        "bits": 16.0,
+        "group_size": -1,
+        "symmetric": false,
+        "effective_bits": 16.0
+      },
+      "full_attn": {
+        "bits": 4.0,
+        "group_size": 128,
+        "symmetric": false,
+        "effective_bits": 4.25
+      },
+      "vision": {
+        "bits": 4.0,
+        "group_size": 128,
+        "symmetric": false,
+        "effective_bits": 4.25
+      },
+      "embed": {
+        "bits": 4.0,
+        "group_size": 128,
+        "symmetric": false,
+        "effective_bits": 4.25
+      },
+      "lm_head": {
+        "bits": 6.0,
+        "group_size": 128,
+        "symmetric": false,
+        "effective_bits": 6.25
+      },
+      "mtp": {
+        "bits": 4.0,
+        "group_size": 128,
+        "symmetric": false,
+        "effective_bits": 4.25
+      }
+    },
+    "codecs": {
+      "pt.scalar.rtn.v1": {
+        "id": "pt.scalar.rtn.v1",
+        "version": 1,
+        "method": "rtn",
+        "logical_bits": 4.0,
+        "storage_bits": 4.0,
+        "block_size": 1,
+        "group_size": 128,
+        "symmetric": false,
+        "scale_dtype": "float16",
+        "zero_dtype": "float16",
+        "byte_order": "little",
+        "packing_order": "least-significant-first"
+      },
+      "raw.f16.v1": {
+        "id": "raw.f16.v1",
+        "version": 1,
+        "method": "raw",
+        "logical_bits": 16.0,
+        "storage_bits": 16.0,
+        "block_size": 1,
+        "group_size": -1,
+        "symmetric": true,
+        "scale_dtype": null,
+        "zero_dtype": null,
+        "byte_order": "little",
+        "packing_order": "native-f16"
+      }
+    },
+    "regions": {},
+    "totals": {
+      "source_params": 27781427952,
+      "packaged_params": 2631931184,
+      "dropped_params": 885429488,
+      "dense_bytes": 2033920320,
+      "expert_bytes": 0,
+      "ple_bytes": 0
+    },
+    "dense": [
+      {
+        "name": "lm_head.weight",
+        "component": "lm_head",
+        "shape": [
+          248320,
+          5120
+        ],
+        "bits": 6.0,
+        "group_size": 128,
+        "symmetric": false,
+        "codec_id": "pt.scalar.rtn.v1",
+        "num_params": 1271398400,
+        "packed_bytes": 1311129600,
+        "byte_offset": 0,
+        "spans": [
+          {
+            "section": "packed",
+            "offset": 0,
+            "length": 1271398400
+          },
+          {
+            "section": "scales",
+            "offset": 1271398400,
+            "length": 19865600
+          },
+          {
+            "section": "zeros",
+            "offset": 1291264000,
+            "length": 19865600
+          }
+        ]
+      },
+      {
+        "name": "model.language_model.embed_tokens.weight",
+        "component": "embed",
+        "shape": [
+          248320,
+          5120
+        ],
+        "bits": 4.0,
+        "group_size": 128,
+        "symmetric": false,
+        "codec_id": "pt.scalar.rtn.v1",
+        "num_params": 1271398400,
+        "packed_bytes": 675430400,
+        "byte_offset": 1311129600,
+        "spans": [
+          {
+            "section": "packed",
+            "offset": 0,
+            "length": 635699200
+          },
+          {
+            "section": "scales",
+            "offset": 635699200,
+            "length": 19865600
+          },
+          {
+            "section": "zeros",
+            "offset": 655564800,
+            "length": 19865600
+          }
+        ]
+      },
+      {
+        "name": "model.language_model.layers.0.input_layernorm.weight",
+        "component": "norm",
+        "shape": [
+          5120
+        ],
+        "bits": 16.0,
+        "group_size": -1,
+        "symmetric": false,
+        "codec_id": "raw.f16.v1",
+        "num_params": 5120,
+        "packed_bytes": 10240,
+        "byte_offset": 1986560000,
+        "spans": [
+          {
+            "section": "packed",
+            "offset": 0,
+            "length": 10240
+          }
+        ]
+      },
+      {
+        "name": "model.language_model.layers.0.linear_attn.A_log",
+        "component": "gdn_attn",
+        "shape": [
+          48
+        ],
+        "bits": 3.0,
+        "group_size": 128,
+        "symmetric": false,
+        "codec_id": "pt.scalar.rtn.v1",
+        "num_params": 48,
+        "packed_bytes": 68,
+        "byte_offset": 1986570240,
+        "spans": [
+          {
+            "section": "packed",
+            "offset": 0,
+            "length": 64
+          },
+          {
+            "section": "scales",
+            "offset": 64,
+            "length": 2
+          },
+          {
+            "section": "zeros",
+            "offset": 66,
+            "length": 2
+          }
+        ]
+      },
+      {
+        "name": "model.language_model.layers.0.mlp.down_proj.weight",
+        "component": "mlp_dense",
+        "shape": [
+          5120,
+          17408
+        ],
+        "bits": 4.0,
+        "group_size": 128,
+        "symmetric": false,
+        "codec_id": "pt.scalar.rtn.v1",
+        "num_params": 89128960,
+        "packed_bytes": 47349760,
+        "byte_offset": 1986570368,
+        "spans": [
+          {
+            "section": "packed",
+            "offset": 0,
+            "length": 44564480
+          },
+          {
+            "section": "scales",
+            "offset": 44564480,
+            "length": 1392640
+          },
+          {
+            "section": "zeros",
+            "offset": 45957120,
+            "length": 1392640
+          }
+        ]
+      },
+      {
+        "name": "model.language_model.layers.11.self_attn.k_norm.weight",
+        "component": "full_attn",
+        "shape": [
+          256
+        ],
+        "bits": 4.0,
+        "group_size": 128,
+        "symmetric": false,
+        "codec_id": "pt.scalar.rtn.v1",
+        "num_params": 256,
+        "packed_bytes": 136,
+        "byte_offset": 2033920128,
+        "spans": [
+          {
+            "section": "packed",
+            "offset": 0,
+            "length": 128
+          },
+          {
+            "section": "scales",
+            "offset": 128,
+            "length": 4
+          },
+          {
+            "section": "zeros",
+            "offset": 132,
+            "length": 4
+          }
+        ]
+      }
+    ],
+    "expert_layout": null,
+    "ple_index": null,
+    "activated_params_per_token": 25624605184,
+    "expert_params_per_token": 0,
+    "expert_bytes_per_token": 0,
+    "reads_per_token": 0
+  },
+  "dense": [
+    {
+      "address": {
+        "name": "lm_head.weight",
+        "shard": "model-00018-of-00018.safetensors",
+        "dtype": "BF16",
+        "shape": [
+          248320,
+          5120
+        ],
+        "byte_start": 1760,
+        "byte_end": 2542798560,
+        "num_params": 1271398400,
+        "size_bytes": 2542796800
+      },
+      "component": "lm_head",
+      "bits": 6.0,
+      "group_size": 128,
+      "symmetric": false,
+      "codec_id": "pt.scalar.rtn.v1",
+      "packed_bytes": 1311129600,
+      "byte_offset": 0,
+      "spans": [
+        {
+          "section": "packed",
+          "offset": 0,
+          "length": 1271398400
+        },
+        {
+          "section": "scales",
+          "offset": 1271398400,
+          "length": 19865600
+        },
+        {
+          "section": "zeros",
+          "offset": 1291264000,
+          "length": 19865600
+        }
+      ]
+    },
+    {
+      "address": {
+        "name": "model.language_model.embed_tokens.weight",
+        "shard": "model-00003-of-00018.safetensors",
+        "dtype": "BF16",
+        "shape": [
+          248320,
+          5120
+        ],
+        "byte_start": 152,
+        "byte_end": 2542796952,
+        "num_params": 1271398400,
+        "size_bytes": 2542796800
+      },
+      "component": "embed",
+      "bits": 4.0,
+      "group_size": 128,
+      "symmetric": false,
+      "codec_id": "pt.scalar.rtn.v1",
+      "packed_bytes": 675430400,
+      "byte_offset": 1311129600,
+      "spans": [
+        {
+          "section": "packed",
+          "offset": 0,
+          "length": 635699200
+        },
+        {
+          "section": "scales",
+          "offset": 635699200,
+          "length": 19865600
+        },
+        {
+          "section": "zeros",
+          "offset": 655564800,
+          "length": 19865600
+        }
+      ]
+    },
+    {
+      "address": {
+        "name": "model.language_model.layers.0.input_layernorm.weight",
+        "shard": "model-00001-of-00018.safetensors",
+        "dtype": "BF16",
+        "shape": [
+          5120
+        ],
+        "byte_start": 45400,
+        "byte_end": 55640,
+        "num_params": 5120,
+        "size_bytes": 10240
+      },
+      "component": "norm",
+      "bits": 16.0,
+      "group_size": -1,
+      "symmetric": false,
+      "codec_id": "raw.f16.v1",
+      "packed_bytes": 10240,
+      "byte_offset": 1986560000,
+      "spans": [
+        {
+          "section": "packed",
+          "offset": 0,
+          "length": 10240
+        }
+      ]
+    },
+    {
+      "address": {
+        "name": "model.language_model.layers.0.linear_attn.A_log",
+        "shard": "model-00001-of-00018.safetensors",
+        "dtype": "BF16",
+        "shape": [
+          48
+        ],
+        "byte_start": 55640,
+        "byte_end": 55736,
+        "num_params": 48,
+        "size_bytes": 96
+      },
+      "component": "gdn_attn",
+      "bits": 3.0,
+      "group_size": 128,
+      "symmetric": false,
+      "codec_id": "pt.scalar.rtn.v1",
+      "packed_bytes": 68,
+      "byte_offset": 1986570240,
+      "spans": [
+        {
+          "section": "packed",
+          "offset": 0,
+          "length": 64
+        },
+        {
+          "section": "scales",
+          "offset": 64,
+          "length": 2
+        },
+        {
+          "section": "zeros",
+          "offset": 66,
+          "length": 2
+        }
+      ]
+    },
+    {
+      "address": {
+        "name": "model.language_model.layers.0.mlp.down_proj.weight",
+        "shard": "model-00001-of-00018.safetensors",
+        "dtype": "BF16",
+        "shape": [
+          5120,
+          17408
+        ],
+        "byte_start": 231807768,
+        "byte_end": 410065688,
+        "num_params": 89128960,
+        "size_bytes": 178257920
+      },
+      "component": "mlp_dense",
+      "bits": 4.0,
+      "group_size": 128,
+      "symmetric": false,
+      "codec_id": "pt.scalar.rtn.v1",
+      "packed_bytes": 47349760,
+      "byte_offset": 1986570368,
+      "spans": [
+        {
+          "section": "packed",
+          "offset": 0,
+          "length": 44564480
+        },
+        {
+          "section": "scales",
+          "offset": 44564480,
+          "length": 1392640
+        },
+        {
+          "section": "zeros",
+          "offset": 45957120,
+          "length": 1392640
+        }
+      ]
+    },
+    {
+      "address": {
+        "name": "model.language_model.layers.11.self_attn.k_norm.weight",
+        "shard": "model-00004-of-00018.safetensors",
+        "dtype": "BF16",
+        "shape": [
+          256
+        ],
+        "byte_start": 1301349664,
+        "byte_end": 1301350176,
+        "num_params": 256,
+        "size_bytes": 512
+      },
+      "component": "full_attn",
+      "bits": 4.0,
+      "group_size": 128,
+      "symmetric": false,
+      "codec_id": "pt.scalar.rtn.v1",
+      "packed_bytes": 136,
+      "byte_offset": 2033920128,
+      "spans": [
+        {
+          "section": "packed",
+          "offset": 0,
+          "length": 128
+        },
+        {
+          "section": "scales",
+          "offset": 128,
+          "length": 4
+        },
+        {
+          "section": "zeros",
+          "offset": 132,
+          "length": 4
+        }
+      ]
+    }
+  ],
+  "experts": [],
+  "ple": null,
+  "warnings": [
+    "gdn_attn: in_features=48 is not a multiple of group_size=128, so it is stored 2.67x larger. Set group_size to a divisor of 48.",
+    "gdn_attn: 3-bit packs at 4 bits/weight (33% larger on disk) - the packer stores 2 values per byte",
+    "lm_head: 6-bit packs at 8 bits/weight (33% larger on disk) - the packer stores 1 values per byte",
+    "ple_table: 3-bit packs at 4 bits/weight (33% larger on disk) - the packer stores 2 values per byte"
+  ]
+}

@@ -815,8 +815,13 @@ def package(
             TimeRemainingColumn(),
             console=console,
         ) as progress:
-            task = progress.add_task("building", total=build_plan.num_work_items)
-            result = writer.build(on_item=lambda region, label: progress.update(task, advance=1))
+            task = progress.add_task("Streaming and building...", total=build_plan.num_work_items)
+            result = writer.build(
+                on_start=lambda region, label: progress.update(
+                    task, description=f"Streaming & quantizing [bold green]{label}[/bold green]"
+                ),
+                on_item=lambda region, label: progress.update(task, advance=1),
+            )
     except Exception as e:
         console.print(f"[bold red]Build failed:[/bold red] {escape(str(e))}")
         console.print("[dim]Rerun the same command to resume from the journal.[/dim]")
