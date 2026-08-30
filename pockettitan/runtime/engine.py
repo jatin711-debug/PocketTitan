@@ -83,14 +83,22 @@ class PocketTitanEngine:
                 vram_capacity_slots=vram_budget_slots,
                 device=device,
             )
+            from pockettitan.runtime.prefetch import SpeculativePrefetcher
+            from pockettitan.runtime.session import SessionAdapter
+            self.prefetcher = SpeculativePrefetcher(self.expert_manager)
+            self.session_adapter = SessionAdapter(self.expert_manager)
         else:
             self.expert_manager = None
+            self.prefetcher = None
+            self.session_adapter = None
 
     def close(self) -> None:
         if self.dense_reader:
             self.dense_reader.close()
         if self.ple_store:
             self.ple_store.close()
+        if self.prefetcher:
+            self.prefetcher.close()
         if self.expert_manager:
             self.expert_manager.close()
 
