@@ -306,7 +306,7 @@ class PackageWriter:
                 f"have {available:,}; short by {shortfall:,} bytes."
             )
 
-    def _read_slice(self, source: SourceSlice) -> torch.Tensor:
+    def _read_slice(self, source: SourceSlice, chunk_cb: Optional[Callable] = None) -> torch.Tensor:
         """Materialize one source slice as a 2-D tensor."""
         from pockettitan.config import TensorAddress
 
@@ -323,7 +323,7 @@ class PackageWriter:
         if hasattr(self.reader, "root_dir"):
             # Local: address the parent tensor and slice it zero-copy.
             return self._read_local_slice(source)
-        return self.reader.read_tensor(address)
+        return self.reader.read_tensor(address, chunk_callback=chunk_cb)
 
     def _read_local_slice(self, source: SourceSlice) -> torch.Tensor:
         """Zero-copy slice out of a memory-mapped local shard."""
@@ -351,6 +351,7 @@ class PackageWriter:
         journal: BuildJournal,
         on_item: Optional[Callable] = None,
         on_start: Optional[Callable] = None,
+        on_bytes: Optional[Callable] = None,
     ) -> Tuple[int, int, float]:
         done, _, _ = journal.as_sets()
         pending = [i for i in self.plan.dense if i.address.name not in done]
@@ -362,13 +363,15 @@ class PackageWriter:
         written = 0
         peak = 0.0
 
+        chunk_cb = (lambda n, _: on_bytes(n)) if on_bytes else None
+
         with open(self.dense_path, "r+b") as blob:
             for batch in _batches(pending, DENSE_BATCH_ITEMS):
                 committed = []
                 for item in batch:
                     if on_start:
                         on_start("dense", item.address.name)
-                    tensor = self.reader.read_tensor(self._address_of(item))
+                    tensor = self.reader.read_tensor(self._address_of(item), chunk_callback=chunk_cb)
                     payload, item_peak = self._encode_dense(item, tensor)
                     peak = max(peak, item_peak)
                     blob.seek(item.byte_offset)
@@ -465,6 +468,7 @@ class PackageWriter:
         journal: BuildJournal,
         on_item: Optional[Callable] = None,
         on_start: Optional[Callable] = None,
+        on_bytes: Optional[Callable] = None,
     ) -> Tuple[int, int, float]:
         layout = self.plan.manifest.expert_layout
         if layout is None or not self.plan.experts:
@@ -478,6 +482,7 @@ class PackageWriter:
         _preallocate(self.bank_path, layout.total_bytes)
         written = 0
         peak = 0.0
+        chunk_cb = (lambda n, _: on_bytes(n)) if on_bytes else None
 
         with open(self.bank_path, "r+b") as bank:
             for batch in _batches(pending, EXPERT_BATCH_ITEMS):
@@ -485,7 +490,10 @@ class PackageWriter:
                 for item in batch:
                     if on_start:
                         on_start("expert", f"L{item.layer}E{item.expert}")
-                    payload, item_peak = self._encode_expert(item)
+                    try:
+                        payload, item_peak = self._encode_expert(item, chunk_cb=chunk_cb)
+                    except TypeError:
+                        payload, item_peak = self._encode_expert(item)
                     peak = max(peak, item_peak)
                     bank.seek(item.bank_offset)
                     bank.write(payload)
@@ -512,7 +520,7 @@ class PackageWriter:
                         on_item("expert", f"L{item.layer}E{item.expert}")
         return written, len(self.plan.experts) - len(pending), peak
 
-    def _encode_expert(self, item: ExpertWorkItem) -> Tuple[bytes, float]:
+    def _encode_expert(self, item: ExpertWorkItem, chunk_cb: Optional[Callable] = None) -> Tuple[bytes, float]:
         record = self.plan.manifest.expert_layout.record
         payload = bytearray()
         peak = 0.0
@@ -523,7 +531,7 @@ class PackageWriter:
                 raise WriteError(
                     f"L{item.layer}E{item.expert}: projection '{source.projection}' is not in the record layout"
                 )
-            weight = self._read_slice(source)
+            weight = self._read_slice(source, chunk_cb=chunk_cb)
             result, _, item_peak = self._quantize(
                 weight, projection.bits, projection.group_size, projection.symmetric
             )
@@ -547,6 +555,7 @@ class PackageWriter:
         journal: BuildJournal,
         on_item: Optional[Callable] = None,
         on_start: Optional[Callable] = None,
+        on_bytes: Optional[Callable] = None,
     ) -> Tuple[int, int, float]:
         ple = self.plan.ple
         if ple is None:
@@ -562,6 +571,7 @@ class PackageWriter:
         row_spans = section_spans([1, row.row_width], row.bits, row.group_size, row.symmetric)
         written = 0
         peak = 0.0
+        chunk_cb = (lambda n, _: on_bytes(n)) if on_bytes else None
 
         with open(self.ple_path, "r+b") as table:
             for batch in _batches(pending, 1):
@@ -569,7 +579,10 @@ class PackageWriter:
                 for shard in batch:
                     if on_start:
                         on_start("ple", f"shard_{shard.shard_index}")
-                    block, shard_peak = self._encode_ple_shard(shard, row_spans)
+                    try:
+                        block, shard_peak = self._encode_ple_shard(shard, row_spans, chunk_cb=chunk_cb)
+                    except TypeError:
+                        block, shard_peak = self._encode_ple_shard(shard, row_spans)
                     peak = max(peak, shard_peak)
                     # Rows are page-packed, so write row by row rather than as one run.
                     for offset_in_shard in range(shard.num_rows):
@@ -601,7 +614,10 @@ class PackageWriter:
         return written, len(ple.shards) - len(pending), peak
 
     def _encode_ple_shard(
-        self, shard: PleShardWorkItem, row_spans: Sequence[SectionSpan]
+        self,
+        shard: PleShardWorkItem,
+        row_spans: Sequence[SectionSpan],
+        chunk_cb: Optional[Callable] = None,
     ) -> Tuple[bytes, float]:
         """Quantize one source shard and interleave it into self-contained rows.
 
@@ -610,7 +626,7 @@ class PackageWriter:
         decodes without touching anything else.
         """
         row = self.plan.ple.row
-        tensor = self.reader.read_tensor(shard.address)
+        tensor = self.reader.read_tensor(shard.address, chunk_callback=chunk_cb)
         result, _, peak = self._quantize(tensor, row.bits, row.group_size, row.symmetric)
         del tensor
 
@@ -649,6 +665,7 @@ class PackageWriter:
         self,
         on_item: Optional[Callable[[str, str], None]] = None,
         on_start: Optional[Callable[[str, str], None]] = None,
+        on_bytes: Optional[Callable[[int], None]] = None,
     ) -> BuildResult:
         """Execute the plan. Safe to call repeatedly to resume."""
         started = time.perf_counter()
@@ -660,7 +677,7 @@ class PackageWriter:
         written = skipped = 0
         peak = 0.0
         for region in (self._write_dense, self._write_experts, self._write_ple):
-            region_bytes, region_skipped, region_peak = region(journal, on_item, on_start)
+            region_bytes, region_skipped, region_peak = region(journal, on_item, on_start, on_bytes)
             written += region_bytes
             skipped += region_skipped
             peak = max(peak, region_peak)

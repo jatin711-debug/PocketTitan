@@ -800,10 +800,12 @@ def package(
 
     from rich.progress import (
         BarColumn,
+        DownloadColumn,
         Progress,
         TaskProgressColumn,
         TextColumn,
         TimeRemainingColumn,
+        TransferSpeedColumn,
     )
 
     console.print()
@@ -811,16 +813,18 @@ def package(
         with Progress(
             TextColumn("[cyan]{task.description}"),
             BarColumn(),
+            DownloadColumn(),
+            TransferSpeedColumn(),
             TaskProgressColumn(),
             TimeRemainingColumn(),
             console=console,
         ) as progress:
-            task = progress.add_task("Streaming and building...", total=build_plan.num_work_items)
+            task = progress.add_task("Streaming and building...", total=build_plan.source_read_bytes)
             result = writer.build(
                 on_start=lambda region, label: progress.update(
                     task, description=f"Streaming & quantizing [bold green]{label}[/bold green]"
                 ),
-                on_item=lambda region, label: progress.update(task, advance=1),
+                on_bytes=lambda delta: progress.update(task, advance=delta),
             )
     except Exception as e:
         console.print(f"[bold red]Build failed:[/bold red] {escape(str(e))}")
