@@ -1,13 +1,12 @@
 """The Oracle Decision Gate Engine (Phase R4)."""
 
 from enum import Enum
-from typing import Dict, List, Optional, Sequence, Tuple
-from pydantic import BaseModel, Field
+from typing import Optional, Sequence
+from pydantic import BaseModel
 
-from pockettitan.sim.cache import LRUCache, OSPageCache, OracleCache, SLRUCache, TinyLFUCache
-from pockettitan.sim.hardware import HardwareProfile, HardwareSimulator
-from pockettitan.sim.report import PolicyMetric, SimulationReport, run_capacity_sweep
-from pockettitan.sim.schema import RoutingEvent, compute_gini, summarize_trace
+from pockettitan.sim.hardware import HardwareProfile
+from pockettitan.sim.report import SimulationReport, run_capacity_sweep
+from pockettitan.sim.schema import RoutingEvent, summarize_trace
 
 
 class GateDecision(str, Enum):

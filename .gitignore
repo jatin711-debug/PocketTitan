@@ -88,3 +88,13 @@ pockettitan_spool/
 precision_map.json
 test_precision_map.json
 qwen_moe_precision_map.json
+
+# Built .ptitan packages. These are build output, not source: a full one is
+# tens to hundreds of GiB, and only `*.bin` inside them was previously caught,
+# so `git add -A` would have committed the manifest, the vendored tokenizer and
+# the journal.
+*.ptitan/
+qwen*_full/
+qwen*_int8/
+qwen*_q4e/
+qwen*_bf16/

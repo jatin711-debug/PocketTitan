@@ -24,11 +24,12 @@ try:
     import google_crc32c
 
     def crc32c(data: bytes, crc: int = 0) -> int:
+        # `Checksum(x)` treats x as leading *data*, not as a seed, so it cannot
+        # continue a running CRC. `extend` is the seeded API and agrees
+        # bit-for-bit with the pure-Python fallback below.
         if crc == 0:
             return google_crc32c.value(data)
-        checksum = google_crc32c.Checksum(crc.to_bytes(4, "big"))
-        checksum.update(data)
-        return checksum.value
+        return google_crc32c.extend(crc, data)
 
 except ImportError:
     try:

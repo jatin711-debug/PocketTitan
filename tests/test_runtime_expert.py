@@ -1,10 +1,10 @@
 """Tests for out-of-core ExpertManager, BoundedSLRUCache, and runtime engine (Phase R6)."""
 
-import os
 from pathlib import Path
 import random
 import tempfile
 import pytest
+import safetensors.torch
 import torch
 
 from pockettitan.package.format import ExpertLayout, ExpertRecordLayout
@@ -140,3 +140,109 @@ def test_expert_manager_bank_roundtrip():
             )
             assert out.shape == torch.Size([1, in_features])
             assert not torch.allclose(out, torch.zeros_like(out))
+
+
+# --------------------------------------------------------------------------- #
+# The quantized path, end to end through the real writer
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("bits,symmetric", [(4, False), (4, True), (2, False)])
+def test_expert_manager_decodes_a_package_the_writer_actually_wrote(
+    dummy_moe_model, tmp_path, bits, symmetric
+):
+    """Fetch experts from a real ``experts/bank.bin`` and compare against the source.
+
+    Every previous expert test used ``bits=16``, so the quantized branch of
+    ``decode_expert_payload`` was never executed. It hardcoded 4-bit nibbles with
+    a ``-8`` offset and never read the ``ZEROS`` section — yet
+    ``PrecisionEntry.symmetric`` defaults to ``False``, so every packaged expert
+    carries a zero-point that was being discarded.
+    """
+    from pockettitan.audit import PrecisionMap, scan_checkpoint
+    from pockettitan.config import MemoryBudgetConfig, QuantMethod
+    from pockettitan.package import PackageWriter, plan_package
+    from pockettitan.streaming.reader import LocalTensorReader
+
+    precision = PrecisionMap.uniform(bits, 32, f"expert-{bits}b")
+    for entry in list(precision.entries.values()) + [precision.default]:
+        entry.symmetric = symmetric
+
+    scan = scan_checkpoint(str(dummy_moe_model))
+    plan = plan_package(scan, precision_map=precision)
+    output = tmp_path / "pkg.ptitan"
+    PackageWriter(
+        plan,
+        output,
+        LocalTensorReader(dummy_moe_model),
+        budget=MemoryBudgetConfig(max_vram_mb=512.0),
+        method=QuantMethod.RTN,
+        device="cpu",
+    ).build()
+
+    layout = plan.manifest.expert_layout
+    assert layout is not None, "fixture must produce routed experts"
+
+    source = {}
+    for path in sorted(dummy_moe_model.glob("*.safetensors")):
+        source.update(safetensors.torch.load_file(str(path)))
+
+    with ExpertManager(
+        bank_path=output / "experts" / "bank.bin",
+        layout=layout,
+        ram_capacity_slots=4,
+        device="cpu",
+    ) as manager:
+        for layer in layout.layers:
+            for expert in (0, layout.num_experts // 2, layout.num_experts - 1):
+                decoded = manager.fetch_expert(layer, expert)
+
+                gate_up = source[f"model.layers.{layer}.mlp.experts.gate_up_proj"][expert]
+                down = source[f"model.layers.{layer}.mlp.experts.down_proj"][expert]
+
+                assert decoded.gate_up.shape == gate_up.shape
+                assert decoded.down.shape == down.shape
+                for got, want, name in (
+                    (decoded.gate_up, gate_up, "gate_up"),
+                    (decoded.down, down, "down"),
+                ):
+                    got_f, want_f = got.float().flatten(), want.float().flatten()
+                    correlation = torch.corrcoef(torch.stack([got_f, want_f]))[0, 1]
+                    assert correlation > 0.9, (
+                        f"L{layer}E{expert} {name} decoded at correlation "
+                        f"{correlation:.3f} — the record is being read wrong, not "
+                        f"merely quantized coarsely"
+                    )
+
+
+def test_distinct_experts_decode_to_distinct_weights(dummy_moe_model, tmp_path):
+    """Guards the failure where every record resolves to one offset."""
+    from pockettitan.audit import PrecisionMap, scan_checkpoint
+    from pockettitan.config import MemoryBudgetConfig, QuantMethod
+    from pockettitan.package import PackageWriter, plan_package
+    from pockettitan.streaming.reader import LocalTensorReader
+
+    scan = scan_checkpoint(str(dummy_moe_model))
+    plan = plan_package(scan, precision_map=PrecisionMap.uniform(4, 32, "int4"))
+    output = tmp_path / "pkg.ptitan"
+    PackageWriter(
+        plan,
+        output,
+        LocalTensorReader(dummy_moe_model),
+        budget=MemoryBudgetConfig(max_vram_mb=512.0),
+        method=QuantMethod.RTN,
+        device="cpu",
+    ).build()
+
+    layout = plan.manifest.expert_layout
+    with ExpertManager(
+        bank_path=output / "experts" / "bank.bin",
+        layout=layout,
+        ram_capacity_slots=layout.num_experts * 2,
+        device="cpu",
+    ) as manager:
+        signatures = {
+            expert: manager.fetch_expert(0, expert).gate_up.float().sum().item()
+            for expert in range(layout.num_experts)
+        }
+    assert len(set(signatures.values())) == layout.num_experts, signatures

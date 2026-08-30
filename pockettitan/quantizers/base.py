@@ -1,11 +1,27 @@
 """Base interfaces, data structures, and capability contracts for quantization backends."""
 
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 import torch
 
 from pockettitan.config import QuantConfig
+
+
+def matrix_dims(shape: Tuple[int, ...]) -> Tuple[int, int]:
+    """``(out_features, in_features)`` exactly as ``quantize`` flattens a weight.
+
+    Every ``quantize`` does ``weight.view(-1, shape[-1])``, so the row count is
+    the product of the leading dimensions, not ``shape[0]``. Reading it as
+    ``(shape[0], shape[1])`` happens to agree only for 2-D weights, and silently
+    transposes 1-D vectors and 3-D convolution kernels.
+    """
+    if not shape:
+        return 1, 1
+    if len(shape) == 1:
+        return 1, shape[0]
+    return math.prod(shape[:-1]), shape[-1]
 
 
 @dataclass

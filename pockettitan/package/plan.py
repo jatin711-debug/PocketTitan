@@ -15,7 +15,6 @@ Responsibilities, mapping to Plan.md R1 tasks:
 
 import re
 from datetime import datetime, timezone
-import math
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from pydantic import BaseModel, Field
@@ -48,6 +47,7 @@ from pockettitan.package.format import (
     is_dense_bit_width,
     matrix_dims,
     packed_bytes,
+    resolve_group_size,
     section_spans,
     storage_bits,
 )
@@ -201,6 +201,20 @@ def codec_spec_for(
         symmetric=symmetric,
         zero_dtype=None if symmetric else "float16",
     )
+
+
+def _requested_group_size(label: str, precision_map) -> Optional[int]:
+    """The group size the precision map asked for, before divisor resolution."""
+    if label.startswith("experts_routed"):
+        component = Component.EXPERTS_ROUTED
+    elif label == "ple_table":
+        component = Component.PLE_TABLE
+    else:
+        try:
+            component = Component(label)
+        except ValueError:
+            return None
+    return precision_map.entry_for(component).group_size
 
 
 def _quantized_shapes(dense, expert_layout, ple_plan):
@@ -448,13 +462,14 @@ def plan_package(
             continue
 
         entry = precision_map.entry_for(rule.component)
-        spans = section_spans(list(address.shape), entry.bits, entry.group_size, entry.symmetric)
+        group_size = resolve_group_size(matrix_dims(list(address.shape))[1], entry.group_size)
+        spans = section_spans(list(address.shape), entry.bits, group_size, entry.symmetric)
         dense.append(
             DenseWorkItem(
                 address=address,
                 component=rule.component,
                 bits=entry.bits,
-                group_size=entry.group_size,
+                group_size=group_size,
                 symmetric=entry.symmetric,
                 codec_id=codec_id_for(rule.component, entry.bits, quant_method),
                 packed_bytes=sum(s.length for s in spans),
@@ -478,19 +493,26 @@ def plan_package(
 
     warnings: List[str] = []
 
-    # Group padding silently inflates storage: a 64-wide row at group_size=128
-    # is stored 128 wide, doubling it. Same defect class as the tiler OOM.
-    padded: Dict[str, Tuple[int, int, float]] = {}
+    # `resolve_group_size` guarantees the group divides `in_features`, so no
+    # record can be padded. Padding used to cost storage *and* accuracy -- the
+    # padding zeros joined the group and stretched its scale -- so the requested
+    # size is rounded down instead. Report where that happened, and assert the
+    # invariant rather than trusting it.
+    reduced: Dict[str, Tuple[int, int, int]] = {}
     for shape, group_size, label in _quantized_shapes(dense, expert_layout, ple_plan):
         _, in_features = matrix_dims(shape)
         if group_size > 0 and in_features % group_size:
-            waste = (int(math.ceil(in_features / group_size)) * group_size) / in_features
-            if waste > padded.get(label, (0, 0, 0.0))[2]:
-                padded[label] = (in_features, group_size, waste)
-    for label, (in_features, group_size, waste) in sorted(padded.items()):
+            raise PlanError(
+                f"{label}: group_size={group_size} does not divide in_features="
+                f"{in_features}; the record would be padded"
+            )
+        requested = _requested_group_size(label, precision_map)
+        if requested and group_size < requested and requested < in_features:
+            reduced[label] = (in_features, requested, group_size)
+    for label, (in_features, requested, group_size) in sorted(reduced.items()):
         warnings.append(
-            f"{label}: in_features={in_features} is not a multiple of group_size={group_size}, "
-            f"so it is stored {waste:.2f}x larger. Set group_size to a divisor of {in_features}."
+            f"{label}: group_size {requested} does not divide in_features={in_features}, "
+            f"so it was reduced to {group_size} rather than padding the record."
         )
 
     for component in sorted(

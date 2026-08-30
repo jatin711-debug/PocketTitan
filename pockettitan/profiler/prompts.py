@@ -1,7 +1,6 @@
 """Benchmark prompt dataset generator covering the 5 canonical MoE evaluation tasks (R3)."""
 
 from enum import Enum
-import json
 from typing import Dict, List, Optional
 from pydantic import BaseModel, Field
 

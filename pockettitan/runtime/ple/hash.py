@@ -1,7 +1,6 @@
 """Bit-exact n-gram hash calculator matching reference Transformers PLE block (R5)."""
 
-from typing import List, Sequence, Union
-import torch
+from typing import List, Sequence
 from pockettitan.package.format import PleIndex
 
 

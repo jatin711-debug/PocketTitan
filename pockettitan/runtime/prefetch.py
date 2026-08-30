@@ -1,7 +1,7 @@
 """Speculative Cross-Layer Lookahead Prefetcher for MoE Expert Paging (Phase R7)."""
 
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Sequence, Tuple
 import torch
 
 from pockettitan.runtime.expert.manager import DecodedExpert, ExpertManager
@@ -75,10 +75,10 @@ class SpeculativePrefetcher:
                 continue
 
             # Submit asynchronous read task
-            def _async_load(l: int, e: int) -> DecodedExpert:
-                raw_bytes = self.manager.read_expert_record(l, e)
+            def _async_load(layer_idx: int, e: int) -> DecodedExpert:
+                raw_bytes = self.manager.read_expert_record(layer_idx, e)
                 decoded = self.manager.decode_expert_payload(raw_bytes)
-                self.manager.ram_cache.put((l, e), decoded)
+                self.manager.ram_cache.put((layer_idx, e), decoded)
                 return decoded
 
             self.pending_futures[key] = self.executor.submit(_async_load, next_layer, exp_idx)

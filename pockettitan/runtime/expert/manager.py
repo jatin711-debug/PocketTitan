@@ -4,10 +4,12 @@ from collections import Counter
 import mmap
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Dict, Optional, Sequence, Tuple, Union
 import torch
 
-from pockettitan.package.format import ExpertLayout, ExpertRecordLayout, Section
+from pockettitan.config import QuantMethod
+from pockettitan.package.decode import decode_record
+from pockettitan.package.format import ExpertLayout
 from pockettitan.runtime.expert.cache import BoundedSLRUCache
 
 
@@ -51,10 +53,12 @@ class ExpertManager:
         vram_capacity_slots: int = 64,  # Up to 64 sustained-hot experts in VRAM (~160 MB)
         vram_promotion_threshold: int = 8,  # Promote to VRAM on 8th access
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        quant_method: QuantMethod = QuantMethod.RTN,
     ):
         self.bank_path = Path(bank_path)
         self.layout = layout
         self.device = device
+        self.quant_method = quant_method
 
         # 1. RAM SLRU Cache (20% probationary / 80% protected)
         self.ram_cache = BoundedSLRUCache(capacity_slots=ram_capacity_slots, probationary_ratio=0.20)
@@ -100,65 +104,35 @@ class ExpertManager:
         return self._mmap[offset : offset + length]
 
     def decode_expert_payload(self, raw_bytes: bytes) -> DecodedExpert:
-        """Dequantize one expert's gate_up and down projections on CPU."""
-        record_layout = self.layout.record
-        
-        # 1. Gate_up projection
-        gate_up_spec = record_layout.projection("gate_up_proj") or record_layout.projections[0]
-        gate_up_span = gate_up_spec.spans[0]
-        gate_up_shape = gate_up_spec.shape
-        
-        # 2. Down projection
-        down_spec = record_layout.projection("down_proj") or record_layout.projections[1]
-        down_span = down_spec.spans[0]
-        down_shape = down_spec.shape
+        """Dequantize one expert record's projections on CPU.
 
-        if gate_up_spec.bits >= 16:
-            # Unquantized FP16
-            gu_bytes = raw_bytes[gate_up_spec.offset : gate_up_spec.offset + gate_up_spec.length]
-            gu_w = torch.frombuffer(bytearray(gu_bytes), dtype=torch.float16).view(*gate_up_shape).clone()
-
-            dn_bytes = raw_bytes[down_spec.offset : down_spec.offset + down_spec.length]
-            dn_w = torch.frombuffer(bytearray(dn_bytes), dtype=torch.float16).view(*down_shape).clone()
-            return DecodedExpert(gate_up_weight=gu_w, down_weight=dn_w, device="cpu")
-
-        # 4-bit RTN dequantization
-        # Gate_up: packed codes + FP16 scale
-        gu_data = raw_bytes[gate_up_spec.offset : gate_up_spec.offset + gate_up_span.length]
-        gu_scale_offset = gate_up_spec.offset + gate_up_spec.spans[1].offset
-        gu_scale_bytes = raw_bytes[gu_scale_offset : gu_scale_offset + gate_up_spec.spans[1].length]
-        
-        gu_packed = torch.frombuffer(bytearray(gu_data), dtype=torch.uint8)
-        gu_scales = torch.frombuffer(bytearray(gu_scale_bytes), dtype=torch.float16)
-        
-        # Unpack nibbles
-        gu_unpacked = torch.empty(gu_packed.numel() * 2, dtype=torch.float32)
-        gu_unpacked[0::2] = (gu_packed & 0x0F).float() - 8.0
-        gu_unpacked[1::2] = ((gu_packed >> 4) & 0x0F).float() - 8.0
-        
-        num_rows = gate_up_shape[0] if len(gate_up_shape) > 1 else 1
-        cols = gate_up_shape[-1]
-        gu_unpacked = gu_unpacked[: num_rows * cols].view(num_rows, cols)
-        gu_w = (gu_unpacked * gu_scales.view(num_rows, -1).float()).to(torch.float16)
-
-        # Down proj dequantization
-        dn_data = raw_bytes[down_spec.offset : down_spec.offset + down_span.length]
-        dn_scale_offset = down_spec.offset + down_spec.spans[1].offset
-        dn_scale_bytes = raw_bytes[dn_scale_offset : dn_scale_offset + down_spec.spans[1].length]
-        
-        dn_packed = torch.frombuffer(bytearray(dn_data), dtype=torch.uint8)
-        dn_scales = torch.frombuffer(bytearray(dn_scale_bytes), dtype=torch.float16)
-        
-        dn_unpacked = torch.empty(dn_packed.numel() * 2, dtype=torch.float32)
-        dn_unpacked[0::2] = (dn_packed & 0x0F).float() - 8.0
-        dn_unpacked[1::2] = ((dn_packed >> 4) & 0x0F).float() - 8.0
-        
-        dn_rows = down_shape[0] if len(down_shape) > 1 else 1
-        dn_cols = down_shape[-1]
-        dn_unpacked = dn_unpacked[: dn_rows * dn_cols].view(dn_rows, dn_cols)
-        dn_w = (dn_unpacked * dn_scales.view(dn_rows, -1).float()).to(torch.float16)
-
-        return DecodedExpert(gate_up_weight=gu_w, down_weight=dn_w, device="cpu")
+        Both projections are decoded from the layout the planner recorded, at
+        whatever bit width and symmetry the precision map assigned. The previous
+        implementation hardcoded 4-bit nibbles with a ``-8`` offset and never
+        read the ``ZEROS`` section, so it silently discarded the zero-point that
+        ``PrecisionEntry.symmetric = False`` (the default) makes mandatory, and
+        it sliced rows at the unpadded width so every row after the first was
+        misaligned under group padding.
+        """
+        record = self.layout.record
+        decoded = {}
+        for index, key in enumerate(("gate_up_proj", "down_proj")):
+            spec = record.projection(key) or record.projections[index]
+            decoded[key] = decode_record(
+                raw_bytes,
+                shape=spec.shape,
+                bits=spec.bits,
+                group_size=spec.group_size,
+                symmetric=spec.symmetric,
+                spans=spec.spans,
+                method=self.quant_method,
+                base_offset=spec.offset,
+            )
+        return DecodedExpert(
+            gate_up_weight=decoded["gate_up_proj"],
+            down_weight=decoded["down_proj"],
+            device="cpu",
+        )
 
     def fetch_expert(self, layer: int, expert: int) -> DecodedExpert:
         """Retrieve an expert, managing VRAM hot tier, RAM SLRU, or on-demand NVMe read."""

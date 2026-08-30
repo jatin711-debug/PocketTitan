@@ -2,9 +2,8 @@
 
 from collections import Counter, defaultdict
 import gzip
-import json
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
+from typing import Dict, Iterator, List, Sequence, Set, Tuple, Union
 from pydantic import BaseModel, Field
 
 from pockettitan.sim.schema import RoutingEvent, compute_gini
@@ -119,9 +118,9 @@ def analyze_routing_trace(events: Sequence[RoutingEvent]) -> TraceMetrics:
     # 3. Cross-layer top-k overlap: Overlap(L, L+1) = |E_L ∩ E_{L+1}| / k
     overlaps: List[float] = []
     for tok in tokens_seen:
-        for l in range(max_layer):
-            set_l = token_layer_experts.get((tok, l), set())
-            set_next = token_layer_experts.get((tok, l + 1), set())
+        for layer_idx in range(max_layer):
+            set_l = token_layer_experts.get((tok, layer_idx), set())
+            set_next = token_layer_experts.get((tok, layer_idx + 1), set())
             if set_l and set_next:
                 intersect = len(set_l.intersection(set_next))
                 k = len(set_l)
@@ -131,10 +130,12 @@ def analyze_routing_trace(events: Sequence[RoutingEvent]) -> TraceMetrics:
 
     # 4. Top 3 most frequent experts per layer
     top_experts: Dict[int, List[int]] = {}
-    for l in range(max_layer + 1):
-        l_counts = {exp: cnt for (layer, exp), cnt in expert_counts.items() if layer == l}
+    for layer_idx in range(max_layer + 1):
+        # `layer` is the comprehension's own binding over the key tuple; it must
+        # not share a name with the loop variable it is filtered against.
+        l_counts = {exp: cnt for (layer, exp), cnt in expert_counts.items() if layer == layer_idx}
         sorted_exp = sorted(l_counts.keys(), key=lambda e: l_counts[e], reverse=True)[:3]
-        top_experts[l] = sorted_exp
+        top_experts[layer_idx] = sorted_exp
 
     return TraceMetrics(
         total_tokens=len(tokens_seen),

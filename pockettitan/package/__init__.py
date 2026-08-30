@@ -48,7 +48,9 @@ from pockettitan.package.format import (
     SourceProvenance,
     align_up,
     num_groups,
+    matrix_dims,
     packed_bytes,
+    resolve_group_size,
 )
 from pockettitan.package.plan import (
     BuildPlan,
@@ -115,7 +117,9 @@ __all__ = [
     "PackageManifest",
     "align_up",
     "num_groups",
+    "matrix_dims",
     "packed_bytes",
+    "resolve_group_size",
     # slicing
     "SourceSlice",
     "ExpertSlice",

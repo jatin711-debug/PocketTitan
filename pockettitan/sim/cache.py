@@ -6,7 +6,7 @@ offline Belady's Optimal Replacement (Oracle) algorithm as an upper bound.
 
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Sequence, Set, Tuple
 
 
 class CachePolicy(ABC):

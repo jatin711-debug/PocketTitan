@@ -490,10 +490,7 @@ class PackageWriter:
                 for item in batch:
                     if on_start:
                         on_start("expert", f"L{item.layer}E{item.expert}")
-                    try:
-                        payload, item_peak = self._encode_expert(item, chunk_cb=chunk_cb)
-                    except TypeError:
-                        payload, item_peak = self._encode_expert(item)
+                    payload, item_peak = self._encode_expert(item, chunk_cb=chunk_cb)
                     peak = max(peak, item_peak)
                     bank.seek(item.bank_offset)
                     bank.write(payload)
@@ -579,10 +576,7 @@ class PackageWriter:
                 for shard in batch:
                     if on_start:
                         on_start("ple", f"shard_{shard.shard_index}")
-                    try:
-                        block, shard_peak = self._encode_ple_shard(shard, row_spans, chunk_cb=chunk_cb)
-                    except TypeError:
-                        block, shard_peak = self._encode_ple_shard(shard, row_spans)
+                    block, shard_peak = self._encode_ple_shard(shard, row_spans, chunk_cb=chunk_cb)
                     peak = max(peak, shard_peak)
                     # Rows are page-packed, so write row by row rather than as one run.
                     for offset_in_shard in range(shard.num_rows):

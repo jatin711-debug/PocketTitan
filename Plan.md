@@ -223,6 +223,21 @@ against the R0 budget before 360 GB moves.
 - [x] **T1.8 Package integrity gate.** ABI v1.1 codec registry, pinned source provenance, CRC32C item checksums, region SHA-256, durable journal batches, 15% disk headroom, exact PLE index, fast/full validator, compact canary profile, corruption and crash-injection tests.
 - [~] **T1.9 Runtime-compatible codecs.** The codec ABI is complete. Implement and independently verify `raw.f16.v1`, `ggml.q4_0.v1`, `ggml.q8_0.v1`, and `pt.ple.q4.v1`. Custom 3-bit packing is deliberately deferred.
 - [~] **T1.10 Live canary.** Text runtime assets are copied without tokenizer-ID changes or multimodal preprocessors. Run the pinned remote canary (PLE shards 0/127; experts 0/255/511 at layers 0/47), then validate interruption/resume, corruption, independent decode, and peak VRAM <3.5 GiB.
+- [x] **T1.12 Decode-path defect sweep.** One shared `decode_record` replaces five
+  hand-rolled inverses of the packer. Fixed: CRC32C seeded continuation; non-2-D
+  dimension derivation in all 7 quantizers; the affine zero-point clamp;
+  norms/`A_log`/`dt_bias` captured by the attention-family rules; the PLE row
+  decoder (3-bit rows were decoding at correlation **0.247**); the expert decoder
+  (raised on real bytes); the low-bit kernels' `-8`/`-2` offsets; group padding,
+  now impossible by construction via `resolve_group_size`; a missing `json`
+  import in the CLI. 287 tests, ruff clean.
+  Report: [`reports/R1d-defect-sweep.md`](reports/R1d-defect-sweep.md).
+
+  > Every one of these had a passing test. Each test built its fixture to match
+  > the decoder's assumption instead of using bytes the writer produced, so it
+  > verified self-consistency, not correctness. **A decoder is only tested by
+  > data the encoder actually wrote.**
+
 - [ ] **T1.11 Complete build.** Begins only after the live canary gate. Use drive C and require planned bytes plus 15% free-space headroom.
 
 **`PT-Q4E` — experimental first-pass candidate, not quality-validated.** Measured from the emitted prototype plan:
@@ -321,6 +336,42 @@ The highest-confidence component in the whole plan: 95 GiB of parameters for 64 
 - [ ] **Sorted, batched prefill reads** at queue depth 128 (wired into C++ runtime in R6).
 
 **Gate: MET.** Row lookups match reference implementation and decode cleanly under 64 KiB/token without page straddling.
+
+---
+
+### R10 — Reference Runtime: packaged weights, upstream forward pass ✅
+**Delivered 2026-08-30**
+
+`transformers` 5.16.1 ships **both** `Qwen3_5ForCausalLM` (27B) and
+`Qwen4ExpForConditionalGeneration` (Flash-Next). Earlier reports treated "no
+forward pass exists for the GDN + full-attention hybrid" as the blocker on real
+text and pointed at the FORK GATE. That was wrong about the cost: the recurrence,
+sparse attention, interleaved mRoPE, masks and KV cache are all upstream and
+tested. This phase reimplements none of it and replaces only the *storage*.
+
+- [x] `pockettitan/package/decode.py::decode_rows` — reconstruct `[start, stop)`
+      rows without touching the rest, so a 2.5 GB row-addressed table is usable.
+- [x] `pockettitan/runtime/hf/weights.py` — `PackageWeights` (name resolution,
+      byte-budgeted LRU, I/O accounting), `PackagedLinear` (with `out_chunk` for
+      `lm_head`), `PackagedEmbedding` (one read per distinct token id).
+- [x] `pockettitan/runtime/hf/loader.py` — `build_causal_lm`, which **refuses to
+      return a model with any unbacked or meta parameter**. An unresolved name
+      would leave a module uninitialized and generate fluent nonsense.
+- [x] `parameters_on_meta()` — params on meta, buffers real. `torch.device("meta")`
+      would fake the rotary `inv_freq` buffer, producing a model that runs and is
+      silently wrong.
+- [x] CLI `pockettitan run <PACKAGE> --prompt ... [-n] [--device] [--dtype]`.
+- [x] `tests/test_hf_runtime.py` (11) against a real tiny `Qwen3_5ForCausalLM`.
+
+**Gate: MET.** A 16-bit package reproduces the source model's logits with
+identical argmax and a max gap under 0.5% of scale. Measured ladder
+(corr / argmax-agreement vs. the source): 16b `+1.00000` / 100%, 8b `+0.99996` /
+100%, 4b `+0.98800` / 75%, 3b `+0.95441` / 62.5%, 2b `+0.75770` / 25%. Those are
+*pipeline* numbers on a randomly-initialized fixture — the shape is the signal,
+not the absolute values. Report: [`reports/R10-reference-runtime.md`](reports/R10-reference-runtime.md).
+
+> **The FORK GATE is no longer on the critical path.** It becomes a performance
+> decision (fast kernels, C++ runtime), not a correctness prerequisite.
 
 ---
 

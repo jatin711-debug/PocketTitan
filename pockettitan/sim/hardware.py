@@ -1,7 +1,7 @@
 """Hardware execution and I/O latency model for out-of-core MoE inference (R2)."""
 
-from typing import Dict, Optional
-from pydantic import BaseModel, Field
+from typing import Optional
+from pydantic import BaseModel
 
 
 class HardwareProfile(BaseModel):

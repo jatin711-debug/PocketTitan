@@ -2,7 +2,6 @@
 
 from pathlib import Path
 import tempfile
-import pytest
 
 from pockettitan.profiler.prompts import TaskType, generate_benchmark_suite
 from pockettitan.profiler.trace import (
@@ -10,7 +9,6 @@ from pockettitan.profiler.trace import (
     TraceWriter,
     analyze_routing_trace,
 )
-from pockettitan.sim.cache import OracleCache
 from pockettitan.sim.report import run_capacity_sweep
 from pockettitan.sim.schema import DistributionType, generate_synthetic_trace
 

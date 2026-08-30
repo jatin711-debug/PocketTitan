@@ -86,3 +86,97 @@ def test_non_divisible_shape_quantization(method):
     assert w_deq.dtype == torch.float16
     report = evaluate_quantization_quality(w, w_deq)
     assert report.cosine_similarity > 0.70
+
+
+# --------------------------------------------------------------------------- #
+# Non-2-D weight round-trips
+# --------------------------------------------------------------------------- #
+
+NON_2D_SHAPES = [
+    pytest.param((48,), id="1d-vector-A_log"),
+    pytest.param((256,), id="1d-vector-q_norm"),
+    pytest.param((640, 1, 4), id="3d-conv1d-kernel"),
+    pytest.param((8, 16, 128), id="3d-fused-bank"),
+]
+
+
+@pytest.mark.parametrize("shape", NON_2D_SHAPES)
+@pytest.mark.parametrize("method", [QuantMethod.RTN, QuantMethod.HQQ, QuantMethod.TERNARY])
+def test_dequantize_restores_non_2d_shapes(shape, method):
+    """``quantize`` flattens with ``view(-1, shape[-1])``; ``dequantize`` must agree.
+
+    Reading the dims as ``(shape[0], shape[1])`` matches only for 2-D weights. A
+    1-D vector comes back transposed and a 3-D kernel gets the wrong row width,
+    so tensors such as ``linear_attn.A_log`` and ``conv1d.weight`` are written to
+    a package that cannot decode them.
+    """
+    torch.manual_seed(0)
+    weight = torch.randn(*shape, dtype=torch.float16)
+
+    ternary = method is QuantMethod.TERNARY
+    config = QuantConfig(
+        method=method,
+        bits=2 if ternary else 4,
+        group_size=128,
+        symmetric=False,
+        device="cpu",
+    )
+    quantizer = get_quantizer(config)
+    restored = quantizer.dequantize(quantizer.quantize(weight.float()))
+
+    # Shape is the sharp assertion: a wrong row/column split either raises or
+    # returns a transposed tensor. The error bound only guards against the
+    # reconstruction being unrelated to the input.
+    assert tuple(restored.shape) == shape
+    scale = weight.float().abs().max().item()
+    tolerance = 1.0 if ternary else 0.25
+    assert (restored.float() - weight.float()).abs().max().item() < tolerance * scale
+
+
+@pytest.mark.parametrize(
+    "shape,expected",
+    [
+        ((48,), (1, 48)),
+        ((5120, 17408), (5120, 17408)),
+        ((10240, 1, 4), (10240, 4)),
+    ],
+)
+def test_matrix_dims_matches_the_quantize_flatten(shape, expected):
+    """One definition of the flatten, shared by the planner and every backend.
+
+    The calibrated backends (GPTQ/AWQ/AutoRound) cannot be exercised without a
+    Hessian, so their dequantize path is pinned here at the helper instead.
+    """
+    from pockettitan.package.format import matrix_dims as planner_dims
+    from pockettitan.quantizers.base import matrix_dims
+
+    assert matrix_dims(tuple(shape)) == expected
+    assert planner_dims(list(shape)) == expected
+    assert torch.empty(*shape).view(-1, shape[-1]).shape == torch.Size(expected)
+
+
+@pytest.mark.parametrize("method", [QuantMethod.RTN, QuantMethod.HQQ])
+@pytest.mark.parametrize("bits", [3, 4])
+def test_narrow_band_group_away_from_zero_keeps_resolution(method, bits):
+    """A group that does not straddle zero must still use the whole code range.
+
+    The affine zero-point is stored as fp16 and only used as ``(q - z) * s``, so
+    it may legitimately fall outside ``[0, max_int]``. Clamping it there forces
+    the representable interval to start at 0 and spends every code on the empty
+    gap. Observed on ``linear_attn.norm.weight``: 128 values in [0.13, 0.16]
+    were all written as code 7 and decoded to one constant, destroying the
+    layer's per-channel gain.
+    """
+    torch.manual_seed(0)
+    weight = torch.empty(1, 128).uniform_(0.130, 0.155)
+
+    config = QuantConfig(
+        method=method, bits=bits, group_size=128, symmetric=False, device="cpu"
+    )
+    quantizer = get_quantizer(config)
+    restored = quantizer.dequantize(quantizer.quantize(weight)).float()
+
+    band = (weight.max() - weight.min()).item()
+    assert torch.unique(restored).numel() > 1, "collapsed to a constant"
+    assert restored.std().item() > 0.25 * weight.std().item()
+    assert (restored - weight).abs().max().item() < band / ((1 << bits) - 1)

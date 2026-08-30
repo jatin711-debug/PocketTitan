@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from pockettitan.config import CalibrationRequiredError, QuantConfig
-from pockettitan.quantizers.base import BaseQuantizer, QuantizerCapabilities, QuantizedResult
+from pockettitan.quantizers.base import BaseQuantizer, QuantizedResult, QuantizerCapabilities, matrix_dims
 from pockettitan.quantizers.rtn import RTNQuantizer
 
 
@@ -152,7 +152,7 @@ class GPTQQuantizer(BaseQuantizer):
     def dequantize(self, quantized: QuantizedResult) -> torch.Tensor:
         bits = quantized.quant_config.bits
         orig_shape = quantized.original_shape
-        out_features, in_features = orig_shape[0], orig_shape[1]
+        out_features, in_features = matrix_dims(orig_shape)
         group_size = (
             quantized.quant_config.group_size
             if quantized.quant_config.group_size > 0

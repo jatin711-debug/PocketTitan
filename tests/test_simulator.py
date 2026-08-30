@@ -6,10 +6,6 @@ from pockettitan.sim import (
     HardwareProfile,
     HardwareSimulator,
     LRUCache,
-    OracleCache,
-    OSPageCache,
-    SLRUCache,
-    TinyLFUCache,
     generate_synthetic_trace,
     run_capacity_sweep,
     run_simulation,
@@ -47,8 +43,6 @@ def test_oracle_bounds_all_online_policies():
 def test_infinite_capacity_lru_hit_rate():
     """Invariant: LRU(inf) hit rate == 1 - (unique_accesses / total_accesses)."""
     trace = generate_synthetic_trace(num_tokens=100, num_layers=4, top_k=4, distribution=DistributionType.ZIPF, alpha=0.9, seed=99)
-    summary = summarize_trace(trace, num_layers=4, num_experts=512)
-    
     unique_pairs = len({(ev.layer_idx, ev.expert_idx) for ev in trace})
     expected_hits = len(trace) - unique_pairs
     expected_hit_rate = expected_hits / len(trace)

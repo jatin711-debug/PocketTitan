@@ -1,7 +1,6 @@
 """PocketTitan VRAM Benchmark & Throughput Profiler."""
 
 import time
-from typing import List, Tuple
 import torch
 from rich.console import Console
 from rich.table import Table

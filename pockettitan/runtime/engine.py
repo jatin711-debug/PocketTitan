@@ -1,10 +1,9 @@
 """Out-of-core inference engine coordinating VRAM dense core, NVMe PLE, and RAM SLRU experts (Phase R6)."""
 
-import json
 import mmap
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, Union
 import torch
 
 from pockettitan.package.format import PackageManifest

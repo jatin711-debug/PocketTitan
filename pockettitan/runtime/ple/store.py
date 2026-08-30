@@ -1,14 +1,15 @@
 """Out-of-core PLE row store reader with page-packed indexing and row cache (R5)."""
 
-import math
 import mmap
 import os
 from collections import OrderedDict
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Optional, Sequence, Union
 import torch
 
-from pockettitan.package.format import PleIndex, PleRowLayout
+from pockettitan.config import QuantMethod
+from pockettitan.package.decode import decode_record
+from pockettitan.package.format import PleIndex
 from pockettitan.runtime.ple.hash import PleHasher
 
 
@@ -20,10 +21,12 @@ class PleRowStore:
         table_path: Union[str, Path],
         index: PleIndex,
         cache_capacity_rows: int = 65536,  # ~5.3 MB RAM cache
+        quant_method: QuantMethod = QuantMethod.RTN,
     ):
         self.table_path = Path(table_path)
         self.index = index
         self.row_layout = index.row
+        self.quant_method = quant_method
         self.hasher = PleHasher(index)
         
         self.cache_capacity = cache_capacity_rows
@@ -70,31 +73,19 @@ class PleRowStore:
         return self._mmap[byte_offset : byte_offset + payload_len]
 
     def decode_row(self, row_bytes: bytes) -> torch.Tensor:
-        """Decode quantized row bytes into an FP16 vector."""
-        width = self.row_layout.row_width
-        bits = self.row_layout.bits
-        
-        if bits >= 16:
-            return torch.frombuffer(row_bytes, dtype=torch.float16).clone()
-            
-        # For Q4 scalar PLE row: [80 bytes packed weights | 2 bytes FP16 scale]
-        group_size = self.row_layout.group_size
-        packed_len = width // 2  # 4-bit = 2 weights per byte
-        
-        packed_data = torch.frombuffer(bytearray(row_bytes[:packed_len]), dtype=torch.uint8)
-        scale_data = torch.frombuffer(bytearray(row_bytes[packed_len : packed_len + 2]), dtype=torch.float16)
-        scale = scale_data[0].float()
-        
-        # Unpack 4-bit nibbles
-        low = (packed_data & 0x0F).float() - 8.0
-        high = ((packed_data >> 4) & 0x0F).float() - 8.0
-        
-        unpacked = torch.empty(width, dtype=torch.float32)
-        unpacked[0::2] = low
-        unpacked[1::2] = high
-        
-        dequantized = unpacked * scale
-        return dequantized.to(torch.float16)
+        """Decode one packed row into an FP16 vector.
+
+        Geometry comes from the index and the reconstruction runs through
+        :func:`decode_record`, so this cannot drift from what the writer emitted.
+        """
+        return decode_record(
+            row_bytes,
+            shape=(self.row_layout.row_width,),
+            bits=self.row_layout.bits,
+            group_size=self.row_layout.group_size,
+            symmetric=self.row_layout.symmetric,
+            method=self.quant_method,
+        )
 
     def fetch_row(self, logical_row_id: int) -> torch.Tensor:
         """Fetch and dequantize a row with LRU caching."""
