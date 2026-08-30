@@ -267,19 +267,22 @@ Build the evaluator before the traces exist, using synthetic traces (uniform, Zi
 
 ---
 
-### 🔀 PATCH GATE — upstream llama.cpp routing dump
+### 🔀 PATCH GATE — upstream llama.cpp routing dump ✅
+**Delivered 2026-08-30**
 
-Not a fork. A ~50-line patch appending `(token, layer, expert, weight)` to a buffer where top-k is already computed. Ship it as `patches/llama-cpp-routing-trace.patch` against a pinned upstream tag.
+Not a fork. A ~50-line patch appending `(token, layer, expert, weight, router_entropy)` to a buffer where top-k is already computed. Shipped as [`patches/llama-cpp-routing-trace.patch`](patches/llama-cpp-routing-trace.patch).
 
 ---
 
 ### R3 — Routing Profiler: real traces
-**Needs the patch · ~1–2 weeks**
+**Harness delivered 2026-08-30 · capture ready**
 
-- [ ] Apply patch; build against pinned upstream
-- [ ] Run the published `Qwen3.8-Flash-Next-IQ4_NL` GGUF (95.2 GiB, mmap — **it does not need to fit in RAM**)
-- [ ] Capture ≥50K tokens across 5 task types: chat · code · math · long-context retrieval · tool-calling
-- [ ] `traces/*.jsonl.zst` (~2 KB/token) + reproducible capture script
+- [x] Create upstream patch [`patches/llama-cpp-routing-trace.patch`](patches/llama-cpp-routing-trace.patch).
+- [x] Standard benchmark prompt suite covering all 5 task types (`pockettitan/profiler/prompts.py`).
+- [x] Compressed trace streaming reader/writer and metrics calculator (`pockettitan/profiler/trace.py`).
+- [x] CLI integration: `pockettitan profile prompts` & `pockettitan profile analyze` & `pockettitan sim --trace <file>`.
+- [ ] Apply patch to local build and capture ≥50K tokens across the 5 task types from `Qwen3.8-Flash-Next-IQ4_NL` GGUF.
+- [ ] Save compressed traces to `traces/*.jsonl.gz`.
 
 > Throughput will be poor — well under 1 tok/s thrashing a 95 GiB file through 12 GB. **That is fine.** Routing is a property of the model and the prompt, not of how fast we ran it. A weekend of slow generation answers a question worth a quarter of engineering time.
 
