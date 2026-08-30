@@ -30,8 +30,10 @@ from pockettitan.package import (
     align_up,
     build_expert_slices,
     build_ple_index,
+    matrix_dims,
     num_groups,
     packed_bytes,
+    resolve_group_size,
     plan_package,
     projection_signature,
     slice_expert_from_bank,
@@ -734,3 +736,54 @@ def test_render_survives_legacy_codepage(qwen_plan):
     render_plan(Console(file=stream, width=160, legacy_windows=False), qwen_plan)
     stream.flush()
     assert raw.getvalue()
+
+
+# --------------------------------------------------------------------------- #
+# Group geometry
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "in_features,requested,expected",
+    [
+        (5120, 128, 128),   # divides cleanly, untouched
+        (17408, 128, 128),
+        (160, 128, 80),     # 128 does not divide 160 -> largest divisor below it
+        (64, 128, 64),      # narrower than the group -> one group, no padding
+        (4, 128, 4),        # conv1d kernel: was padding 32x
+        (48, 128, 48),      # A_log-style vector
+        (7, 128, 7),        # prime, narrower than the group
+        (5120, -1, 5120),   # per-row scale
+    ],
+)
+def test_resolve_group_size_never_pads(in_features, requested, expected):
+    resolved = resolve_group_size(in_features, requested)
+    assert resolved == expected
+    assert in_features % resolved == 0, "a resolved group must divide the row"
+
+
+def test_no_planned_record_is_ever_padded(qwen_scan):
+    """Padding costs storage *and* accuracy, so the planner must never emit it.
+
+    The zeros added to fill a group take part in that group's min/max, so the
+    scale is stretched over a range the real weights never occupy. Rounding the
+    group size down to a divisor is strictly better on both counts.
+    """
+    plan = plan_package(qwen_scan, precision_map=PrecisionMap.pt_q4e())
+
+    checked = 0
+    for item in plan.dense:
+        if item.bits < 16:
+            _, in_features = matrix_dims(list(item.address.shape))
+            assert in_features % item.group_size == 0, item.address.name
+            checked += 1
+    if plan.manifest.expert_layout:
+        for projection in plan.manifest.expert_layout.record.projections:
+            if projection.bits < 16:
+                _, in_features = matrix_dims(projection.shape)
+                assert in_features % projection.group_size == 0, projection.name
+                checked += 1
+    if plan.ple is not None:
+        assert plan.ple.row.row_width % plan.ple.row.group_size == 0
+        checked += 1
+    assert checked > 0

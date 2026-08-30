@@ -2,23 +2,24 @@
 
 import io
 import json
-import math
-import os
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict
 
+# stdout must be re-wrapped before the heavy imports below emit anything on a
+# legacy Windows code page, so these imports are deliberately not at the top.
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
-import torch
-import torch.nn.functional as F
-from rich.console import Console
-from transformers import AutoTokenizer
+import torch  # noqa: E402
+import torch.nn.functional as F  # noqa: E402
+from rich.console import Console  # noqa: E402
+from transformers import AutoTokenizer  # noqa: E402
 
-from pockettitan.package.format import PackageManifest, Section
-from pockettitan.runtime.engine import DenseBlobReader
+from pockettitan.package.decode import decode_record  # noqa: E402
+from pockettitan.package.format import PackageManifest, Section  # noqa: E402
+from pockettitan.runtime.engine import DenseBlobReader  # noqa: E402
 
 console = Console(force_terminal=True, highlight=False)
 
@@ -62,68 +63,24 @@ class PocketTitanQwenRunner:
         )
 
     def _get_tensor(self, name: str) -> torch.Tensor:
-        """Fetch and dequantize a dense tensor."""
+        """Fetch and dequantize a dense tensor through the package's own decoder."""
         if name in self._tensor_cache:
             return self._tensor_cache[name]
 
         entry = self.reader.dense_entries.get(name)
         if entry is None:
             raise KeyError(f"Tensor {name} not found in manifest.")
-        
-        raw_bytes = self.reader.get_tensor_bytes(name)
-        
-        if entry.bits >= 16:
-            t = torch.frombuffer(bytearray(raw_bytes), dtype=torch.float16).view(*entry.shape).to(self.device)
-            self._tensor_cache[name] = t
-            return t
-        
-        spans = {s.section: s for s in entry.spans}
-        packed_span = spans.get(Section.PACKED)
-        scale_span = spans.get(Section.SCALES)
-        zero_span = spans.get(Section.ZEROS)
-        
-        scales = None
-        if scale_span:
-            s_bytes = raw_bytes[scale_span.offset : scale_span.offset + scale_span.length]
-            scales = torch.frombuffer(bytearray(s_bytes), dtype=torch.float16).to(self.device)
-            
-        zeros = None
-        if zero_span:
-            z_bytes = raw_bytes[zero_span.offset : zero_span.offset + zero_span.length]
-            zeros = torch.frombuffer(bytearray(z_bytes), dtype=torch.float16).to(self.device)
-            
-        p_bytes = raw_bytes[packed_span.offset : packed_span.offset + packed_span.length]
-        raw_tensor = torch.frombuffer(bytearray(p_bytes), dtype=torch.uint8).to(self.device)
-        
-        out_f = entry.shape[0]
-        in_f = entry.shape[1] if len(entry.shape) > 1 else 1
-        group_size = entry.group_size if entry.group_size > 0 else in_f
-        padded_in = scales.numel() * group_size // max(1, out_f) if scales is not None else in_f
-        
-        bits = int(entry.bits)
-        vals_per_byte = max(1, 8 // bits)
-        mask = (1 << bits) - 1
-        
-        if vals_per_byte == 1:
-            unpacked = (raw_tensor & mask)[:out_f * padded_in]
-        else:
-            shifts = torch.tensor([i * bits for i in range(vals_per_byte)], dtype=torch.uint8, device=self.device)
-            unpacked = ((raw_tensor.unsqueeze(-1) >> shifts) & mask).view(-1)[:out_f * padded_in]
-            
-        num_groups = padded_in // group_size
-        q_grouped = unpacked.view(out_f, num_groups, group_size).to(torch.float32)
-        s_g = scales.view(out_f, num_groups, 1).to(torch.float32) if scales is not None else 1.0
-        
-        if zeros is not None:
-            z_g = zeros.view(out_f, num_groups, 1).to(torch.float32)
-            deq = (q_grouped - z_g) * s_g
-        else:
-            max_int = (1 << bits) - 1
-            deq = (q_grouped - (max_int // 2)) * s_g
-            
-        dequantized = deq.view(out_f, padded_in)[:, :in_f].to(torch.float16)
-        self._tensor_cache[name] = dequantized
-        return dequantized
+
+        tensor = decode_record(
+            self.reader.get_tensor_bytes(name),
+            shape=entry.shape,
+            bits=entry.bits,
+            group_size=entry.group_size,
+            symmetric=entry.symmetric,
+            spans=entry.spans,
+        ).to(self.device)
+        self._tensor_cache[name] = tensor
+        return tensor
 
     def _get_embedding_rows(self, token_ids: torch.Tensor) -> torch.Tensor:
         """Fetch exact embedding vectors for active token IDs."""
@@ -249,11 +206,11 @@ class PocketTitanQwenRunner:
         for _ in range(max_new_tokens):
             hidden_states = self._get_embedding_rows(tokens)
             
-            for l in [0, 1, self.num_layers - 2, self.num_layers - 1]:
-                normed = self.rms_norm(hidden_states, f"model.language_model.layers.{l}.input_layernorm.weight")
-                gate_w = self._get_tensor(f"model.language_model.layers.{l}.mlp.gate_proj.weight")
-                up_w = self._get_tensor(f"model.language_model.layers.{l}.mlp.up_proj.weight")
-                down_w = self._get_tensor(f"model.language_model.layers.{l}.mlp.down_proj.weight")
+            for layer in [0, 1, self.num_layers - 2, self.num_layers - 1]:
+                normed = self.rms_norm(hidden_states, f"model.language_model.layers.{layer}.input_layernorm.weight")
+                gate_w = self._get_tensor(f"model.language_model.layers.{layer}.mlp.gate_proj.weight")
+                up_w = self._get_tensor(f"model.language_model.layers.{layer}.mlp.up_proj.weight")
+                down_w = self._get_tensor(f"model.language_model.layers.{layer}.mlp.down_proj.weight")
                 
                 mlp_out = F.silu(F.linear(normed, gate_w)) * F.linear(normed, up_w)
                 hidden_states = hidden_states + F.linear(mlp_out, down_w)

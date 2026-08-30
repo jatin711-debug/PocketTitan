@@ -28,6 +28,8 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
+from pockettitan.quantizers.base import matrix_dims as _quantizer_matrix_dims
+
 PACKAGE_VERSION = "1.1"
 PAGE_BYTES = 4096
 
@@ -151,12 +153,37 @@ def num_groups(num_elements: int, group_size: int) -> int:
 
 
 def matrix_dims(shape: List[int]) -> tuple:
-    """``(rows, in_features)`` as the quantizers see it: ``weight.view(-1, shape[-1])``."""
-    if not shape:
-        return 1, 1
-    if len(shape) == 1:
-        return 1, shape[0]
-    return math.prod(shape[:-1]), shape[-1]
+    """``(rows, in_features)`` as the quantizers see it: ``weight.view(-1, shape[-1])``.
+
+    Delegates so the planner and the quantizers can never drift apart.
+    """
+    return _quantizer_matrix_dims(tuple(shape))
+
+
+def resolve_group_size(in_features: int, group_size: int) -> int:
+    """The group size actually used for ``in_features``, never one that pads.
+
+    A group size that does not divide ``in_features`` pads the row up to a
+    multiple before packing, which costs storage *and* accuracy: the padding
+    zeros join the group and widen its min/max, so the scale is stretched to
+    cover a range the real weights never occupy. ``conv1d.weight`` is the
+    pathological case — 4 input features under ``group_size=128`` pad to 128,
+    inflating 3.9 MB of fp16 weights into 33.4 MB of 3-bit codes whose scales
+    were set by 124 zeros per group.
+
+    Rounding down to the largest divisor is always at least as good: it never
+    pads, never grows the record, and gives finer-grained scales.
+    """
+    if in_features <= 0:
+        return in_features
+    if group_size <= 0 or group_size >= in_features:
+        return in_features
+    if in_features % group_size == 0:
+        return group_size
+    for candidate in range(group_size, 0, -1):
+        if in_features % candidate == 0:
+            return candidate
+    return in_features
 
 
 def section_spans(
@@ -179,7 +206,7 @@ def section_spans(
     if bits >= 16:
         return [SectionSpan(section=Section.PACKED, offset=0, length=rows * in_features * 2)]
 
-    effective_group = group_size if group_size > 0 else in_features
+    effective_group = resolve_group_size(in_features, group_size)
     groups_per_row = int(math.ceil(in_features / effective_group))
     padded_in = groups_per_row * effective_group
     groups = rows * groups_per_row
@@ -285,8 +312,8 @@ class ExpertRecordLayout(BaseModel):
         for spec in projections:
             shape = list(spec["shape"])
             bits = float(spec["bits"])
-            group_size = int(spec["group_size"])
             symmetric = bool(spec.get("symmetric", False))
+            group_size = resolve_group_size(matrix_dims(shape)[1], int(spec["group_size"]))
             codec_id = str(spec.get("codec_id", "pt.scalar.rtn.v1"))
             spans = section_spans(shape, bits, group_size, symmetric, scale_bytes, zero_bytes)
             offset = sum(sp.length for sp in spans)
@@ -411,7 +438,7 @@ class PleRowLayout(BaseModel):
         codec_id: str = "pt.ple.rtn.v1",
     ) -> "PleRowLayout":
         # A group must never span rows: each row has to decode independently.
-        group_size = min(group_size, row_width) if group_size > 0 else row_width
+        group_size = resolve_group_size(row_width, group_size)
         payload = sum(
             span.length
             for span in section_spans(

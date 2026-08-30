@@ -377,8 +377,8 @@ def test_peak_vram_includes_dense_and_ple(dummy_ple_model, tmp_path, monkeypatch
         payload, _ = dense_encoder(item, tensor)
         return payload, 11.0
 
-    def ple_with_peak(item, spans):
-        payload, _ = ple_encoder(item, spans)
+    def ple_with_peak(item, spans, chunk_cb=None):
+        payload, _ = ple_encoder(item, spans, chunk_cb=chunk_cb)
         return payload, 33.0
 
     monkeypatch.setattr(writer, "_encode_dense", dense_with_peak)
@@ -395,8 +395,8 @@ def test_peak_vram_includes_experts(dummy_moe_model, tmp_path, monkeypatch):
         payload, _ = dense_encoder(item, tensor)
         return payload, 11.0
 
-    def expert_with_peak(item):
-        payload, _ = expert_encoder(item)
+    def expert_with_peak(item, chunk_cb=None):
+        payload, _ = expert_encoder(item, chunk_cb=chunk_cb)
         return payload, 22.0
 
     monkeypatch.setattr(writer, "_encode_dense", dense_with_peak)
