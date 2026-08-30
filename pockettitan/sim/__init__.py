@@ -9,6 +9,12 @@ from pockettitan.sim.cache import (
     TinyLFUCache,
 )
 from pockettitan.sim.hardware import HardwareProfile, HardwareSimulator, LatencyBreakdown
+from pockettitan.sim.oracle_gate import (
+    GateDecision,
+    GateReport,
+    evaluate_oracle_gate,
+    format_gate_report_markdown,
+)
 from pockettitan.sim.report import (
     PolicyMetric,
     SimulationReport,

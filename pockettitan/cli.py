@@ -1004,6 +1004,79 @@ def sim(
             console.print(f"\n[dim]Simulation report written to {output}[/dim]")
 
 
+@app.command()
+def gate(
+    trace_file: Optional[Path] = typer.Option(None, "--trace", "-t", help="Path to real routing trace file (.jsonl / .jsonl.gz)"),
+    tokens: int = typer.Option(500, "--tokens", "-n", help="Synthetic tokens if no trace file provided"),
+    alpha: float = typer.Option(1.0, "--alpha", "-a", help="Zipf distribution skew alpha"),
+    slots: int = typer.Option(2880, "--slots", "-s", help="Target RAM cache budget in expert slots (default 2880 = 7.0 GB RAM)"),
+    bits: float = typer.Option(4.0, "--bits", "-b", help="Bits per weight (4.0 or 2.0)"),
+    ssd_bw: float = typer.Option(3.5, "--ssd-bw", help="SSD bandwidth in GB/s"),
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Write formal gate report markdown to file"),
+):
+    """R4: The Oracle Decision Gate — evaluate feasibility threshold (50% Oracle hit rate @ 2,880 slots)."""
+    from pockettitan.sim import (
+        DistributionType,
+        HardwareProfile,
+        evaluate_oracle_gate,
+        format_gate_report_markdown,
+        generate_synthetic_trace,
+    )
+    from pockettitan.profiler.trace import TraceReader
+
+    hw = HardwareProfile(ssd_bandwidth_gbps=ssd_bw)
+
+    if trace_file is not None:
+        if not trace_file.exists():
+            console.print(f"[bold red]Trace file not found:[/bold red] {trace_file}")
+            raise typer.Exit(code=1)
+        console.print(f"[bold green]Running R4 Oracle Gate on Real Trace:[/bold green] [cyan]{trace_file}[/cyan]")
+        events = TraceReader(trace_file).read_all_events()
+    else:
+        console.print(
+            f"[bold green]Running R4 Oracle Gate on Synthetic Trace[/bold green] "
+            f"[dim]({tokens} tokens, alpha={alpha}, target_slots={slots}, bits={bits}b, ssd={ssd_bw} GB/s)[/dim]"
+        )
+        events = generate_synthetic_trace(
+            num_tokens=tokens,
+            num_layers=48,
+            num_experts=512,
+            top_k=10,
+            distribution=DistributionType.ZIPF,
+            alpha=alpha,
+        )
+
+    report = evaluate_oracle_gate(
+        events=events,
+        target_slots=slots,
+        bits_per_weight=bits,
+        hardware=hw,
+    )
+
+    # Render results table
+    table = Table(title=f"[bold green]Phase R4 — The Oracle Decision Gate[/bold green]", show_header=True)
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", style="green")
+
+    table.add_row("Target Budget Slots", f"{report.target_budget_slots:,} slots (~7.0 GB RAM)")
+    table.add_row("Oracle Hit Rate (Upper Bound)", f"[bold]{report.oracle_hit_rate_at_budget * 100:.1f}%[/bold]")
+    table.add_row("OS Page Cache Hit Rate", f"{report.os_page_cache_hit_rate * 100:.1f}%")
+    table.add_row("Winning Online Policy", f"{report.winning_online_policy} (+{report.custom_policy_advantage * 100:.1f}%)")
+    table.add_row("Expert Gini Skew", f"{report.gini_coefficient:.4f}")
+    
+    decision_style = "bold green" if report.decision.value != "KILL_CUSTOM_CACHE" else "bold red"
+    table.add_row("Gate Decision", f"[{decision_style}]{report.decision.value}[/{decision_style}]")
+
+    console.print(table)
+    console.print(f"\n[bold]{report.rationale}[/bold]\n")
+
+    md_report = format_gate_report_markdown(report)
+    if output is not None:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(md_report, encoding="utf-8")
+        console.print(f"[dim]Formal gate report written to {output}[/dim]")
+
+
 profile_app = typer.Typer(
     help="R3: MoE Routing Profiler — generate prompt suites and analyze routing traces."
 )
