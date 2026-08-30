@@ -8,7 +8,7 @@ import pytest
 from pockettitan.audit import PrecisionMap, scan_checkpoint
 from pockettitan.config import MemoryBudgetConfig, QuantMethod
 from pockettitan.package import PackageWriter, PtitanValidator, WriteError, plan_package
-from pockettitan.package.integrity import crc32c_hex
+from pockettitan.package.integrity import _CRC32C_TABLE, crc32c, crc32c_hex
 from pockettitan.streaming.reader import LocalTensorReader
 
 
@@ -41,8 +41,33 @@ def flip_byte(path, offset):
         stream.write(bytes([value[0] ^ 0x40]))
 
 
+def _reference_crc32c(data: bytes, crc: int = 0) -> int:
+    """Textbook Castagnoli CRC-32C, independent of whichever backend is installed."""
+    value = crc ^ 0xFFFFFFFF
+    for byte in data:
+        value = _CRC32C_TABLE[(value ^ byte) & 0xFF] ^ (value >> 8)
+    return value ^ 0xFFFFFFFF
+
+
 def test_crc32c_matches_castagnoli_golden_vector():
     assert crc32c_hex(b"123456789") == "e3069283"
+
+
+def test_seeded_crc32c_continues_a_running_checksum():
+    """PLE shard checksums accumulate row by row, so the seeded call must chain.
+
+    The accelerated backend is optional, so a package written on a machine that
+    has it must validate on a machine that does not. Chaining and one-shot must
+    therefore agree, and both must match the reference implementation.
+    """
+    head = b"first PLE row payload"
+    tail = b"second PLE row payload"
+
+    chained = crc32c(tail, crc32c(head))
+
+    assert chained == crc32c(head + tail)
+    assert chained == _reference_crc32c(head + tail)
+    assert chained == _reference_crc32c(tail, _reference_crc32c(head))
 
 
 def test_fast_and_full_validation_pass(dummy_ple_model, tmp_path):
