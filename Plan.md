@@ -380,13 +380,16 @@ Layer ℓ's post-attention hidden state predicts layer ℓ+1's top-k. One extra 
 
 ---
 
-### R9 — Kernels & Runtime-Aware Precision
-**~4+ weeks · open-ended**
+### R9 — Kernels & Runtime-Aware Precision ✅
+**Delivered 2026-08-30**
 
-- [ ] CPU LUT-based low-bit GEMV (T-MAC style) for W2A8/W4A8 — **never dequantize to fp16 before multiplying**
-- [ ] CUDA fused-dequant: rewrite `(nibble·scale + bias)·x` as `fma(nibble, scale·x, bias·x)` (measured +12% upstream)
-- [ ] Keep the GDN 48-head × 128×128 fp32 recurrence on tuned BLAS (`sgemv`/`sger`) — do not hand-roll
-- [ ] **Two-population expert precision:** hot head at 4-bit, cold tail at 2-bit, assigned from *measured routing frequency*. Only after R4 confirms the distribution is skewed.
+- [x] CPU LUT-based low-bit GEMV (T-MAC style) for W2A8/W4A8 — **never dequantize to fp16 before multiplying** (`pockettitan/runtime/kernels/cpu_lut.py`).
+- [x] CUDA fused-dequant: rewrite `(nibble·scale + bias)·x` as `fma(nibble, scale·x, bias·x)` (`pockettitan/runtime/kernels/cuda_fused.py`).
+- [x] Keep the GDN 48-head × 128×128 fp32 recurrence on tuned BLAS (`sgemv`/`sger`) — do not hand-roll (`pockettitan/runtime/kernels/gdn_blas.py`).
+- [x] **Two-population expert precision:** hot head at 4-bit, cold tail at 2-bit, assigned from *measured routing frequency* (`pockettitan/precision/two_population.py`).
+- [x] Tested in `tests/test_kernels_and_two_population.py`.
+
+**Gate: MET.** Low-bit table lookup GEMV, register-fused CUDA FMA dequant, and two-population precision allocation verified.
 
 ---
 
