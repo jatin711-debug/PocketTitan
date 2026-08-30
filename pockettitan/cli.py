@@ -926,5 +926,74 @@ def audit(
         raise typer.Exit(code=2)
 
 
+@app.command()
+def sim(
+    tokens: int = typer.Option(500, "--tokens", "-n", help="Number of decoding steps to simulate"),
+    distribution: str = typer.Option("zipf", "--distribution", "-d", help="Synthetic trace distribution: zipf, uniform, sticky"),
+    alpha: float = typer.Option(1.0, "--alpha", "-a", help="Zipf distribution skew parameter alpha"),
+    bits: float = typer.Option(4.0, "--bits", "-b", help="Nominal bits per weight (4.0 or 2.0)"),
+    ssd_bw: float = typer.Option(3.5, "--ssd-bw", help="SSD bandwidth in GB/s"),
+    capacities: str = typer.Option("512,1024,2048,2880,4096,5437", "--capacities", help="Comma-separated cache capacities in expert slots"),
+    json_output: bool = typer.Option(False, "--json", help="Output raw JSON instead of formatted tables"),
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Write report JSON to file"),
+):
+    """R2: Trace Simulator — replay expert routing through cache policies and model roofline throughput."""
+    from pockettitan.sim import (
+        DistributionType,
+        HardwareProfile,
+        generate_synthetic_trace,
+        render_simulation_report,
+        run_capacity_sweep,
+    )
+
+    try:
+        dist_enum = DistributionType(distribution.lower())
+    except ValueError:
+        console.print(f"[bold red]Invalid distribution '{distribution}'.[/bold red] Choose from: zipf, uniform, sticky")
+        raise typer.Exit(code=1)
+
+    try:
+        cap_list = [int(c.strip()) for c in capacities.split(",") if c.strip()]
+    except ValueError:
+        console.print(f"[bold red]Invalid --capacities list '{capacities}'. Must be integers.[/bold red]")
+        raise typer.Exit(code=1)
+
+    hw = HardwareProfile(ssd_bandwidth_gbps=ssd_bw)
+    
+    if not json_output:
+        console.print(
+            f"[bold green]Simulating MoE Expert Paging[/bold green] "
+            f"[dim]({tokens} tokens, dist={dist_enum.value}, alpha={alpha}, bits={bits}b, ssd={ssd_bw} GB/s)[/dim]"
+        )
+
+    trace = generate_synthetic_trace(
+        num_tokens=tokens,
+        num_layers=48,
+        num_experts=512,
+        top_k=10,
+        distribution=dist_enum,
+        alpha=alpha,
+    )
+
+    report = run_capacity_sweep(
+        events=trace,
+        capacities=cap_list,
+        bits_per_weight=bits,
+        hardware=hw,
+    )
+
+    if output is not None:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(report.model_dump_json(indent=2), encoding="utf-8")
+
+    if json_output:
+        console.print_json(report.model_dump_json())
+    else:
+        render_simulation_report(console, report)
+        if output is not None:
+            console.print(f"\n[dim]Simulation report written to {output}[/dim]")
+
+
 if __name__ == "__main__":
     app()
+
