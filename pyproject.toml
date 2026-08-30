@@ -40,3 +40,11 @@ pockettitan = "pockettitan.cli:app"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["pockettitan*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "network: hits the Hugging Face CDN; deselected by default, run with `-m network`",
+    "gpu: requires a CUDA device; deselected by default, run with `-m gpu`",
+]
+addopts = "-m 'not network and not gpu'"

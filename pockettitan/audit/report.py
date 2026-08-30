@@ -2,18 +2,39 @@
 
 Kept separate from the CLI so the analysis can be rendered from notebooks and
 tests without importing Typer.
+
+Glyphs are resolved against the destination stream's encoding. Windows consoles
+still default to cp1252, and a report that raises ``UnicodeEncodeError`` halfway
+through rendering is worse than one that prints ``OK`` instead of a check mark.
 """
 
-from typing import List, Sequence
+from typing import Dict, List, Optional, Sequence
 
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from pockettitan.audit.budget import GIB, MIB, AuditReport
-from pockettitan.audit.classify import Capability, Tier
+from pockettitan.audit.budget import AuditReport
+from pockettitan.audit.classify import Tier
 
 DEFAULT_CONTEXTS: Sequence[int] = (2048, 4096, 8192, 32768, 131072)
+
+UNICODE_GLYPHS: Dict[str, str] = {
+    "ok": "✓",       # ✓
+    "warn": "⚠",     # ⚠
+    "bullet": "·",   # ·
+    "arrow": "→",    # →
+    "inf": "∞",      # ∞
+    "times": "×",    # ×
+}
+ASCII_GLYPHS: Dict[str, str] = {
+    "ok": "OK",
+    "warn": "!",
+    "bullet": "-",
+    "arrow": "->",
+    "inf": "inf",
+    "times": "x",
+}
 
 _TIER_STYLE = {
     Tier.VRAM_HOT: "bold red",
@@ -25,6 +46,20 @@ _TIER_LABEL = {
     Tier.RAM_WARM: "RAM",
     Tier.NVME_COLD: "NVMe",
 }
+
+
+def glyphs_for(console: Console) -> Dict[str, str]:
+    """Pick the richest glyph set the console's encoding can actually emit."""
+    encoding = getattr(getattr(console, "file", None), "encoding", None) or "utf-8"
+    try:
+        "".join(UNICODE_GLYPHS.values()).encode(encoding)
+    except (UnicodeEncodeError, LookupError):
+        return ASCII_GLYPHS
+    return UNICODE_GLYPHS
+
+
+def _g(glyphs: Optional[Dict[str, str]]) -> Dict[str, str]:
+    return glyphs if glyphs is not None else UNICODE_GLYPHS
 
 
 def fmt_bytes(num_bytes: float) -> str:
@@ -45,43 +80,50 @@ def fmt_params(count: int) -> str:
     return str(count)
 
 
-def render_summary(report: AuditReport) -> Panel:
+def _tier_cell(tier: Tier) -> str:
+    style = _TIER_STYLE[tier]
+    return f"[{style}]{_TIER_LABEL[tier]}[/{style}]"
+
+
+def render_summary(report: AuditReport, glyphs: Optional[Dict[str, str]] = None) -> Panel:
+    g = _g(glyphs)
+    dtypes = ", ".join(f"{k}{g['times']}{v}" for k, v in report.dtype_histogram.items())
+
     lines: List[str] = [
         f"[bold]Model[/bold]            {report.model_id}",
         f"[bold]Tensors[/bold]          {report.num_tensors:,} across {report.num_shards} shards",
         f"[bold]Total params[/bold]     [bold cyan]{report.total_params:,}[/bold cyan]  ({fmt_params(report.total_params)})",
         f"[bold]Source bytes[/bold]     {fmt_bytes(report.total_source_bytes)}",
-        f"[bold]Dtypes[/bold]           " + ", ".join(f"{k}×{v}" for k, v in report.dtype_histogram.items()),
+        f"[bold]Dtypes[/bold]           {dtypes}",
+        f"[bold]Features[/bold]         {', '.join(c.value for c in report.activation.features)}",
+        f"[bold]Enabled params[/bold]   [bold green]{report.enabled_params:,}[/bold green]  ({fmt_params(report.enabled_params)})",
+        f"[bold]LM core[/bold]          {report.lm_core_params:,}  ({fmt_params(report.lm_core_params)}) [dim]excl. cold lookup tables[/dim]",
+        (
+            f"[bold]Activated/token[/bold]  [bold magenta]{report.activation.total:,}[/bold magenta]  "
+            f"({fmt_params(report.activation.total)}, "
+            f"{100.0 * report.activation.total / max(1, report.total_params):.2f}% of model)"
+        ),
+        f"[bold]Scan time[/bold]        {report.elapsed_s:.2f} s",
+        "",
     ]
 
-    enabled = ", ".join(c.value for c in report.activation.features)
-    lines.append(f"[bold]Features[/bold]         {enabled}")
-    lines.append(
-        f"[bold]Enabled params[/bold]   [bold green]{report.enabled_params:,}[/bold green]  ({fmt_params(report.enabled_params)})"
-    )
-    lines.append(
-        f"[bold]Activated/token[/bold]  [bold magenta]{report.activation.total:,}[/bold magenta]  "
-        f"({fmt_params(report.activation.total)}, {100.0 * report.activation.total / max(1, report.total_params):.2f}% of model)"
-    )
-    lines.append(f"[bold]Scan time[/bold]        {report.elapsed_s:.2f} s")
-
     if report.discrepancies:
-        lines.append("")
-        lines.append(f"[bold yellow]⚠ {len(report.discrepancies)} discrepancies[/bold yellow]")
+        lines.append(f"[bold yellow]{g['warn']} {len(report.discrepancies)} discrepancies[/bold yellow]")
         for item in report.discrepancies[:5]:
-            lines.append(f"  [yellow]· {item}[/yellow]")
+            lines.append(f"  [yellow]{g['bullet']} {item}[/yellow]")
     else:
-        lines.append("")
-        lines.append("[bold green]✓ Verified against published index (tensor set + total_size)[/bold green]")
+        lines.append(
+            f"[bold green]{g['ok']} Verified against published index (tensor set + total_size)[/bold green]"
+        )
 
     return Panel(
         "\n".join(lines),
-        title="[bold green]PocketTitan Audit — R0[/bold green]",
+        title="[bold green]PocketTitan Audit - R0[/bold green]",
         border_style="green",
     )
 
 
-def render_components(report: AuditReport) -> Table:
+def render_components(report: AuditReport, glyphs: Optional[Dict[str, str]] = None) -> Table:
     table = Table(title="[bold]Component Decomposition[/bold]", show_header=True, header_style="bold")
     table.add_column("Component", style="cyan", no_wrap=True)
     table.add_column("Cap", style="dim")
@@ -98,7 +140,7 @@ def render_components(report: AuditReport) -> Table:
         table.add_row(
             stat.component.value,
             stat.capability.value,
-            f"[{_TIER_STYLE[stat.tier]}]{_TIER_LABEL[stat.tier]}[/{_TIER_STYLE[stat.tier]}]",
+            _tier_cell(stat.tier),
             f"{stat.num_tensors:,}",
             f"{stat.params:,}",
             f"{100.0 * stat.share_of(total):.2f}%",
@@ -116,7 +158,7 @@ def render_components(report: AuditReport) -> Table:
     return table
 
 
-def render_capability(report: AuditReport) -> Table:
+def render_capability(report: AuditReport, glyphs: Optional[Dict[str, str]] = None) -> Table:
     table = Table(title="[bold]Capability Stripping[/bold]", show_header=True, header_style="bold")
     table.add_column("Dropped component", style="cyan")
     table.add_column("Parameters", justify="right")
@@ -129,9 +171,7 @@ def render_capability(report: AuditReport) -> Table:
         table.add_row("[dim]nothing dropped[/dim]", "-", "-", "-", "-")
         return table
 
-    total_params = 0
-    total_source = 0
-    total_packed = 0
+    total_params = total_source = total_packed = 0
     for component, params in sorted(dropped.items(), key=lambda kv: -kv[1]):
         stat = report.breakdown.stats[component]
         packed = int(params * report.precision_map.bits_for(component) / 8)
@@ -157,10 +197,11 @@ def render_capability(report: AuditReport) -> Table:
     return table
 
 
-def render_storage(report: AuditReport) -> Table:
+def render_storage(report: AuditReport, glyphs: Optional[Dict[str, str]] = None) -> Table:
+    g = _g(glyphs)
     storage = report.storage
     table = Table(
-        title=f"[bold]Storage Budget — precision map '{storage.precision_map_name}'[/bold]",
+        title=f"[bold]Storage Budget - precision map '{storage.precision_map_name}'[/bold]",
         show_header=True,
         header_style="bold",
     )
@@ -173,7 +214,7 @@ def render_storage(report: AuditReport) -> Table:
     for entry in storage.entries:
         table.add_row(
             entry.component.value,
-            f"[{_TIER_STYLE[entry.tier]}]{_TIER_LABEL[entry.tier]}[/{_TIER_STYLE[entry.tier]}]",
+            _tier_cell(entry.tier),
             f"{entry.params:,}",
             f"{entry.effective_bits:.2f}",
             fmt_bytes(entry.packed_bytes),
@@ -189,14 +230,20 @@ def render_storage(report: AuditReport) -> Table:
     for tier in (Tier.VRAM_HOT, Tier.RAM_WARM, Tier.NVME_COLD):
         resident = storage.bytes_in_tier(tier)
         if resident:
+            style = _TIER_STYLE[tier]
             table.add_row(
-                f"[dim]  → resident in {_TIER_LABEL[tier]}[/dim]", "", "", "",
-                f"[{_TIER_STYLE[tier]}]{fmt_bytes(resident)}[/{_TIER_STYLE[tier]}]",
+                f"[dim]  {g['arrow']} resident in {_TIER_LABEL[tier]}[/dim]", "", "", "",
+                f"[{style}]{fmt_bytes(resident)}[/{style}]",
             )
     return table
 
 
-def render_state(report: AuditReport, contexts: Sequence[int] = DEFAULT_CONTEXTS) -> Table:
+def render_state(
+    report: AuditReport,
+    contexts: Sequence[int] = DEFAULT_CONTEXTS,
+    glyphs: Optional[Dict[str, str]] = None,
+) -> Table:
+    g = _g(glyphs)
     state = report.state
     table = Table(
         title=(
@@ -212,28 +259,28 @@ def render_state(report: AuditReport, contexts: Sequence[int] = DEFAULT_CONTEXTS
     table.add_column("Total", justify="right", style="white")
 
     for ctx in contexts:
-        per_token = state.bytes_per_token * ctx
         table.add_row(
             f"{ctx:,}",
-            fmt_bytes(per_token),
+            fmt_bytes(state.bytes_per_token * ctx),
             fmt_bytes(state.recurrent_state_bytes),
             fmt_bytes(state.at_context(ctx)),
         )
 
     table.caption = (
-        f"{state.bytes_per_token / 1024.0:.1f} KiB/token · "
+        f"{state.bytes_per_token / 1024.0:.1f} KiB/token {g['bullet']} "
         f"recurrent state is constant in context length"
     )
     return table
 
 
-def render_roofline(report: AuditReport) -> Table:
+def render_roofline(report: AuditReport, glyphs: Optional[Dict[str, str]] = None) -> Table:
+    g = _g(glyphs)
     roofline = report.roofline
     if roofline is None:
-        return Table(title="[dim]No MoE routing detected — roofline not applicable[/dim]")
+        return Table(title="[dim]No MoE routing detected - roofline not applicable[/dim]")
 
     table = Table(
-        title=f"[bold]SSD Roofline — experts @ {roofline.expert_bits:.2f} bits[/bold]",
+        title=f"[bold]SSD Roofline - experts @ {roofline.expert_bits:.2f} bits[/bold]",
         show_header=True,
         header_style="bold",
     )
@@ -247,15 +294,15 @@ def render_roofline(report: AuditReport) -> Table:
         cells = [f"{row.hit_rate * 100:.0f}%", fmt_bytes(row.ssd_bytes_per_token)]
         for bw in bandwidths:
             tps = row.tokens_per_second.get(bw, 0.0)
-            cells.append("∞" if tps == float("inf") else f"{tps:.1f} tok/s")
+            cells.append(g["inf"] if tps == float("inf") else f"{tps:.1f} tok/s")
         table.add_row(*cells)
 
     table.caption = (
-        f"expert record {fmt_bytes(roofline.expert_record_bytes)} · "
-        f"{roofline.reads_per_token} reads/token · "
+        f"expert record {fmt_bytes(roofline.expert_record_bytes)} {g['bullet']} "
+        f"{roofline.reads_per_token} reads/token {g['bullet']} "
         f"cache {roofline.cache_slots:,}/{roofline.total_expert_slots:,} slots "
-        f"({roofline.cache_capacity_fraction * 100:.1f}%) · "
-        f"ceilings only — comparable systems reach ~{roofline.efficiency_factor * 100:.0f}%"
+        f"({roofline.cache_capacity_fraction * 100:.1f}%) {g['bullet']} "
+        f"ceilings only - comparable systems reach ~{roofline.efficiency_factor * 100:.0f}%"
     )
     return table
 
@@ -267,24 +314,26 @@ def render_report(
     show_roofline: bool = True,
 ) -> None:
     """Print the full audit to the console."""
-    console.print(render_summary(report))
+    g = glyphs_for(console)
+
+    console.print(render_summary(report, g))
     console.print()
-    console.print(render_components(report))
+    console.print(render_components(report, g))
     console.print()
-    console.print(render_capability(report))
+    console.print(render_capability(report, g))
     console.print()
-    console.print(render_storage(report))
+    console.print(render_storage(report, g))
     console.print()
-    console.print(render_state(report, contexts))
+    console.print(render_state(report, contexts, g))
     if show_roofline and report.roofline is not None:
         console.print()
-        console.print(render_roofline(report))
+        console.print(render_roofline(report, g))
 
     if report.breakdown.unclassified:
         console.print()
         console.print(
-            f"[yellow]⚠ {len(report.breakdown.unclassified)} unclassified tensors "
+            f"[yellow]{g['warn']} {len(report.breakdown.unclassified)} unclassified tensors "
             f"(review before trusting this architecture):[/yellow]"
         )
         for name in report.breakdown.unclassified[:10]:
-            console.print(f"  [dim]· {name}[/dim]")
+            console.print(f"  [dim]{g['bullet']} {name}[/dim]")

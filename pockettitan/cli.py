@@ -23,6 +23,8 @@ from pockettitan.exporters.vllm import VLLMExporter
 from pockettitan.metadata.repo import fetch_model_config, inspect_model_repository
 from pockettitan.metadata.tensor_index import build_tensor_address_table
 from pockettitan.models.moe import parse_moe_layer_structure
+from pockettitan.package import PackageWriter, plan_package
+from pockettitan.package.report import render_plan
 from pockettitan.pipeline.layer_pipeline import QuantizationPipeline
 from pockettitan.precision.allocator import ParetoBitAllocator
 from pockettitan.precision.distortion import evaluate_quantization_quality
@@ -60,7 +62,11 @@ def _configure_stdio_encoding() -> None:
 
 
 _configure_stdio_encoding()
-console = Console()
+
+# When output is redirected Rich falls back to 80 columns, which truncates
+# 12-digit parameter counts to "120,795,9...". An audit that silently elides
+# digits is not an audit, so widen non-interactive output.
+console = Console(width=None if sys.stdout.isatty() else 160)
 
 
 def format_size(num_bytes: float) -> str:
@@ -462,6 +468,148 @@ def inspect_layer(
     runner = PocketTitanModelRunner(checkpoint_dir)
     res = runner.inspect_layer_sample(layer)
     console.print(f"[bold green]Inspection Result:[/bold green] {res}")
+
+
+@app.command()
+def plan(
+    model: str = typer.Argument(..., help="Hugging Face repo ID (e.g. Qwen/Qwen3.8-Flash-Next) or local directory path"),
+    token: Optional[str] = typer.Option(None, "--token", "-t", help="Hugging Face API token"),
+    precision: str = typer.Option("pt-q4e", "--precision", "-p", help="Precision preset: pt-q4e, pt-q2e, bf16, int8, int4, int3, int2, ternary"),
+    features: str = typer.Option("text", "--features", help="Comma-separated capabilities to keep: text,vision,mtp"),
+    alignment: int = typer.Option(4096, "--expert-alignment", help="Expert record pitch in bytes; page alignment keeps reads page-aligned"),
+    workers: int = typer.Option(16, "--workers", help="Parallel shard header requests"),
+    json_output: bool = typer.Option(False, "--json", help="Emit the plan as JSON instead of tables"),
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Write the plan JSON to this path"),
+):
+    """R1: Plan a PocketTitan package — capability filter, expert repacking, precision, and PLE row store.
+
+    Reads only checkpoint headers. No weights are fetched, so the byte-exact
+    layout can be reviewed before a multi-hundred-gigabyte build starts.
+    """
+    try:
+        selected = [Capability(f.strip().lower()) for f in features.split(",") if f.strip()]
+    except ValueError:
+        console.print(
+            f"[bold red]Invalid --features '{features}'.[/bold red] Valid values: "
+            + ", ".join(c.value for c in Capability)
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        precision_map = get_precision_preset(precision)
+    except KeyError as e:
+        console.print(f"[bold red]{e}[/bold red]")
+        raise typer.Exit(code=1)
+
+    if not json_output:
+        console.print(
+            f"[bold green]Planning package for [cyan]{model}[/cyan][/bold green] "
+            f"[dim](precision={precision_map.name}, features={','.join(c.value for c in selected)})[/dim]"
+        )
+
+    try:
+        with console.status("[green]Reading shard headers...", spinner="dots") if not json_output else nullcontext():
+            scan = scan_checkpoint(model, token=token, max_workers=workers, strict=True)
+        build_plan = plan_package(
+            scan,
+            precision_map=precision_map,
+            features=selected,
+            expert_alignment=alignment,
+            pockettitan_version=__version__,
+        )
+    except Exception as e:
+        console.print(f"[bold red]Planning failed for {model}:[/bold red] {escape(str(e))}")
+        raise typer.Exit(code=1)
+
+    if output is not None:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(build_plan.model_dump_json(indent=2), encoding="utf-8")
+
+    if json_output:
+        console.print_json(build_plan.model_dump_json())
+    else:
+        render_plan(console, build_plan)
+        if output is not None:
+            console.print(f"\n[dim]Plan written to {output}[/dim]")
+
+
+@app.command()
+def package(
+    model: str = typer.Argument(..., help="Hugging Face repo ID or local directory path"),
+    output: Path = typer.Argument(..., help="Destination .ptitan directory"),
+    token: Optional[str] = typer.Option(None, "--token", "-t", help="Hugging Face API token"),
+    precision: str = typer.Option("pt-q4e", "--precision", "-p", help="Precision preset"),
+    features: str = typer.Option("text", "--features", help="Comma-separated capabilities to keep"),
+    method: QuantMethod = typer.Option(QuantMethod.RTN, "--method", help="Quantizer backend"),
+    max_vram: str = typer.Option("3584MB", "--max-vram", help="Hard VRAM ceiling"),
+    device: str = typer.Option("cuda", "--device", "-d", help="Execution device (cuda/cpu)"),
+    no_resume: bool = typer.Option(False, "--no-resume", help="Rebuild from scratch, ignoring the journal"),
+    workers: int = typer.Option(16, "--workers", help="Parallel shard header requests"),
+):
+    """R1: Build a PocketTitan package — capability-filtered, repacked, quantized.
+
+    Resumable: rerun the same command after an interruption and only unfinished
+    work items are redone.
+    """
+    try:
+        selected = [Capability(f.strip().lower()) for f in features.split(",") if f.strip()]
+        precision_map = get_precision_preset(precision)
+    except (ValueError, KeyError) as e:
+        console.print(f"[bold red]{escape(str(e))}[/bold red]")
+        raise typer.Exit(code=1)
+
+    budget = MemoryBudgetConfig(max_vram_mb=parse_memory_to_mb(max_vram))
+    console.print(
+        f"[bold green]Packaging [cyan]{model}[/cyan] -> [cyan]{output}[/cyan][/bold green] "
+        f"[dim](precision={precision_map.name}, method={method.value}, VRAM cap {budget.max_vram_mb:.0f} MiB)[/dim]"
+    )
+
+    try:
+        with console.status("[green]Reading shard headers...", spinner="dots"):
+            scan = scan_checkpoint(model, token=token, max_workers=workers, strict=True)
+        build_plan = plan_package(
+            scan, precision_map=precision_map, features=selected, pockettitan_version=__version__
+        )
+    except Exception as e:
+        console.print(f"[bold red]Planning failed:[/bold red] {escape(str(e))}")
+        raise typer.Exit(code=1)
+
+    render_plan(console, build_plan)
+    for warning in build_plan.warnings:
+        console.print(f"[yellow]! {escape(warning)}[/yellow]")
+
+    if scan.is_local:
+        reader = LocalTensorReader(model)
+    else:
+        reader = RemoteTensorSliceReader(model, token=token)
+
+    writer = PackageWriter(
+        build_plan, output, reader, budget=budget, method=method,
+        device=device, resume=not no_resume,
+    )
+
+    from rich.progress import BarColumn, Progress, TaskProgressColumn, TextColumn, TimeRemainingColumn
+
+    console.print()
+    try:
+        with Progress(
+            TextColumn("[cyan]{task.description}"), BarColumn(),
+            TaskProgressColumn(), TimeRemainingColumn(), console=console,
+        ) as progress:
+            task = progress.add_task("building", total=build_plan.num_work_items)
+            result = writer.build(on_item=lambda region, label: progress.update(task, advance=1))
+    except Exception as e:
+        console.print(f"[bold red]Build failed:[/bold red] {escape(str(e))}")
+        console.print("[dim]Rerun the same command to resume from the journal.[/dim]")
+        raise typer.Exit(code=1)
+
+    console.print(
+        f"\n[bold green]Package written to {output}[/bold green]\n"
+        f"  items written {result.items_written:,} · skipped {result.items_skipped:,}\n"
+        f"  bytes written {format_size(result.bytes_written)}\n"
+        f"  peak VRAM {result.peak_vram_mb:.1f} MiB / {budget.usable_vram_mb:.0f} MiB usable\n"
+        f"  elapsed {result.elapsed_s:.1f} s"
+    )
 
 
 @app.command()

@@ -7,10 +7,7 @@ or the checkpoint changed — both require updating Plan.md §2 in the same comm
 per the reporting rule in Plan.md §9.
 """
 
-import gzip
 import json
-import math
-from pathlib import Path
 
 import pytest
 
@@ -18,21 +15,15 @@ from pockettitan.audit import (
     Capability,
     Component,
     PrecisionMap,
-    ShardHeaderScan,
     ShardScanError,
     Tier,
     build_audit_report,
-    build_roofline,
     classify_all,
     classify_tensor,
     effective_bits,
     get_precision_preset,
     scan_checkpoint,
 )
-from pockettitan.config import TensorAddress
-
-FIXTURE = Path(__file__).parent / "data" / "qwen38_flash_next_headers.json.gz"
-
 # --- Ground truth: Qwen/Qwen3.8-Flash-Next @ de4b8e4d ----------------------- #
 TOTAL_PARAMS = 179_999_981_459
 TOTAL_BYTES = 359_999_963_128
@@ -54,37 +45,6 @@ COMPONENT_PARAMS = {
     Component.ROUTER: 63_037_440,
     Component.PLE_PROJ: 32_839_715,
 }
-
-
-@pytest.fixture(scope="module")
-def qwen_scan() -> ShardHeaderScan:
-    """Reconstruct a full scan from the checked-in header fixture (no network)."""
-    with gzip.open(FIXTURE, "rt", encoding="utf-8") as f:
-        payload = json.load(f)
-
-    tensors = {}
-    for name, info in payload["tensors"].items():
-        start, end = info["data_offsets"]
-        shape = info["shape"]
-        tensors[name] = TensorAddress(
-            name=name,
-            shard=info["shard"],
-            dtype=info["dtype"],
-            shape=shape,
-            byte_start=start,
-            byte_end=end,
-            num_params=math.prod(shape) if shape else 0,
-            size_bytes=end - start,
-        )
-
-    return ShardHeaderScan(
-        model_id=payload["model_id"],
-        is_local=False,
-        config=payload["config"],
-        shards=sorted({t.shard for t in tensors.values()}),
-        tensors=tensors,
-        declared_total_bytes=payload["declared_total_bytes"],
-    )
 
 
 @pytest.fixture(scope="module")

@@ -29,7 +29,9 @@ class AWQQuantizer(BaseQuantizer):
             supports_cpu=True,
             supports_cuda=True,
             supports_remote_streaming=True,
-            workspace_multiplier=2.5,
+            # Measured peak/source on a group-aligned matrix: 14.09x.
+            # Padding overhead is modelled separately by group_padding_factor().
+            workspace_multiplier=15.0,
         )
 
     def quantize(

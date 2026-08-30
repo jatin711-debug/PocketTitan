@@ -30,7 +30,9 @@ class AutoRoundQuantizer(BaseQuantizer):
             supports_cpu=True,
             supports_cuda=True,
             supports_remote_streaming=True,
-            workspace_multiplier=3.5,
+            # Measured peak/source on a group-aligned matrix: 34.06x.
+            # Padding overhead is modelled separately by group_padding_factor().
+            workspace_multiplier=36.0,
         )
 
     def quantize(

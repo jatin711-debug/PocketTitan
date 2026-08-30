@@ -1,6 +1,7 @@
 """Hardware profiling, VRAM budget enforcement, and work unit sizing."""
 
 import ctypes
+import math
 import os
 import shutil
 from pathlib import Path
@@ -117,30 +118,64 @@ def apply_cuda_memory_fraction(budget: MemoryBudgetConfig, device_id: int = 0) -
         return None
 
 
+def group_padding_factor(in_features: int, group_size: int) -> float:
+    """Memory blowup from padding ``in_features`` up to a multiple of ``group_size``.
+
+    Group-wise quantizers pad the input dimension before grouping, so a 160-wide
+    row with ``group_size=128`` is materialized as 256 wide — a 1.60x expansion
+    of every fp32 intermediate. Ignoring this is what made the estimator
+    under-predict by 60% on the n-gram shards and OOM a 4 GB card.
+    """
+    if group_size <= 0 or in_features <= 0:
+        return 1.0
+    padded = int(math.ceil(in_features / group_size)) * group_size
+    return padded / in_features
+
+
+def source_dtype_bytes(source_dtype: str) -> int:
+    """Bytes per element for a checkpoint dtype string."""
+    normalized = str(source_dtype).upper().replace("TORCH.", "")
+    if normalized.startswith(("F8", "FLOAT8")) or normalized in ("I8", "U8", "INT8", "UINT8"):
+        return 1
+    if "64" in normalized:
+        return 8
+    if "32" in normalized:
+        return 4
+    return 2
+
+
 def estimate_tensor_vram_requirement(
     shape: List[int],
     source_dtype: str = "float16",
     quant_method: QuantMethod = QuantMethod.HQQ,
     bits: int = 2,
     workspace_multiplier: float = 2.5,
+    group_size: int = 0,
 ) -> float:
-    """Estimate total VRAM needed in MiB to hold source tensor + workspace intermediates."""
+    """Estimate total VRAM needed in MiB to hold source tensor + workspace intermediates.
+
+    ``workspace_multiplier`` is the measured peak-to-source ratio for a
+    *group-aligned* matrix; the padding factor is applied on top, which keeps the
+    multiplier shape-independent (verified in ``tests/test_tiler.py``).
+
+    Args:
+        group_size: Quantization group size. Pass it whenever known — omitting it
+            silently assumes no padding and can under-predict by up to 2x.
+    """
     if not shape:
         return 0.0
     num_elements = 1
     for s in shape:
         num_elements *= s
-        
-    dtype_bytes = 2
-    if "32" in source_dtype:
-        dtype_bytes = 4
-    elif "8" in source_dtype:
-        dtype_bytes = 1
-        
+
+    dtype_bytes = source_dtype_bytes(source_dtype)
+    in_features = shape[-1] if len(shape) > 1 else 1
+    pad_factor = group_padding_factor(in_features, group_size)
+
     source_bytes = num_elements * dtype_bytes
-    working_bytes = source_bytes * workspace_multiplier
+    working_bytes = source_bytes * pad_factor * workspace_multiplier
     packed_bytes = (num_elements * bits) / 8 + (num_elements / 128) * 4
-    
+
     total_bytes = source_bytes + working_bytes + packed_bytes
     return total_bytes / (1024 * 1024)
 
@@ -159,6 +194,7 @@ def compute_work_unit_bounds(
         quant_method=quant_config.method,
         bits=quant_config.bits,
         workspace_multiplier=workspace_multiplier,
+        group_size=quant_config.group_size,
     )
     usable_vram_mb = budget.usable_vram_mb
     
@@ -182,15 +218,12 @@ def compute_work_unit_bounds(
             "total_matrix_vram_mb": round(full_vram_req_mb, 2),
         }
         
-    # Calculate exact memory consumption per row
-    dtype_bytes = 2
-    if "32" in source_dtype:
-        dtype_bytes = 4
-    elif "8" in source_dtype:
-        dtype_bytes = 1
-        
+    # Calculate exact memory consumption per row, including group padding.
+    dtype_bytes = source_dtype_bytes(source_dtype)
+    pad_factor = group_padding_factor(in_features, quant_config.group_size)
+
     source_bytes_per_row = in_features * dtype_bytes
-    working_bytes_per_row = source_bytes_per_row * workspace_multiplier
+    working_bytes_per_row = source_bytes_per_row * pad_factor * workspace_multiplier
     packed_bytes_per_row = (in_features * quant_config.bits) / 8 + (in_features / 128) * 4
     total_bytes_per_row = source_bytes_per_row + working_bytes_per_row + packed_bytes_per_row
     vram_per_row_mb = total_bytes_per_row / (1024 * 1024)
@@ -203,7 +236,6 @@ def compute_work_unit_bounds(
     tile_rows = max(64, (raw_tile_rows // 64) * 64)
     tile_rows = min(out_features, tile_rows)
     
-    import math
     num_tiles = math.ceil(out_features / tile_rows)
     est_tile_vram_mb = tile_rows * vram_per_row_mb
     

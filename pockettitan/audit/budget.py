@@ -29,7 +29,7 @@ from pockettitan.audit.classify import (
     classify_tensor,
 )
 from pockettitan.audit.headers import ShardHeaderScan
-from pockettitan.config import TensorAddress
+
 
 GIB = float(1 << 30)
 MIB = float(1 << 20)

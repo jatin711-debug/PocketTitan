@@ -27,7 +27,9 @@ class INTxQuantizer(BaseQuantizer):
             supports_cpu=True,
             supports_cuda=True,
             supports_remote_streaming=True,
-            workspace_multiplier=1.5,
+            # Measured peak/source on a group-aligned matrix: 6.05x.
+            # Padding overhead is modelled separately by group_padding_factor().
+            workspace_multiplier=6.5,
         )
 
     def quantize(
