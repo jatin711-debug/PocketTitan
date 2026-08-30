@@ -7,7 +7,11 @@ import safetensors.torch
 import torch
 from huggingface_hub import hf_hub_url
 
-from pockettitan.config import TensorAddress, UnsupportedSourceDTypeError
+from pockettitan.config import (
+    TensorAddress,
+    TruncatedTensorError,
+    UnsupportedSourceDTypeError,
+)
 from pockettitan.metadata.safetensors_header import (
     fetch_remote_bytes,
 )
@@ -142,6 +146,11 @@ class RemoteTensorSliceReader:
             return full_t[row_start:row_end]
 
         out_features, in_features = shape[0], shape[1]
+        if tensor_addr.size_bytes % max(1, out_features):
+            raise TruncatedTensorError(
+                f"{tensor_addr.name}: {tensor_addr.size_bytes:,} bytes do not divide into "
+                f"{out_features} rows, so the row stride is unknown"
+            )
         bytes_per_row = (tensor_addr.size_bytes) // max(1, out_features)
 
         slice_byte_start = tensor_addr.byte_start + (row_start * bytes_per_row)
@@ -172,6 +181,11 @@ class RemoteTensorSliceReader:
             raise ValueError(f"read_3d_expert_slice requires a 3D tensor, got shape {shape}")
 
         num_experts, out_feat, in_feat = shape[0], shape[1], shape[2]
+        if tensor_addr.size_bytes % max(1, num_experts):
+            raise TruncatedTensorError(
+                f"{tensor_addr.name}: {tensor_addr.size_bytes:,} bytes do not divide into "
+                f"{num_experts} experts, so the record stride is unknown"
+            )
         bytes_per_expert = tensor_addr.size_bytes // max(1, num_experts)
 
         expert_byte_start = tensor_addr.byte_start + (expert_idx * bytes_per_expert)
@@ -204,6 +218,22 @@ class RemoteTensorSliceReader:
             )
 
         np_dtype = DTYPE_MAP_NUMPY[dtype_upper]
+
+        # Say what actually went wrong. A cut-short transfer otherwise surfaces
+        # as a reshape failure naming a shape and an element count but neither
+        # the tensor nor the cause, which is how a dropped connection reads as
+        # "shape '[17408, 5120]' is invalid for input of size 47516081".
+        expected_elements = 1
+        for dim in shape:
+            expected_elements *= int(dim)
+        expected_bytes = expected_elements * np.dtype(np_dtype).itemsize
+        if len(raw_bytes) != expected_bytes:
+            raise TruncatedTensorError(
+                f"expected {expected_bytes:,} bytes for a {dtype_str} tensor of shape "
+                f"{list(shape)} but received {len(raw_bytes):,} "
+                f"({len(raw_bytes) / max(expected_bytes, 1):.2%}) - the transfer was cut short"
+            )
+
         arr = np.frombuffer(raw_bytes, dtype=np_dtype)
 
         if dtype_upper in ["F8_E4M3", "FLOAT8_E4M3FN"]:

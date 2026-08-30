@@ -90,6 +90,10 @@ def parse_remote_safetensors_header(
         return json.loads(header_json_str), total_header_bytes
 
 
+class IncompleteRangeRead(IOError):
+    """The server returned fewer bytes than the requested range, and retries ran out."""
+
+
 def fetch_remote_bytes(
     url: str,
     byte_start: int,
@@ -97,32 +101,68 @@ def fetch_remote_bytes(
     headers: Optional[Dict[str, str]] = None,
     timeout: int = 60,
     chunk_callback: Optional[Callable[[int, int], None]] = None,
+    max_attempts: int = 6,
+    backoff_seconds: float = 1.5,
 ) -> bytes:
-    """Fetch exact byte range from remote URL with redirect range preservation and chunk callback."""
+    """Fetch an exact byte range, resuming rather than truncating.
+
+    A long transfer over a slow link will drop: the socket closes early, the
+    read loop ends without error, and the caller gets a short buffer. Verifying
+    only the reshape downstream turns that into
+    ``shape '[17408, 5120]' is invalid for input of size 47516081`` three hours
+    into a build -- an error that names neither the cause nor the fix.
+
+    So the range is tracked to the byte and a short read re-requests **only the
+    missing suffix**, which costs one more request rather than restarting a
+    178 MB tensor. Only a genuinely exhausted retry budget raises, and it raises
+    saying what went wrong.
+    """
+    import time
+
     opener = urllib.request.build_opener(RedirectRangeHandler)
-    req_headers = {
-        "User-Agent": "PocketTitan/0.1.0",
-        "Range": f"bytes={byte_start}-{byte_end}",
-    }
-    if headers:
-        req_headers.update(headers)
-
     total_expected = (byte_end - byte_start) + 1
-    req = urllib.request.Request(url, headers=req_headers)
+    if total_expected <= 0:
+        return b""
 
-    with opener.open(req, timeout=timeout) as resp:
-        if chunk_callback is None:
-            return resp.read()
+    chunks: list = []
+    received = 0
+    last_error: Optional[BaseException] = None
 
-        chunks = []
-        chunk_size = 4 * 1024 * 1024  # 4 MiB buffer
-        while True:
-            c = resp.read(chunk_size)
-            if not c:
-                break
-            chunks.append(c)
-            chunk_callback(len(c), total_expected)
-        return b"".join(chunks)
+    for attempt in range(max_attempts):
+        if received >= total_expected:
+            break
+        if attempt:
+            time.sleep(backoff_seconds * (2 ** (attempt - 1)))
+
+        req_headers = {
+            "User-Agent": "PocketTitan/0.1.0",
+            "Range": f"bytes={byte_start + received}-{byte_end}",
+        }
+        if headers:
+            req_headers.update(headers)
+        request = urllib.request.Request(url, headers=req_headers)
+
+        try:
+            with opener.open(request, timeout=timeout) as response:
+                chunk_size = 4 * 1024 * 1024  # 4 MiB
+                while received < total_expected:
+                    block = response.read(min(chunk_size, total_expected - received))
+                    if not block:
+                        break
+                    chunks.append(block)
+                    received += len(block)
+                    if chunk_callback is not None:
+                        chunk_callback(len(block), total_expected)
+        except OSError as exc:  # socket resets, timeouts, truncated TLS records
+            last_error = exc
+
+    if received != total_expected:
+        raise IncompleteRangeRead(
+            f"{url}: got {received:,} of {total_expected:,} bytes for range "
+            f"[{byte_start}, {byte_end}] after {max_attempts} attempts"
+            + (f"; last error: {last_error!r}" if last_error else "")
+        )
+    return b"".join(chunks)
 
 
 def parse_safetensors_header(

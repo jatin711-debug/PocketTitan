@@ -34,6 +34,14 @@ class UnsupportedSourceDTypeError(Exception):
     pass
 
 
+class TruncatedTensorError(IOError):
+    """Fewer bytes arrived than the tensor's shape and dtype require.
+
+    Distinguished from a shape bug because the fix is different: retry the
+    transfer, do not go looking at the layout.
+    """
+
+
 class CalibrationRequiredError(Exception):
     """Raised when an algorithm (e.g., GPTQ, AWQ) requires calibration data that was not provided."""
 
