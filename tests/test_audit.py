@@ -36,15 +36,20 @@ COMPONENT_PARAMS = {
     Component.EXPERTS_ROUTED: 120_795_955_200,
     Component.PLE_TABLE: 51_200_245_760,
     Component.MTP: 2_607_150_848,
-    Component.GDN_ATTN: 2_086_510_464,
+    # GDN_ATTN and FULL_ATTN each shed their norm/state vectors to NORM when the
+    # norm rules were hoisted above the attention-family prefixes (17,280 params
+    # in total, conserved -- see test_norms_and_state_params_outrank_the_
+    # attention_family_rules). Deliberate, same as the shared_expert_gate move.
+    Component.GDN_ATTN: 2_086_502_400,
     Component.HYPERCONN: 640_624_640,
     Component.EMBED: 635_699_200,
     Component.LM_HEAD: 635_699_200,
-    Component.FULL_ATTN: 617_358_336,
+    Component.FULL_ATTN: 617_349_120,
     Component.VISION: 448_931_056,
     Component.SHARED_EXPERT: 235_929_600,
     Component.ROUTER: 63_037_440,
     Component.PLE_PROJ: 32_839_715,
+    Component.NORM: 17_280,
 }
 
 
@@ -373,3 +378,40 @@ def test_render_survives_legacy_codepage(qwen_report):
     render_report(Console(file=stream, width=140, legacy_windows=False), qwen_report)
     stream.flush()
     assert raw.getvalue()
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "model.language_model.layers.0.linear_attn.norm.weight",
+        "model.language_model.layers.0.linear_attn.A_log",
+        "model.language_model.layers.0.linear_attn.dt_bias",
+        "model.language_model.layers.5.self_attn.q_norm.weight",
+        "model.language_model.layers.5.self_attn.k_norm.weight",
+        "model.language_model.layers.0.input_layernorm.weight",
+        "model.language_model.norm.weight",
+    ],
+)
+def test_norms_and_state_params_outrank_the_attention_family_rules(name):
+    """Precision-critical vectors must not be swallowed by a family prefix.
+
+    ``linear_attn.`` and ``self_attn.`` are prefix rules. Before they were
+    ordered after the norm rule, ``linear_attn.norm.weight`` classified as
+    ``gdn_attn`` and was written at 3 bits: all 128 values decoded to a single
+    constant, erasing the layer's per-channel gain. Same shape of bug as
+    ``shared_expert_gate``.
+    """
+    assert classify_tensor(name).component is Component.NORM
+
+
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        ("model.language_model.layers.0.linear_attn.out_proj.weight", Component.GDN_ATTN),
+        ("model.language_model.layers.0.linear_attn.conv1d.weight", Component.GDN_ATTN),
+        ("model.language_model.layers.5.self_attn.q_proj.weight", Component.FULL_ATTN),
+        ("model.language_model.layers.0.mlp.gate_proj.weight", Component.MLP_DENSE),
+    ],
+)
+def test_hoisting_norms_did_not_capture_real_weight_matrices(name, expected):
+    assert classify_tensor(name).component is expected

@@ -145,14 +145,24 @@ DEFAULT_RULES: List[ClassificationRule] = [
         activation=ActivationMode.ROW_LOOKUP,
     ),
     ClassificationRule(pattern=r"^lm_head\.", component=Component.LM_HEAD),
+    # --- norms, biases, and recurrence state ---
+    # These must be matched BEFORE the attention families below. `linear_attn.`
+    # and `self_attn.` are prefix rules, so without this they swallow
+    # `linear_attn.norm.weight`, `linear_attn.A_log`, `linear_attn.dt_bias`, and
+    # `self_attn.{q,k}_norm.weight` into a quantized bucket. Those tensors are
+    # ~0.007% of the parameters and carry per-channel gains and per-head decay
+    # rates, so quantizing them costs everything and buys ~24 KB on a 14 GiB
+    # package. Same failure mode as `shared_expert_gate` above: a
+    # precision-critical tensor hidden under a family prefix.
     # --- attention families ---
     ClassificationRule(pattern=r"hyper_connection", component=Component.HYPERCONN),
+    ClassificationRule(pattern=r"norm|layernorm|\.ln_", component=Component.NORM),
+    ClassificationRule(pattern=r"\.(A_log|dt_bias)$", component=Component.NORM),
     ClassificationRule(pattern=r"\.linear_attn\.", component=Component.GDN_ATTN),
     ClassificationRule(pattern=r"\.self_attn\.", component=Component.FULL_ATTN),
     ClassificationRule(pattern=r"\.attn\.", component=Component.FULL_ATTN),
-    # --- dense MLP fallback, then norms ---
+    # --- dense MLP fallback ---
     ClassificationRule(pattern=r"\.mlp\.", component=Component.MLP_DENSE),
-    ClassificationRule(pattern=r"norm|layernorm|\.ln_", component=Component.NORM),
 ]
 
 
