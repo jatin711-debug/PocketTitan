@@ -1,6 +1,5 @@
-# Internal Specification & Planning Documents
-Design.md
-Plan.md
+# Generated research reports (human-readable phase reports remain tracked)
+reports/*.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
