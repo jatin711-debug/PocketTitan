@@ -37,7 +37,7 @@ class DenseBlobReader:
         if name not in self.dense_entries:
             raise KeyError(f"Dense tensor '{name}' not found in package manifest")
         entry = self.dense_entries[name]
-        return self._mmap[entry.byte_offset : entry.byte_offset + entry.packed_bytes]
+        return self._mmap[entry.byte_offset : entry.byte_offset + entry.length]
 
 
 class PocketTitanEngine:
