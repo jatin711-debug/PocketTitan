@@ -20,17 +20,30 @@ def _crc32c_table() -> tuple[int, ...]:
 
 _CRC32C_TABLE = _crc32c_table()
 
+try:
+    import google_crc32c
 
-def crc32c(data: bytes, crc: int = 0) -> int:
-    """Return the Castagnoli CRC-32C of ``data``.
+    def crc32c(data: bytes, crc: int = 0) -> int:
+        if crc == 0:
+            return google_crc32c.value(data)
+        checksum = google_crc32c.Checksum(crc.to_bytes(4, "big"))
+        checksum.update(data)
+        return checksum.value
 
-    The implementation is deliberately dependency-free so package validation
-    behaves identically on a minimal Windows installation and in CPU CI.
-    """
-    value = crc ^ 0xFFFFFFFF
-    for byte in data:
-        value = _CRC32C_TABLE[(value ^ byte) & 0xFF] ^ (value >> 8)
-    return value ^ 0xFFFFFFFF
+except ImportError:
+    try:
+        import crc32c as _c_crc32c
+
+        def crc32c(data: bytes, crc: int = 0) -> int:
+            return _c_crc32c.crc32c(data, crc)
+
+    except ImportError:
+        def crc32c(data: bytes, crc: int = 0) -> int:
+            """Return the Castagnoli CRC-32C of ``data`` (pure-Python fallback)."""
+            value = crc ^ 0xFFFFFFFF
+            for byte in data:
+                value = _CRC32C_TABLE[(value ^ byte) & 0xFF] ^ (value >> 8)
+            return value ^ 0xFFFFFFFF
 
 
 def crc32c_hex(data: bytes) -> str:
