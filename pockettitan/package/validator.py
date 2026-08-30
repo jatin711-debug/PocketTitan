@@ -406,26 +406,36 @@ class PtitanValidator:
         byte_count = 0
         if manifest.totals.dense_bytes:
             path = self._region_path(manifest, "dense")
-            for name, checksum in checksums.dense.items():
-                if checksum.offset is None:
-                    errors.append(f"dense checksum {name} has no offset")
-                    continue
-                payload = _read_exact(path, checksum.offset, checksum.length)
-                if crc32c_hex(payload) != checksum.value:
-                    errors.append(f"dense tensor checksum mismatch: {name}")
-                items += 1
-                byte_count += len(payload)
+            with path.open("rb") as stream:
+                for name, checksum in checksums.dense.items():
+                    if checksum.offset is None:
+                        errors.append(f"dense checksum {name} has no offset")
+                        continue
+                    stream.seek(checksum.offset)
+                    payload = stream.read(checksum.length)
+                    if len(payload) != checksum.length:
+                        errors.append(f"dense tensor {name} has short read")
+                        continue
+                    if crc32c_hex(payload) != checksum.value:
+                        errors.append(f"dense tensor checksum mismatch: {name}")
+                    items += 1
+                    byte_count += len(payload)
         if manifest.totals.expert_bytes:
             path = self._region_path(manifest, "experts")
-            for index, checksum in checksums.experts.items():
-                if checksum.offset is None:
-                    errors.append(f"expert checksum {index} has no offset")
-                    continue
-                payload = _read_exact(path, checksum.offset, checksum.length)
-                if crc32c_hex(payload) != checksum.value:
-                    errors.append(f"expert record checksum mismatch: {index}")
-                items += 1
-                byte_count += len(payload)
+            with path.open("rb") as stream:
+                for index, checksum in checksums.experts.items():
+                    if checksum.offset is None:
+                        errors.append(f"expert checksum {index} has no offset")
+                        continue
+                    stream.seek(checksum.offset)
+                    payload = stream.read(checksum.length)
+                    if len(payload) != checksum.length:
+                        errors.append(f"expert record {index} has short read")
+                        continue
+                    if crc32c_hex(payload) != checksum.value:
+                        errors.append(f"expert record checksum mismatch: {index}")
+                    items += 1
+                    byte_count += len(payload)
         if manifest.totals.ple_bytes and manifest.ple_index:
             path = self._region_path(manifest, "ple")
             row = manifest.ple_index.row
