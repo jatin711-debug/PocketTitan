@@ -3,7 +3,7 @@
 import math
 import random
 from enum import Enum
-from typing import Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Dict, List, Sequence
 from pydantic import BaseModel, Field
 
 
@@ -71,7 +71,7 @@ def compute_gini(frequencies: Sequence[int]) -> float:
 def summarize_trace(events: Sequence[RoutingEvent], num_layers: int = 48, num_experts: int = 512) -> TraceSummary:
     """Compute aggregate access statistics and Gini distribution from an event stream."""
     expert_freq: Dict[int, int] = {e: 0 for e in range(num_experts)}
-    layer_freq: Dict[int, Dict[int, int]] = {l: {e: 0 for e in range(num_experts)} for l in range(num_layers)}
+    layer_freq: Dict[int, Dict[int, int]] = {layer: {e: 0 for e in range(num_experts)} for layer in range(num_layers)}
     
     tokens = set()
     top_k_set = set()
@@ -133,13 +133,13 @@ def generate_synthetic_trace(
     probs = [w / total_w for w in weights]
     
     # State for sticky-session Markov generator
-    last_active_per_layer: Dict[int, List[int]] = {l: [] for l in range(num_layers)}
+    last_active_per_layer: Dict[int, List[int]] = {layer: [] for layer in range(num_layers)}
     
     for tok in range(num_tokens):
-        for l in range(num_layers):
-            if distribution == DistributionType.STICKY and last_active_per_layer[l] and rng.random() < sticky_prob:
+        for layer in range(num_layers):
+            if distribution == DistributionType.STICKY and last_active_per_layer[layer] and rng.random() < sticky_prob:
                 # Keep some previous experts, sample remaining
-                prev = last_active_per_layer[l]
+                prev = last_active_per_layer[layer]
                 num_keep = rng.randint(max(1, top_k // 2), top_k)
                 chosen = set(rng.sample(prev, min(len(prev), num_keep)))
                 while len(chosen) < top_k:
@@ -159,13 +159,13 @@ def generate_synthetic_trace(
                     selected.append(pick)
                     pool_weights[pick] = 0.0
                     
-            last_active_per_layer[l] = selected
+            last_active_per_layer[layer] = selected
             
             for slot, exp in enumerate(selected):
                 events.append(
                     RoutingEvent(
                         token_id=tok,
-                        layer_idx=l,
+                        layer_idx=layer,
                         slot_idx=slot,
                         expert_idx=exp,
                         weight=1.0 / top_k,

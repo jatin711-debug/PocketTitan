@@ -45,9 +45,9 @@ def dummy_expert_manager():
     bank_bytes = bytearray(layout.total_bytes)
     
     # Initialize some dummy weights
-    for l in range(4):
+    for layer in range(4):
         for e in range(8):
-            offset, _ = layout.byte_range(l, e)
+            offset, _ = layout.byte_range(layer, e)
             gu_w = torch.ones(2 * intermediate_size, in_features, dtype=torch.float16) * (e + 1)
             dn_w = torch.ones(in_features, intermediate_size, dtype=torch.float16) * (e + 1)
             

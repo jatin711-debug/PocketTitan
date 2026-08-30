@@ -1,7 +1,7 @@
 """Test script to load and inspect the PocketTitan 2-bit Qwen model & tokenizer."""
 
 import torch
-from transformers import AutoTokenizer, AutoConfig
+from transformers import AutoTokenizer
 import safetensors.torch
 from pathlib import Path
 import json
@@ -11,13 +11,13 @@ from pockettitan.quantizers.rtn import RTNQuantizer
 
 def main():
     model_dir = Path("./qwen_2bit_model")
-    print(f"=== PocketTitan 2-Bit Model Tester ===")
+    print("=== PocketTitan 2-Bit Model Tester ===")
     print(f"Model directory: {model_dir.resolve()}\n")
 
     # 1. Load Tokenizer
     print("[1/3] Loading Tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
-    print(f"Tokenizer successfully loaded!")
+    print("Tokenizer successfully loaded!")
     print(f" - Vocabulary Size: {len(tokenizer):,}")
     print(f" - BOS Token: {tokenizer.bos_token} (ID: {tokenizer.bos_token_id})")
     print(f" - EOS Token: {tokenizer.eos_token} (ID: {tokenizer.eos_token_id})")
@@ -25,7 +25,7 @@ def main():
 
     # 2. Test Token Encoding & Decoding
     sample_text = "Hello! Tell me a fun fact about space."
-    print(f"[2/3] Testing Tokenizer with sample prompt:")
+    print("[2/3] Testing Tokenizer with sample prompt:")
     print(f" Prompt: '{sample_text}'")
     encoded = tokenizer(sample_text, return_tensors="pt")
     tokens = encoded["input_ids"]

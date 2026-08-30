@@ -1,9 +1,7 @@
 """Tests for Phase R4 The Oracle Decision Gate."""
 
-import pytest
 from pockettitan.sim.oracle_gate import (
     GateDecision,
-    GateReport,
     evaluate_oracle_gate,
     format_gate_report_markdown,
 )

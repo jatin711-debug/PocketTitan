@@ -56,4 +56,9 @@ __all__ = [
     "run_simulation",
     "run_capacity_sweep",
     "render_simulation_report",
+    # oracle gate (R4) -- re-exported for `pockettitan gate`
+    "GateDecision",
+    "GateReport",
+    "evaluate_oracle_gate",
+    "format_gate_report_markdown",
 ]

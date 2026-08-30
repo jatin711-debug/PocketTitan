@@ -1,6 +1,6 @@
 """Two-population expert precision allocator (Phase R9)."""
 
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Set, Tuple
 from pydantic import BaseModel, Field
 
 
@@ -54,10 +54,10 @@ class TwoPopulationAllocator:
         """Partition experts into hot and cold populations based on measured routing frequency."""
         # Ensure all experts exist in frequency map
         all_experts: List[Tuple[Tuple[int, int], int]] = []
-        for l in range(self.num_layers):
+        for layer in range(self.num_layers):
             for e in range(self.num_experts):
-                count = expert_frequencies.get((l, e), 0)
-                all_experts.append(((l, e), count))
+                count = expert_frequencies.get((layer, e), 0)
+                all_experts.append(((layer, e), count))
 
         # Sort by activation frequency descending
         all_experts.sort(key=lambda x: x[1], reverse=True)

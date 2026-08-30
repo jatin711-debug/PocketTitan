@@ -1,10 +1,9 @@
 """Session-adaptive expert pinning and warmup stabilization (Phase R8)."""
 
 from collections import Counter
-from typing import Dict, List, Optional, Set, Tuple
-import torch
+from typing import List, Set, Tuple
 
-from pockettitan.runtime.expert.manager import DecodedExpert, ExpertManager
+from pockettitan.runtime.expert.manager import ExpertManager
 
 
 class SessionAdapter:

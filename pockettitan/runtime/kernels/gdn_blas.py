@@ -1,6 +1,5 @@
 """BLAS-accelerated Gated Delta Net (GDN) linear state recurrence (Phase R9)."""
 
-from typing import Optional, Tuple
 import torch
 
 

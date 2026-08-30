@@ -1,6 +1,6 @@
 """Simulation execution, policy comparison sweeps, and Rich reporting (R2)."""
 
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence
 from pydantic import BaseModel, Field
 from rich.console import Console
 from rich.panel import Panel
@@ -108,9 +108,9 @@ def run_simulation(
             
         # Aggregate statistics
         total_tokens = max(1, len(token_latencies))
-        avg_ssd_mb = sum(l.ssd_bytes_read for l in token_latencies) / (total_tokens * 1024 * 1024)
-        avg_stall = sum(l.stall_time_ms for l in token_latencies) / total_tokens
-        avg_tok_s = sum(l.tokens_per_second for l in token_latencies) / total_tokens
+        avg_ssd_mb = sum(lat.ssd_bytes_read for lat in token_latencies) / (total_tokens * 1024 * 1024)
+        avg_stall = sum(lat.stall_time_ms for lat in token_latencies) / total_tokens
+        avg_tok_s = sum(lat.tokens_per_second for lat in token_latencies) / total_tokens
         
         metrics.append(
             PolicyMetric(

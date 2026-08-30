@@ -2,8 +2,7 @@
 
 from collections import OrderedDict
 from enum import Enum
-from typing import Any, Dict, List, Optional, Set, Tuple
-import torch
+from typing import Any, Optional, Tuple
 
 
 class CachePartition(str, Enum):
