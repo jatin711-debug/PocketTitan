@@ -16,7 +16,6 @@ import torch
 from pockettitan.audit import PrecisionMap, scan_checkpoint
 from pockettitan.config import MemoryBudgetConfig, QuantConfig, QuantMethod
 from pockettitan.package import (
-    DENSE_BLOB_NAME,
     BuildJournal,
     PackageWriter,
     Section,
@@ -52,23 +51,33 @@ def dequantize_from_bytes(payload, spans, shape, bits, group_size, symmetric):
     """Reconstruct a weight matrix from raw package bytes and a span list."""
     sections = {}
     for span in spans:
-        sections[span.section] = payload[span.offset:span.offset + span.length]
+        sections[span.section] = payload[span.offset : span.offset + span.length]
 
     packed = torch.frombuffer(bytearray(sections[Section.PACKED]), dtype=torch.uint8)
     scales = torch.frombuffer(bytearray(sections[Section.SCALES]), dtype=torch.float16)
     zeros = (
         torch.frombuffer(bytearray(sections[Section.ZEROS]), dtype=torch.float16)
-        if Section.ZEROS in sections else None
+        if Section.ZEROS in sections
+        else None
     )
 
     config = QuantConfig(
-        method=QuantMethod.RTN, bits=int(bits), group_size=group_size,
-        symmetric=symmetric, device="cpu",
+        method=QuantMethod.RTN,
+        bits=int(bits),
+        group_size=group_size,
+        symmetric=symmetric,
+        device="cpu",
     )
     result = QuantizedResult(
-        packed_weights=packed, scales=scales, zeros=zeros, codebook=None,
-        quant_config=config, original_shape=tuple(shape),
-        original_dtype=torch.float16, bit_width=float(bits), device="cpu",
+        packed_weights=packed,
+        scales=scales,
+        zeros=zeros,
+        codebook=None,
+        quant_config=config,
+        original_shape=tuple(shape),
+        original_dtype=torch.float16,
+        bit_width=float(bits),
+        device="cpu",
     )
     return get_quantizer(config).dequantize(result)
 
@@ -81,6 +90,7 @@ def source_tensors(model_dir):
 # --------------------------------------------------------------------------- #
 # Layout fidelity
 # --------------------------------------------------------------------------- #
+
 
 def test_build_matches_planned_layout(dummy_moe_model, tmp_path):
     plan, writer, out = build_package(dummy_moe_model, tmp_path)
@@ -122,6 +132,7 @@ def test_dense_entries_do_not_overlap(dummy_moe_model, tmp_path):
 # Round-trips
 # --------------------------------------------------------------------------- #
 
+
 @pytest.mark.parametrize("layer,expert", [(0, 0), (0, 7), (1, 3)])
 def test_expert_roundtrip_from_bank(dummy_moe_model, tmp_path, layer, expert):
     """Read one expert back using only the manifest, and compare to source."""
@@ -137,10 +148,14 @@ def test_expert_roundtrip_from_bank(dummy_moe_model, tmp_path, layer, expert):
 
     originals = source_tensors(dummy_moe_model)
     for projection in layout.record.projections:
-        payload = record[projection.offset:projection.offset + projection.length]
+        payload = record[projection.offset : projection.offset + projection.length]
         recovered = dequantize_from_bytes(
-            payload, projection.spans, projection.shape,
-            projection.bits, projection.group_size, projection.symmetric,
+            payload,
+            projection.spans,
+            projection.shape,
+            projection.bits,
+            projection.group_size,
+            projection.symmetric,
         )
         expected = originals[f"model.layers.{layer}.mlp.experts.{projection.name}"][expert]
 
@@ -176,8 +191,12 @@ def test_dense_roundtrip_from_blob(dummy_moe_model, tmp_path):
         payload = blob.read(target.length)
 
     recovered = dequantize_from_bytes(
-        payload, target.spans, target.address.shape,
-        target.bits, target.group_size, target.symmetric,
+        payload,
+        target.spans,
+        target.address.shape,
+        target.bits,
+        target.group_size,
+        target.symmetric,
     )
     expected = originals[target.address.name]
     error = (recovered.float() - expected.float()).abs().max().item()
@@ -196,13 +215,16 @@ def test_fp16_components_are_stored_verbatim(dummy_moe_model, tmp_path):
     with open(writer.dense_path, "rb") as blob:
         blob.seek(router.byte_offset)
         payload = blob.read(router.length)
-    recovered = torch.frombuffer(bytearray(payload), dtype=torch.float16).view(*router.address.shape)
+    recovered = torch.frombuffer(bytearray(payload), dtype=torch.float16).view(
+        *router.address.shape
+    )
     assert torch.equal(recovered, originals[router.address.name])
 
 
 # --------------------------------------------------------------------------- #
 # PLE row store
 # --------------------------------------------------------------------------- #
+
 
 def test_ple_table_roundtrip(dummy_ple_model, tmp_path):
     """Every row must be independently addressable and decodable."""
@@ -211,6 +233,11 @@ def test_ple_table_roundtrip(dummy_ple_model, tmp_path):
 
     ple = plan.ple
     assert ple is not None
+    assert plan.manifest.ple_index is not None
+    assert (writer.output_dir / "ple" / "index.json").is_file()
+    assert plan.manifest.ple_index.layer_multipliers == [11, 17, 23]
+    assert plan.manifest.ple_index.head_offsets == [0, 32, 64, 96]
+    assert plan.manifest.ple_index.head_vocab_sizes == [32, 32, 32, 32]
     assert writer.ple_path.stat().st_size == ple.total_bytes
 
     originals = source_tensors(dummy_ple_model)
@@ -246,6 +273,7 @@ def test_ple_rows_land_on_planned_offsets(dummy_ple_model, tmp_path):
 # --------------------------------------------------------------------------- #
 # Resumption
 # --------------------------------------------------------------------------- #
+
 
 def test_resume_skips_completed_work(dummy_moe_model, tmp_path):
     plan, writer, out = build_package(dummy_moe_model, tmp_path)
@@ -292,6 +320,101 @@ def test_resume_rejects_a_different_layout(dummy_moe_model, tmp_path):
         other_writer.build()
 
 
+def test_resume_rejects_source_revision_drift(dummy_moe_model, tmp_path):
+    _, writer, _ = build_package(dummy_moe_model, tmp_path)
+    writer.build()
+
+    scan = scan_checkpoint(str(dummy_moe_model))
+    changed = plan_package(
+        scan,
+        precision_map=TEST_PRECISION,
+        source_revision="different-source-revision",
+    )
+    resumed = PackageWriter(
+        changed,
+        writer.output_dir,
+        LocalTensorReader(dummy_moe_model),
+        budget=MemoryBudgetConfig(max_vram_mb=512),
+        method=QuantMethod.RTN,
+        device="cpu",
+    )
+    with pytest.raises(WriteError, match="Resuming would corrupt"):
+        resumed.build()
+
+
+def test_uncommitted_batch_is_repeated_after_crash(dummy_moe_model, tmp_path, monkeypatch):
+    """Bytes may reach disk before the journal; those bytes must be rewritten."""
+    plan, writer, _ = build_package(dummy_moe_model, tmp_path)
+    original_save = writer._save_journal
+    failed = False
+
+    def fail_first_commit(journal):
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise RuntimeError("injected termination before journal commit")
+        original_save(journal)
+
+    monkeypatch.setattr(writer, "_save_journal", fail_first_commit)
+    with pytest.raises(RuntimeError, match="injected termination"):
+        writer.build()
+    assert not writer.journal_path.exists()
+
+    _, resumed, _ = build_package(dummy_moe_model, tmp_path)
+    result = resumed.build()
+    assert result.items_written == plan.num_work_items
+    assert BuildJournal.model_validate_json(
+        resumed.journal_path.read_text(encoding="utf-8")
+    ).finished
+
+
+def test_peak_vram_includes_dense_and_ple(dummy_ple_model, tmp_path, monkeypatch):
+    _, writer, _ = build_package(dummy_ple_model, tmp_path)
+    dense_encoder = writer._encode_dense
+    ple_encoder = writer._encode_ple_shard
+
+    def dense_with_peak(item, tensor):
+        payload, _ = dense_encoder(item, tensor)
+        return payload, 11.0
+
+    def ple_with_peak(item, spans):
+        payload, _ = ple_encoder(item, spans)
+        return payload, 33.0
+
+    monkeypatch.setattr(writer, "_encode_dense", dense_with_peak)
+    monkeypatch.setattr(writer, "_encode_ple_shard", ple_with_peak)
+    assert writer.build().peak_vram_mb == 33.0
+
+
+def test_peak_vram_includes_experts(dummy_moe_model, tmp_path, monkeypatch):
+    _, writer, _ = build_package(dummy_moe_model, tmp_path)
+    dense_encoder = writer._encode_dense
+    expert_encoder = writer._encode_expert
+
+    def dense_with_peak(item, tensor):
+        payload, _ = dense_encoder(item, tensor)
+        return payload, 11.0
+
+    def expert_with_peak(item):
+        payload, _ = expert_encoder(item)
+        return payload, 22.0
+
+    monkeypatch.setattr(writer, "_encode_dense", dense_with_peak)
+    monkeypatch.setattr(writer, "_encode_expert", expert_with_peak)
+    assert writer.build().peak_vram_mb == 22.0
+
+
+def test_text_runtime_assets_are_copied_without_vision_processor(dummy_ple_model, tmp_path):
+    _, writer, output = build_package(dummy_ple_model, tmp_path)
+    writer.build()
+
+    assert (output / "metadata" / "config.json").is_file()
+    assert (output / "metadata" / "generation_config.json").is_file()
+    assert (output / "tokenizer" / "tokenizer.json").is_file()
+    assert (output / "tokenizer" / "tokenizer_config.json").is_file()
+    assert not (output / "tokenizer" / "preprocessor_config.json").exists()
+
+
 def test_resume_false_rebuilds_everything(dummy_moe_model, tmp_path):
     plan, writer, _ = build_package(dummy_moe_model, tmp_path)
     writer.build()
@@ -315,6 +438,7 @@ def test_plan_fingerprint_tracks_layout_not_identity(dummy_moe_model, tmp_path):
 # --------------------------------------------------------------------------- #
 # Failure modes
 # --------------------------------------------------------------------------- #
+
 
 def test_section_size_mismatch_is_fatal(dummy_moe_model, tmp_path):
     """A short write would shift every later record, so it must raise."""
@@ -341,8 +465,12 @@ def test_build_respects_vram_budget(dummy_moe_model, tmp_path):
     scan = scan_checkpoint(str(dummy_moe_model))
     plan = plan_package(scan, precision_map=TEST_PRECISION)
     writer = PackageWriter(
-        plan, tmp_path / "gpu.ptitan", LocalTensorReader(dummy_moe_model),
-        budget=budget, method=QuantMethod.RTN, device="cuda",
+        plan,
+        tmp_path / "gpu.ptitan",
+        LocalTensorReader(dummy_moe_model),
+        budget=budget,
+        method=QuantMethod.RTN,
+        device="cuda",
     )
     result = writer.build()
     assert result.finished

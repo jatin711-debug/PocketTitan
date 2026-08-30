@@ -19,11 +19,11 @@ def dummy_transformer_model(tmp_path):
     """Create a realistic miniature transformer checkpoint with Safetensors index."""
     model_dir = tmp_path / "dummy_model"
     model_dir.mkdir()
-    
+
     hidden_size = 256
     intermediate_size = 512
     num_layers = 2
-    
+
     config_dict = {
         "architectures": ["LlamaForCausalLM"],
         "hidden_size": hidden_size,
@@ -35,53 +35,99 @@ def dummy_transformer_model(tmp_path):
     }
     with open(model_dir / "config.json", "w") as f:
         json.dump(config_dict, f)
-        
+
     tensors_shard_1 = {
         "model.embed_tokens.weight": torch.randn(1000, hidden_size, dtype=torch.float16) * 0.02,
         "model.layers.0.input_layernorm.weight": torch.ones(hidden_size, dtype=torch.float16),
-        "model.layers.0.self_attn.q_proj.weight": torch.randn(hidden_size, hidden_size, dtype=torch.float16) * 0.02,
-        "model.layers.0.self_attn.k_proj.weight": torch.randn(hidden_size, hidden_size, dtype=torch.float16) * 0.02,
-        "model.layers.0.self_attn.v_proj.weight": torch.randn(hidden_size, hidden_size, dtype=torch.float16) * 0.02,
-        "model.layers.0.self_attn.o_proj.weight": torch.randn(hidden_size, hidden_size, dtype=torch.float16) * 0.02,
-        "model.layers.0.post_attention_layernorm.weight": torch.ones(hidden_size, dtype=torch.float16),
-        "model.layers.0.mlp.gate_proj.weight": torch.randn(intermediate_size, hidden_size, dtype=torch.float16) * 0.02,
-        "model.layers.0.mlp.up_proj.weight": torch.randn(intermediate_size, hidden_size, dtype=torch.float16) * 0.02,
-        "model.layers.0.mlp.down_proj.weight": torch.randn(hidden_size, intermediate_size, dtype=torch.float16) * 0.02,
+        "model.layers.0.self_attn.q_proj.weight": torch.randn(
+            hidden_size, hidden_size, dtype=torch.float16
+        )
+        * 0.02,
+        "model.layers.0.self_attn.k_proj.weight": torch.randn(
+            hidden_size, hidden_size, dtype=torch.float16
+        )
+        * 0.02,
+        "model.layers.0.self_attn.v_proj.weight": torch.randn(
+            hidden_size, hidden_size, dtype=torch.float16
+        )
+        * 0.02,
+        "model.layers.0.self_attn.o_proj.weight": torch.randn(
+            hidden_size, hidden_size, dtype=torch.float16
+        )
+        * 0.02,
+        "model.layers.0.post_attention_layernorm.weight": torch.ones(
+            hidden_size, dtype=torch.float16
+        ),
+        "model.layers.0.mlp.gate_proj.weight": torch.randn(
+            intermediate_size, hidden_size, dtype=torch.float16
+        )
+        * 0.02,
+        "model.layers.0.mlp.up_proj.weight": torch.randn(
+            intermediate_size, hidden_size, dtype=torch.float16
+        )
+        * 0.02,
+        "model.layers.0.mlp.down_proj.weight": torch.randn(
+            hidden_size, intermediate_size, dtype=torch.float16
+        )
+        * 0.02,
     }
-    
+
     tensors_shard_2 = {
         "model.layers.1.input_layernorm.weight": torch.ones(hidden_size, dtype=torch.float16),
-        "model.layers.1.self_attn.q_proj.weight": torch.randn(hidden_size, hidden_size, dtype=torch.float16) * 0.02,
-        "model.layers.1.self_attn.k_proj.weight": torch.randn(hidden_size, hidden_size, dtype=torch.float16) * 0.02,
-        "model.layers.1.self_attn.v_proj.weight": torch.randn(hidden_size, hidden_size, dtype=torch.float16) * 0.02,
-        "model.layers.1.self_attn.o_proj.weight": torch.randn(hidden_size, hidden_size, dtype=torch.float16) * 0.02,
-        "model.layers.1.post_attention_layernorm.weight": torch.ones(hidden_size, dtype=torch.float16),
-        "model.layers.1.mlp.gate_proj.weight": torch.randn(intermediate_size, hidden_size, dtype=torch.float16) * 0.02,
-        "model.layers.1.mlp.up_proj.weight": torch.randn(intermediate_size, hidden_size, dtype=torch.float16) * 0.02,
-        "model.layers.1.mlp.down_proj.weight": torch.randn(hidden_size, intermediate_size, dtype=torch.float16) * 0.02,
+        "model.layers.1.self_attn.q_proj.weight": torch.randn(
+            hidden_size, hidden_size, dtype=torch.float16
+        )
+        * 0.02,
+        "model.layers.1.self_attn.k_proj.weight": torch.randn(
+            hidden_size, hidden_size, dtype=torch.float16
+        )
+        * 0.02,
+        "model.layers.1.self_attn.v_proj.weight": torch.randn(
+            hidden_size, hidden_size, dtype=torch.float16
+        )
+        * 0.02,
+        "model.layers.1.self_attn.o_proj.weight": torch.randn(
+            hidden_size, hidden_size, dtype=torch.float16
+        )
+        * 0.02,
+        "model.layers.1.post_attention_layernorm.weight": torch.ones(
+            hidden_size, dtype=torch.float16
+        ),
+        "model.layers.1.mlp.gate_proj.weight": torch.randn(
+            intermediate_size, hidden_size, dtype=torch.float16
+        )
+        * 0.02,
+        "model.layers.1.mlp.up_proj.weight": torch.randn(
+            intermediate_size, hidden_size, dtype=torch.float16
+        )
+        * 0.02,
+        "model.layers.1.mlp.down_proj.weight": torch.randn(
+            hidden_size, intermediate_size, dtype=torch.float16
+        )
+        * 0.02,
         "model.norm.weight": torch.ones(hidden_size, dtype=torch.float16),
         "lm_head.weight": torch.randn(1000, hidden_size, dtype=torch.float16) * 0.02,
     }
-    
+
     shard1_name = "model-00001-of-00002.safetensors"
     shard2_name = "model-00002-of-00002.safetensors"
-    
+
     safetensors.torch.save_file(tensors_shard_1, str(model_dir / shard1_name))
     safetensors.torch.save_file(tensors_shard_2, str(model_dir / shard2_name))
-    
+
     weight_map = {}
     for k in tensors_shard_1.keys():
         weight_map[k] = shard1_name
     for k in tensors_shard_2.keys():
         weight_map[k] = shard2_name
-        
+
     index_dict = {
         "metadata": {"total_size": 1000000},
         "weight_map": weight_map,
     }
     with open(model_dir / "model.safetensors.index.json", "w") as f:
         json.dump(index_dict, f)
-        
+
     return model_dir
 
 
@@ -154,10 +200,16 @@ def dummy_moe_model(tmp_path):
     }
     for layer in range(num_layers):
         p = f"model.layers.{layer}"
-        tensors[f"{p}.self_attn.q_proj.weight"] = torch.randn(hidden, hidden, dtype=torch.float16) * 0.02
-        tensors[f"{p}.self_attn.o_proj.weight"] = torch.randn(hidden, hidden, dtype=torch.float16) * 0.02
+        tensors[f"{p}.self_attn.q_proj.weight"] = (
+            torch.randn(hidden, hidden, dtype=torch.float16) * 0.02
+        )
+        tensors[f"{p}.self_attn.o_proj.weight"] = (
+            torch.randn(hidden, hidden, dtype=torch.float16) * 0.02
+        )
         tensors[f"{p}.input_layernorm.weight"] = torch.ones(hidden, dtype=torch.float16)
-        tensors[f"{p}.mlp.gate.weight"] = torch.randn(num_experts, hidden, dtype=torch.float16) * 0.02
+        tensors[f"{p}.mlp.gate.weight"] = (
+            torch.randn(num_experts, hidden, dtype=torch.float16) * 0.02
+        )
         # Fused expert banks: (num_experts, out, in)
         tensors[f"{p}.mlp.experts.gate_up_proj"] = (
             torch.randn(num_experts, 2 * inter, hidden, dtype=torch.float16) * 0.02
@@ -171,10 +223,12 @@ def dummy_moe_model(tmp_path):
 
     total_size = sum(t.numel() * t.element_size() for t in tensors.values())
     (model_dir / "model.safetensors.index.json").write_text(
-        json.dumps({
-            "metadata": {"total_size": total_size},
-            "weight_map": {k: shard_name for k in tensors},
-        }),
+        json.dumps(
+            {
+                "metadata": {"total_size": total_size},
+                "weight_map": {k: shard_name for k in tensors},
+            }
+        ),
         encoding="utf-8",
     )
     return model_dir
@@ -206,12 +260,37 @@ def dummy_ple_model(tmp_path):
         },
     }
     (model_dir / "config.json").write_text(json.dumps(config_dict), encoding="utf-8")
+    (model_dir / "generation_config.json").write_text(
+        json.dumps({"max_new_tokens": 32}), encoding="utf-8"
+    )
+    (model_dir / "tokenizer.json").write_text(
+        json.dumps({"version": "1.0", "added_tokens": []}), encoding="utf-8"
+    )
+    (model_dir / "tokenizer_config.json").write_text(
+        json.dumps({"chat_template": "{{ messages }}"}), encoding="utf-8"
+    )
+    # A text-only package must not copy this multimodal preprocessor.
+    (model_dir / "preprocessor_config.json").write_text(
+        json.dumps({"do_resize": True}), encoding="utf-8"
+    )
 
     tensors = {
         "model.embed_tokens.weight": torch.randn(256, hidden, dtype=torch.float16) * 0.02,
         "lm_head.weight": torch.randn(256, hidden, dtype=torch.float16) * 0.02,
-        "model.layers.0.self_attn.q_proj.weight": torch.randn(hidden, hidden, dtype=torch.float16) * 0.02,
-        "model.layers.0.ple.key_proj.weight": torch.randn(hidden, hidden, dtype=torch.float16) * 0.02,
+        "model.layers.0.self_attn.q_proj.weight": torch.randn(hidden, hidden, dtype=torch.float16)
+        * 0.02,
+        "model.layers.0.ple.key_proj.weight": torch.randn(hidden, hidden, dtype=torch.float16)
+        * 0.02,
+        # These are exact hash/index constants, not quantizable model weights.
+        "model.layers.0.ple.ple_embedding.layer_multipliers": torch.tensor(
+            [11, 17, 23], dtype=torch.int64
+        ),
+        "model.layers.0.ple.ple_embedding.ngram_heads_offsets": torch.tensor(
+            [0, 32, 64, 96], dtype=torch.int64
+        ),
+        "model.layers.0.ple.ple_embedding.ngram_heads_vocab_sizes": torch.tensor(
+            [32, 32, 32, 32], dtype=torch.int64
+        ),
     }
     for shard in range(shards):
         tensors[f"model.layers.0.ple.ple_embedding.ngram_embedding.shard_{shard}.weight"] = (
@@ -221,10 +300,14 @@ def dummy_ple_model(tmp_path):
     shard_name = "model-00001-of-00001.safetensors"
     safetensors.torch.save_file(tensors, str(model_dir / shard_name))
     (model_dir / "model.safetensors.index.json").write_text(
-        json.dumps({
-            "metadata": {"total_size": sum(t.numel() * t.element_size() for t in tensors.values())},
-            "weight_map": {k: shard_name for k in tensors},
-        }),
+        json.dumps(
+            {
+                "metadata": {
+                    "total_size": sum(t.numel() * t.element_size() for t in tensors.values())
+                },
+                "weight_map": {k: shard_name for k in tensors},
+            }
+        ),
         encoding="utf-8",
     )
     return model_dir

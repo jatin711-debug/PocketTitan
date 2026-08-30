@@ -8,12 +8,14 @@ looks successful is worse than a hard failure.
 """
 
 import concurrent.futures
+import hashlib
+import json
 import math
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from huggingface_hub import hf_hub_url
+from huggingface_hub import HfApi, hf_hub_url
 from pydantic import BaseModel, Field
 
 from pockettitan.config import TensorAddress
@@ -35,7 +37,9 @@ class ShardScanError(RuntimeError):
 class ScanDiscrepancy(BaseModel):
     """A single mismatch between the scanned headers and the checkpoint index."""
 
-    kind: str = Field(description="Discrepancy class, e.g. 'missing_tensor' or 'total_size_mismatch'")
+    kind: str = Field(
+        description="Discrepancy class, e.g. 'missing_tensor' or 'total_size_mismatch'"
+    )
     detail: str = Field(description="Human-readable description of the mismatch")
 
 
@@ -44,6 +48,9 @@ class ShardHeaderScan(BaseModel):
 
     model_id: str
     is_local: bool
+    source_revision: str = "local"
+    config_sha256: str = ""
+    index_sha256: Optional[str] = None
     config: Dict[str, Any] = Field(default_factory=dict)
     shards: List[str] = Field(default_factory=list)
     tensors: Dict[str, TensorAddress] = Field(default_factory=dict)
@@ -84,6 +91,7 @@ def _read_header(
     is_local: bool,
     headers: Optional[Dict[str, str]],
     retries: int,
+    revision: Optional[str] = None,
 ) -> Tuple[str, Dict[str, Any], int, Optional[str]]:
     """Read one shard header. Returns ``(shard, header, header_bytes, error)``."""
     last_error: Optional[str] = None
@@ -96,7 +104,11 @@ def _read_header(
                     return shard, {}, 0, f"shard file not found: {shard_path}"
                 header, header_bytes = parse_local_safetensors_header(shard_path)
             else:
-                url = hf_hub_url(repo_id=model_id_or_path, filename=shard)
+                url = hf_hub_url(
+                    repo_id=model_id_or_path,
+                    filename=shard,
+                    revision=revision,
+                )
                 header, header_bytes = parse_remote_safetensors_header(url, headers=headers)
             return shard, header, header_bytes, None
         except Exception as exc:  # noqa: BLE001 - surfaced verbatim to the caller
@@ -130,6 +142,7 @@ def scan_checkpoint(
     max_workers: int = 16,
     strict: bool = True,
     retries: int = 3,
+    revision: Optional[str] = None,
 ) -> ShardHeaderScan:
     """Read every shard header and build a complete tensor inventory.
 
@@ -154,9 +167,30 @@ def scan_checkpoint(
     path = Path(model_id_or_path)
     is_local = path.exists() and path.is_dir()
 
-    repo_files = list_repository_files(model_id_or_path, token=token)
-    config = fetch_model_config(model_id_or_path, token=token)
-    index = fetch_model_index(model_id_or_path, available_files=repo_files, token=token)
+    if is_local:
+        resolved_revision = revision or "local"
+    else:
+        info = HfApi(token=token).model_info(model_id_or_path, revision=revision)
+        resolved_revision = info.sha
+        if not resolved_revision:
+            raise ShardScanError(f"Could not resolve immutable revision for {model_id_or_path}")
+
+    repo_files = list_repository_files(
+        model_id_or_path,
+        token=token,
+        revision=None if is_local else resolved_revision,
+    )
+    config = fetch_model_config(
+        model_id_or_path,
+        token=token,
+        revision=None if is_local else resolved_revision,
+    )
+    index = fetch_model_index(
+        model_id_or_path,
+        available_files=repo_files,
+        token=token,
+        revision=None if is_local else resolved_revision,
+    )
     shards = _discover_shards(model_id_or_path, is_local, index, repo_files)
 
     if token and not headers:
@@ -169,7 +203,15 @@ def scan_checkpoint(
     num_workers = min(max_workers, max(1, len(shards)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
         futures = [
-            executor.submit(_read_header, shard, model_id_or_path, is_local, headers, retries)
+            executor.submit(
+                _read_header,
+                shard,
+                model_id_or_path,
+                is_local,
+                headers,
+                retries,
+                None if is_local else resolved_revision,
+            )
             for shard in shards
         ]
         for future in concurrent.futures.as_completed(futures):
@@ -204,6 +246,9 @@ def scan_checkpoint(
     scan = ShardHeaderScan(
         model_id=model_id_or_path,
         is_local=is_local,
+        source_revision=resolved_revision,
+        config_sha256=_canonical_json_sha256(config),
+        index_sha256=_canonical_json_sha256(index) if index is not None else None,
         config=config,
         shards=shards,
         tensors=tensors,
@@ -213,6 +258,12 @@ def scan_checkpoint(
     )
     scan.discrepancies = verify_scan(scan, index, failures)
     return scan
+
+
+def _canonical_json_sha256(value: Dict[str, Any]) -> str:
+    """Stable provenance hash independent of JSON whitespace and key order."""
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def verify_scan(
@@ -236,7 +287,9 @@ def verify_scan(
 
         for name in sorted(declared - observed)[:20]:
             found.append(
-                ScanDiscrepancy(kind="missing_tensor", detail=f"in index but not in headers: {name}")
+                ScanDiscrepancy(
+                    kind="missing_tensor", detail=f"in index but not in headers: {name}"
+                )
             )
         for name in sorted(observed - declared)[:20]:
             found.append(

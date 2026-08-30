@@ -1,9 +1,7 @@
 """Zero-copy memory-mapped local reader and direct HTTP Range tensor slice streaming reader."""
 
-import io
-import math
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 import numpy as np
 import safetensors.torch
 import torch
@@ -11,7 +9,6 @@ from huggingface_hub import hf_hub_url
 
 from pockettitan.config import TensorAddress, UnsupportedSourceDTypeError
 from pockettitan.metadata.safetensors_header import (
-    RedirectRangeHandler,
     fetch_remote_bytes,
 )
 
@@ -103,9 +100,11 @@ class RemoteTensorSliceReader:
         model_id: str,
         token: Optional[str] = None,
         headers: Optional[Dict[str, str]] = None,
+        revision: Optional[str] = None,
     ):
         self.model_id = model_id
         self.token = token
+        self.revision = revision
         self.headers = headers or {}
         if token:
             self.headers["Authorization"] = f"Bearer {token}"
@@ -116,7 +115,11 @@ class RemoteTensorSliceReader:
         chunk_callback: Optional[Callable[[int, int], None]] = None,
     ) -> torch.Tensor:
         """Fetch exact tensor bytes over network using HTTP Range header."""
-        url = hf_hub_url(repo_id=self.model_id, filename=tensor_addr.shard)
+        url = hf_hub_url(
+            repo_id=self.model_id,
+            filename=tensor_addr.shard,
+            revision=self.revision,
+        )
         raw_bytes = fetch_remote_bytes(
             url,
             byte_start=tensor_addr.byte_start,
@@ -137,14 +140,18 @@ class RemoteTensorSliceReader:
         if len(shape) != 2:
             full_t = self.read_tensor(tensor_addr)
             return full_t[row_start:row_end]
-            
+
         out_features, in_features = shape[0], shape[1]
         bytes_per_row = (tensor_addr.size_bytes) // max(1, out_features)
-        
+
         slice_byte_start = tensor_addr.byte_start + (row_start * bytes_per_row)
         slice_byte_end = tensor_addr.byte_start + (row_end * bytes_per_row)
-        
-        url = hf_hub_url(repo_id=self.model_id, filename=tensor_addr.shard)
+
+        url = hf_hub_url(
+            repo_id=self.model_id,
+            filename=tensor_addr.shard,
+            revision=self.revision,
+        )
         raw_bytes = fetch_remote_bytes(
             url,
             byte_start=slice_byte_start,
@@ -163,14 +170,18 @@ class RemoteTensorSliceReader:
         shape = tensor_addr.shape
         if len(shape) != 3:
             raise ValueError(f"read_3d_expert_slice requires a 3D tensor, got shape {shape}")
-            
+
         num_experts, out_feat, in_feat = shape[0], shape[1], shape[2]
         bytes_per_expert = tensor_addr.size_bytes // max(1, num_experts)
-        
+
         expert_byte_start = tensor_addr.byte_start + (expert_idx * bytes_per_expert)
         expert_byte_end = expert_byte_start + bytes_per_expert
-        
-        url = hf_hub_url(repo_id=self.model_id, filename=tensor_addr.shard)
+
+        url = hf_hub_url(
+            repo_id=self.model_id,
+            filename=tensor_addr.shard,
+            revision=self.revision,
+        )
         raw_bytes = fetch_remote_bytes(
             url,
             byte_start=expert_byte_start,
@@ -191,10 +202,10 @@ class RemoteTensorSliceReader:
             raise UnsupportedSourceDTypeError(
                 f"Source tensor has unsupported dtype '{dtype_str}'. Supported dtypes: {list(DTYPE_MAP_NUMPY.keys())}"
             )
-            
+
         np_dtype = DTYPE_MAP_NUMPY[dtype_upper]
         arr = np.frombuffer(raw_bytes, dtype=np_dtype)
-        
+
         if dtype_upper in ["F8_E4M3", "FLOAT8_E4M3FN"]:
             torch_tensor = torch.from_numpy(arr.copy()).view(torch.float8_e4m3fn).to(torch.float16)
         elif dtype_upper in ["F8_E5M2", "FLOAT8_E5M2"]:
@@ -203,5 +214,5 @@ class RemoteTensorSliceReader:
             torch_tensor = torch.from_numpy(arr.copy()).view(torch.bfloat16)
         else:
             torch_tensor = torch.from_numpy(arr.copy())
-            
+
         return torch_tensor.view(*shape)

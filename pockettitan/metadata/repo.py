@@ -4,10 +4,10 @@ import json
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional
 from huggingface_hub import HfApi, hf_hub_url
 
-from pockettitan.config import ModelMetadata, TensorAddress
+from pockettitan.config import ModelMetadata
 from pockettitan.models.adapters import get_model_adapter
 
 
@@ -30,19 +30,21 @@ def _fetch_remote_json(url: str, token: Optional[str] = None) -> Dict[str, Any]:
 def list_repository_files(
     model_id_or_path: str,
     token: Optional[str] = None,
+    revision: Optional[str] = None,
 ) -> List[str]:
     """List all filenames available in a local directory or remote HF repository."""
     path = Path(model_id_or_path)
     if path.exists() and path.is_dir():
         return [p.name for p in path.iterdir()]
-    
+
     api = HfApi(token=token)
-    return api.list_repo_files(repo_id=model_id_or_path)
+    return api.list_repo_files(repo_id=model_id_or_path, revision=revision)
 
 
 def fetch_model_config(
     model_id_or_path: str,
     token: Optional[str] = None,
+    revision: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Fetch config.json from local path or Hugging Face Hub directly into memory."""
     path = Path(model_id_or_path)
@@ -52,8 +54,8 @@ def fetch_model_config(
             raise FileNotFoundError(f"config.json not found in {path}")
         with open(config_path, "r", encoding="utf-8") as f:
             return json.load(f)
-    
-    url = hf_hub_url(repo_id=model_id_or_path, filename="config.json")
+
+    url = hf_hub_url(repo_id=model_id_or_path, filename="config.json", revision=revision)
     return _fetch_remote_json(url, token=token)
 
 
@@ -61,21 +63,26 @@ def fetch_model_index(
     model_id_or_path: str,
     available_files: Optional[List[str]] = None,
     token: Optional[str] = None,
+    revision: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Fetch model.safetensors.index.json if present (for sharded models)."""
     if available_files is None:
-        available_files = list_repository_files(model_id_or_path, token=token)
-        
+        available_files = list_repository_files(model_id_or_path, token=token, revision=revision)
+
     if "model.safetensors.index.json" not in available_files:
         return None
-        
+
     path = Path(model_id_or_path)
     if path.exists() and path.is_dir():
         index_path = path / "model.safetensors.index.json"
         with open(index_path, "r", encoding="utf-8") as f:
             return json.load(f)
-            
-    url = hf_hub_url(repo_id=model_id_or_path, filename="model.safetensors.index.json")
+
+    url = hf_hub_url(
+        repo_id=model_id_or_path,
+        filename="model.safetensors.index.json",
+        revision=revision,
+    )
     try:
         return _fetch_remote_json(url, token=token)
     except Exception:
@@ -91,20 +98,26 @@ def extract_moe_specs(config: Dict[str, Any]) -> Dict[str, Any]:
 def inspect_model_repository(
     model_id_or_path: str,
     token: Optional[str] = None,
+    revision: Optional[str] = None,
 ) -> ModelMetadata:
     """Inspect repository metadata and build complete model descriptor using model adapter."""
-    repo_files = list_repository_files(model_id_or_path, token=token)
-    config = fetch_model_config(model_id_or_path, token=token)
-    index = fetch_model_index(model_id_or_path, available_files=repo_files, token=token)
-    
+    repo_files = list_repository_files(model_id_or_path, token=token, revision=revision)
+    config = fetch_model_config(model_id_or_path, token=token, revision=revision)
+    index = fetch_model_index(
+        model_id_or_path,
+        available_files=repo_files,
+        token=token,
+        revision=revision,
+    )
+
     adapter = get_model_adapter(config)
     dims = adapter.extract_dimensions()
     moe_specs = adapter.extract_moe_topology()
     architecture = adapter.extract_architecture_name()
     source_dtype, is_fp8 = adapter.extract_source_dtype()
-    
+
     shards: List[str] = []
-    
+
     if index and "weight_map" in index:
         tensor_map = index["weight_map"]
         shards = sorted(list(set(tensor_map.values())))
@@ -113,11 +126,11 @@ def inspect_model_repository(
         shards = sorted([f for f in repo_files if f.endswith(".safetensors")])
         if not shards:
             shards = ["model.safetensors"]
-        
+
     total_bytes = index.get("metadata", {}).get("total_size", 0) if index else 0
     bytes_per_elem = 1 if is_fp8 else (4 if "32" in str(source_dtype) else 2)
     total_params = int(total_bytes // bytes_per_elem) if total_bytes > 0 else 0
-    
+
     return ModelMetadata(
         model_id_or_path=model_id_or_path,
         architecture=architecture,

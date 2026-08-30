@@ -29,18 +29,22 @@ from pockettitan.audit.budget import (
 )
 from pockettitan.audit.classify import Capability, Component, classify_all, classify_tensor
 from pockettitan.audit.headers import ShardHeaderScan
-from pockettitan.config import TensorAddress
+from pockettitan.config import QuantMethod, TensorAddress
 from pockettitan.package.format import (
+    CodecSpec,
     PAGE_BYTES,
     SectionSpan,
     align_up,
     DenseTensorEntry,
     ExpertLayout,
+    ExpertRecordEntry,
     ExpertRecordLayout,
     PackageManifest,
     PackageTotals,
     PleIndex,
     PleRowLayout,
+    PleShardMapping,
+    SourceProvenance,
     is_dense_bit_width,
     matrix_dims,
     packed_bytes,
@@ -73,6 +77,7 @@ class DenseWorkItem(BaseModel):
     bits: float
     group_size: int
     symmetric: bool
+    codec_id: str
     packed_bytes: int
     byte_offset: int = 0
     spans: List[SectionSpan] = Field(default_factory=list)
@@ -104,6 +109,7 @@ class PleShardWorkItem(BaseModel):
     address: TensorAddress
     shard_index: int
     first_row: int
+    logical_first_row: int
     num_rows: int
     byte_offset: int
 
@@ -116,12 +122,17 @@ class PlePlan(BaseModel):
     """Row-store geometry plus the source shards that fill it."""
 
     source_layer: int
+    ngram_size: int = 3
     row: PleRowLayout
     total_rows: int
-    declared_rows: int = Field(description="Rows addressable by the hash; the remainder is vocab padding")
+    logical_total_rows: int
+    declared_rows: int = Field(
+        description="Rows addressable by the hash; the remainder is vocab padding"
+    )
     shards: List[PleShardWorkItem] = Field(default_factory=list)
-    index_tensor_names: List[str] = Field(
-        default_factory=list, description="Small int64 tensors the builder must read to emit ple/index.json"
+    index_tensors: List[TensorAddress] = Field(
+        default_factory=list,
+        description="Exact int64 tensors the writer reads to emit ple/index.json",
     )
 
     @property
@@ -144,11 +155,52 @@ class BuildPlan(BaseModel):
         dense = sum(i.address.size_bytes for i in self.dense)
         experts = sum(i.expert_slice.source_bytes for i in self.experts)
         ple = sum(i.address.size_bytes for i in self.ple.shards) if self.ple else 0
-        return dense + experts + ple
+        structural = sum(i.size_bytes for i in self.ple.index_tensors) if self.ple else 0
+        return dense + experts + ple + structural
 
     @property
     def num_work_items(self) -> int:
         return len(self.dense) + len(self.experts) + (len(self.ple.shards) if self.ple else 0)
+
+
+def codec_id_for(component: Component, bits: float, method: QuantMethod) -> str:
+    """Stable ABI codec identifier for one planned component."""
+    if bits >= 16:
+        return "raw.f16.v1"
+    if component is Component.PLE_TABLE:
+        return f"pt.ple.{method.value}.v1"
+    return f"pt.scalar.{method.value}.v1"
+
+
+def codec_spec_for(
+    component: Component,
+    bits: float,
+    group_size: int,
+    symmetric: bool,
+    method: QuantMethod,
+) -> CodecSpec:
+    codec_id = codec_id_for(component, bits, method)
+    if bits >= 16:
+        return CodecSpec(
+            id=codec_id,
+            method="raw",
+            logical_bits=16,
+            storage_bits=16,
+            group_size=-1,
+            symmetric=True,
+            scale_dtype=None,
+            zero_dtype=None,
+            packing_order="native-f16",
+        )
+    return CodecSpec(
+        id=codec_id,
+        method=method.value,
+        logical_bits=bits,
+        storage_bits=storage_bits(bits),
+        group_size=group_size,
+        symmetric=symmetric,
+        zero_dtype=None if symmetric else "float16",
+    )
 
 
 def _quantized_shapes(dense, expert_layout, ple_plan):
@@ -174,6 +226,7 @@ def _ple_shard_index(name: str) -> int:
 def _plan_ple(
     scan: ShardHeaderScan,
     precision_map: PrecisionMap,
+    build_profile: str,
 ) -> Optional[PlePlan]:
     """Lay out the n-gram row store and order its source shards."""
     geometry = infer_ple_geometry(scan)
@@ -181,7 +234,7 @@ def _plan_ple(
         return None
 
     table_tensors: List[TensorAddress] = []
-    index_names: List[str] = []
+    index_tensors: List[TensorAddress] = []
     source_layer = -1
 
     for address in scan.tensors.values():
@@ -190,7 +243,7 @@ def _plan_ple(
             table_tensors.append(address)
             source_layer = layer_index(address.name) if source_layer < 0 else source_layer
         elif component is Component.PLE_PROJ and address.dtype.upper().startswith("I"):
-            index_names.append(address.name)
+            index_tensors.append(address)
 
     if not table_tensors:
         return None
@@ -205,31 +258,46 @@ def _plan_ple(
         symmetric=entry.symmetric,
     )
 
-    shards: List[PleShardWorkItem] = []
-    cursor_rows = 0
+    logical_rows = []
+    logical_cursor = 0
     for address in table_tensors:
+        logical_rows.append((address, logical_cursor))
+        logical_cursor += address.shape[0]
+
+    if build_profile == "canary":
+        selected_indices = {0, len(table_tensors) - 1}
+        logical_rows = [
+            item for index, item in enumerate(logical_rows) if index in selected_indices
+        ]
+
+    shards: List[PleShardWorkItem] = []
+    physical_cursor = 0
+    for address, logical_first_row in logical_rows:
         rows = address.shape[0]
         shards.append(
             PleShardWorkItem(
                 address=address,
                 shard_index=_ple_shard_index(address.name),
-                first_row=cursor_rows,
+                first_row=physical_cursor,
+                logical_first_row=logical_first_row,
                 num_rows=rows,
-                byte_offset=row.row_offset(cursor_rows),
+                byte_offset=row.row_offset(physical_cursor),
             )
         )
-        cursor_rows += rows
+        physical_cursor += rows
 
     cfg = text_config(scan.config)
     declared = int(cfg.get("ngram_vocab_size_base", 0) or 0) * geometry.num_heads
 
     return PlePlan(
         source_layer=source_layer if source_layer >= 0 else 0,
+        ngram_size=int(cfg.get("ngram_size", 3) or 3),
         row=row,
-        total_rows=cursor_rows,
-        declared_rows=declared or cursor_rows,
+        total_rows=physical_cursor,
+        logical_total_rows=logical_cursor,
+        declared_rows=declared or logical_cursor,
         shards=shards,
-        index_tensor_names=sorted(index_names),
+        index_tensors=sorted(index_tensors, key=lambda item: item.name),
     )
 
 
@@ -237,6 +305,8 @@ def _plan_experts(
     scan: ShardHeaderScan,
     precision_map: PrecisionMap,
     alignment: int,
+    quant_method: QuantMethod,
+    build_profile: str,
 ) -> tuple:
     """Build expert slices and the shared record layout.
 
@@ -250,6 +320,17 @@ def _plan_experts(
     if not slices:
         return [], None
 
+    sparse_canary = build_profile == "canary"
+    if sparse_canary:
+        all_layers = sorted({item.layer for item in slices})
+        selected_layers = {all_layers[0], all_layers[-1]}
+        selected_experts = {0, geometry.num_experts // 2 - 1, geometry.num_experts - 1}
+        slices = [
+            item
+            for item in slices
+            if item.layer in selected_layers and item.expert in selected_experts
+        ]
+
     signature = projection_signature(slices)
     entry = precision_map.entry_for(Component.EXPERTS_ROUTED)
     record = ExpertRecordLayout.build(
@@ -260,6 +341,7 @@ def _plan_experts(
                 "bits": entry.bits,
                 "group_size": entry.group_size,
                 "symmetric": entry.symmetric,
+                "codec_id": codec_id_for(Component.EXPERTS_ROUTED, entry.bits, quant_method),
             }
             for s in signature
         ],
@@ -267,11 +349,25 @@ def _plan_experts(
     )
 
     layers = sorted({s.layer for s in slices})
+    records = (
+        [
+            ExpertRecordEntry(
+                record_index=index,
+                layer=item.layer,
+                expert=item.expert,
+                byte_offset=record.record_offset(index),
+            )
+            for index, item in enumerate(slices)
+        ]
+        if sparse_canary
+        else []
+    )
     layout = ExpertLayout(
         num_layers=len(layers),
         num_experts=geometry.num_experts,
         layers=layers,
         record=record,
+        records=records,
     )
 
     items = [
@@ -292,6 +388,9 @@ def plan_package(
     expert_alignment: int = PAGE_BYTES,
     pockettitan_version: str = "",
     source_revision: Optional[str] = None,
+    quant_method: QuantMethod = QuantMethod.RTN,
+    build_profile: str = "full",
+    complete_model: bool = True,
 ) -> BuildPlan:
     """Compute the full package layout without reading any weights.
 
@@ -308,15 +407,31 @@ def plan_package(
         PlanError: If the checkpoint cannot be packaged unambiguously.
     """
     precision_map = precision_map or PrecisionMap.pt_q4e()
+    if build_profile not in {"canary", "full"}:
+        raise PlanError(f"unknown build profile {build_profile!r}; expected 'canary' or 'full'")
+    if build_profile == "canary":
+        complete_model = False
     enabled = set(features)
     breakdown = classify_all(scan.tensors)
 
     try:
-        expert_items, expert_layout = _plan_experts(scan, precision_map, expert_alignment)
+        expert_items, expert_layout = _plan_experts(
+            scan,
+            precision_map,
+            expert_alignment,
+            quant_method,
+            build_profile,
+        )
     except SliceError as exc:
         raise PlanError(str(exc)) from exc
 
-    ple_plan = _plan_ple(scan, precision_map)
+    ple_plan = _plan_ple(scan, precision_map, build_profile)
+    if ple_plan is not None:
+        ple_plan.row.codec_id = codec_id_for(
+            Component.PLE_TABLE,
+            ple_plan.row.bits,
+            quant_method,
+        )
 
     dense: List[DenseWorkItem] = []
     dropped_params = 0
@@ -326,6 +441,10 @@ def plan_package(
             dropped_params += address.num_params
             continue
         if rule.component in (Component.EXPERTS_ROUTED, Component.PLE_TABLE):
+            continue
+        if ple_plan is not None and any(
+            address.name == item.name for item in ple_plan.index_tensors
+        ):
             continue
 
         entry = precision_map.entry_for(rule.component)
@@ -337,10 +456,17 @@ def plan_package(
                 bits=entry.bits,
                 group_size=entry.group_size,
                 symmetric=entry.symmetric,
+                codec_id=codec_id_for(rule.component, entry.bits, quant_method),
                 packed_bytes=sum(s.length for s in spans),
                 spans=spans,
             )
         )
+
+    if build_profile == "canary":
+        representatives = {}
+        for item in sorted(dense, key=lambda candidate: candidate.address.name):
+            representatives.setdefault(item.component, item)
+        dense = list(representatives.values())
 
     # Deterministic order, then contiguous 64-byte-aligned addresses in the blob.
     dense.sort(key=lambda i: i.address.name)
@@ -367,7 +493,9 @@ def plan_package(
             f"so it is stored {waste:.2f}x larger. Set group_size to a divisor of {in_features}."
         )
 
-    for component in sorted({i.component for i in dense} | {Component.EXPERTS_ROUTED, Component.PLE_TABLE}):
+    for component in sorted(
+        {i.component for i in dense} | {Component.EXPERTS_ROUTED, Component.PLE_TABLE}
+    ):
         bits = precision_map.entry_for(component).bits
         if bits < 16 and not is_dense_bit_width(bits):
             warnings.append(
@@ -379,12 +507,43 @@ def plan_package(
     activation = build_activation_budget(scan, breakdown, features)
     expert_entry = precision_map.entry_for(Component.EXPERTS_ROUTED)
 
+    codecs: Dict[str, CodecSpec] = {}
+    for item in dense:
+        spec = codec_spec_for(
+            item.component,
+            item.bits,
+            item.group_size,
+            item.symmetric,
+            quant_method,
+        )
+        codecs[spec.id] = spec
+    if expert_layout is not None:
+        spec = codec_spec_for(
+            Component.EXPERTS_ROUTED,
+            expert_entry.bits,
+            expert_entry.group_size,
+            expert_entry.symmetric,
+            quant_method,
+        )
+        codecs[spec.id] = spec
+    if ple_plan is not None:
+        ple_entry = precision_map.entry_for(Component.PLE_TABLE)
+        spec = codec_spec_for(
+            Component.PLE_TABLE,
+            ple_entry.bits,
+            ple_plan.row.group_size,
+            ple_entry.symmetric,
+            quant_method,
+        )
+        codecs[spec.id] = spec
+
     totals = PackageTotals(
         source_params=scan.total_params,
         packaged_params=(
             sum(i.address.num_params for i in dense)
             + sum(i.expert_slice.num_params for i in expert_items)
             + (sum(s.address.num_params for s in ple_plan.shards) if ple_plan else 0)
+            + (sum(s.num_params for s in ple_plan.index_tensors) if ple_plan else 0)
         ),
         dropped_params=dropped_params,
         dense_bytes=dense_bytes,
@@ -396,8 +555,16 @@ def plan_package(
         pockettitan_version=pockettitan_version,
         created_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         source_model=scan.model_id,
-        source_revision=source_revision,
+        source_revision=source_revision or scan.source_revision,
+        source=SourceProvenance(
+            repository=scan.model_id,
+            revision=source_revision or scan.source_revision,
+            config_sha256=scan.config_sha256,
+            index_sha256=scan.index_sha256,
+        ),
         architecture=(scan.config.get("architectures") or [""])[0],
+        build_profile=build_profile,
+        complete_model=complete_model,
         features=[c.value for c in features],
         precision_map_name=precision_map.name,
         precision_map={
@@ -409,6 +576,7 @@ def plan_package(
             }
             for component in breakdown.stats
         },
+        codecs=codecs,
         totals=totals,
         dense=[
             DenseTensorEntry(
@@ -418,6 +586,7 @@ def plan_package(
                 bits=i.bits,
                 group_size=i.group_size,
                 symmetric=i.symmetric,
+                codec_id=i.codec_id,
                 num_params=i.address.num_params,
                 packed_bytes=i.packed_bytes,
                 byte_offset=i.byte_offset,
@@ -459,23 +628,37 @@ def build_ple_index(
             f"({len(head_vocab_sizes)}) disagree"
         )
     if len(layer_multipliers) < ngram_size:
+        raise PlanError(f"need {ngram_size} hash multipliers, got {len(layer_multipliers)}")
+    num_orders = ngram_size - 1
+    if num_orders <= 0 or len(head_offsets) % num_orders:
         raise PlanError(
-            f"need {ngram_size} hash multipliers, got {len(layer_multipliers)}"
+            f"{len(head_offsets)} PLE heads cannot be divided across bigram..{ngram_size}-gram orders"
         )
 
     addressable = head_offsets[-1] + head_vocab_sizes[-1]
-    if addressable > plan.total_rows:
+    if addressable > plan.logical_total_rows:
         raise PlanError(
-            f"hash addresses {addressable:,} rows but the table holds {plan.total_rows:,}"
+            f"hash addresses {addressable:,} rows but the table holds {plan.logical_total_rows:,}"
         )
 
     return PleIndex(
         ngram_size=ngram_size,
         num_heads=len(head_offsets),
+        heads_per_ngram=len(head_offsets) // num_orders,
         head_offsets=list(head_offsets),
         head_vocab_sizes=list(head_vocab_sizes),
         layer_multipliers=list(layer_multipliers)[:ngram_size],
-        total_rows=plan.total_rows,
+        total_rows=plan.logical_total_rows,
+        physical_rows=plan.total_rows,
+        shards=[
+            PleShardMapping(
+                shard_index=shard.shard_index,
+                logical_first_row=shard.logical_first_row,
+                physical_first_row=shard.first_row,
+                num_rows=shard.num_rows,
+            )
+            for shard in plan.shards
+        ],
         row=plan.row,
         source_layer=plan.source_layer,
     )

@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
-PACKAGE_VERSION = "1.0"
+PACKAGE_VERSION = "1.1"
 PAGE_BYTES = 4096
 
 MANIFEST_NAME = "manifest.json"
@@ -36,10 +36,71 @@ DENSE_DIR = "dense"
 EXPERTS_DIR = "experts"
 PLE_DIR = "ple"
 TOKENIZER_DIR = "tokenizer"
+METADATA_DIR = "metadata"
+INTEGRITY_DIR = "integrity"
 EXPERT_BANK_NAME = "bank.bin"
 EXPERT_LAYOUT_NAME = "layout.json"
 PLE_TABLE_NAME = "table.bin"
 PLE_INDEX_NAME = "index.json"
+CHECKSUMS_NAME = "checksums.json"
+
+
+class CodecSpec(BaseModel):
+    """Self-contained description of a binary weight codec.
+
+    Runtime code must be able to choose a decoder from this descriptor without
+    importing the Python quantizer implementation that produced the package.
+    """
+
+    id: str
+    version: int = 1
+    method: str
+    logical_bits: float
+    storage_bits: float
+    block_size: int = 1
+    group_size: int = -1
+    symmetric: bool = False
+    scale_dtype: Optional[str] = "float16"
+    zero_dtype: Optional[str] = "float16"
+    byte_order: str = "little"
+    packing_order: str = "least-significant-first"
+
+
+class SourceProvenance(BaseModel):
+    """Immutable source identity for a resumable package build."""
+
+    repository: str
+    revision: str
+    config_sha256: str
+    index_sha256: Optional[str] = None
+
+
+class RegionIntegrity(BaseModel):
+    """Expected and observed integrity metadata for one package region."""
+
+    path: str
+    size_bytes: int
+    sha256: Optional[str] = None
+
+
+class ItemChecksum(BaseModel):
+    """Checksum and address metadata for one independently committed item."""
+
+    algorithm: str = "crc32c"
+    value: str
+    offset: Optional[int] = None
+    length: int
+    first_row: Optional[int] = None
+    num_rows: Optional[int] = None
+
+
+class PackageChecksums(BaseModel):
+    """Per-item integrity index emitted after all durable batches commit."""
+
+    version: int = 1
+    dense: Dict[str, ItemChecksum] = Field(default_factory=dict)
+    experts: Dict[str, ItemChecksum] = Field(default_factory=dict)
+    ple: Dict[str, ItemChecksum] = Field(default_factory=dict)
 
 
 class Section(str, Enum):
@@ -154,6 +215,7 @@ class ProjectionLayout(BaseModel):
     bits: float
     group_size: int
     symmetric: bool
+    codec_id: str = "pt.scalar.rtn.v1"
     offset: int = Field(description="Start of this projection within the record")
     spans: List[SectionSpan] = Field(default_factory=list)
 
@@ -225,6 +287,7 @@ class ExpertRecordLayout(BaseModel):
             bits = float(spec["bits"])
             group_size = int(spec["group_size"])
             symmetric = bool(spec.get("symmetric", False))
+            codec_id = str(spec.get("codec_id", "pt.scalar.rtn.v1"))
             spans = section_spans(shape, bits, group_size, symmetric, scale_bytes, zero_bytes)
             offset = sum(sp.length for sp in spans)
 
@@ -235,6 +298,7 @@ class ExpertRecordLayout(BaseModel):
                     bits=bits,
                     group_size=group_size,
                     symmetric=symmetric,
+                    codec_id=codec_id,
                     offset=cursor,
                     spans=spans,
                 )
@@ -263,17 +327,32 @@ class ExpertRecordLayout(BaseModel):
         return self.record_offset(record_index) + proj.offset + span.offset
 
 
+class ExpertRecordEntry(BaseModel):
+    """Explicit logical-to-physical expert mapping used by sparse canary packages."""
+
+    record_index: int
+    layer: int
+    expert: int
+    byte_offset: int
+
+
 class ExpertLayout(BaseModel):
     """Index over the expert bank: ``(layer, expert) -> record``."""
 
     num_layers: int
     num_experts: int
-    layers: List[int] = Field(default_factory=list, description="Source layer indices, in bank order")
+    layers: List[int] = Field(
+        default_factory=list, description="Source layer indices, in bank order"
+    )
     record: ExpertRecordLayout = Field(default_factory=ExpertRecordLayout)
+    records: List[ExpertRecordEntry] = Field(
+        default_factory=list,
+        description="Explicit sparse mapping; empty means the full layer-major Cartesian layout",
+    )
 
     @property
     def num_records(self) -> int:
-        return len(self.layers) * self.num_experts
+        return len(self.records) if self.records else len(self.layers) * self.num_experts
 
     @property
     def total_bytes(self) -> int:
@@ -281,6 +360,11 @@ class ExpertLayout(BaseModel):
 
     def record_index(self, layer: int, expert: int) -> int:
         """Bank slot for one expert. Layer-major, so a layer's experts are adjacent."""
+        if self.records:
+            for entry in self.records:
+                if entry.layer == layer and entry.expert == expert:
+                    return entry.record_index
+            raise KeyError(f"Expert ({layer}, {expert}) is not present in this sparse package")
         try:
             position = self.layers.index(layer)
         except ValueError as exc:
@@ -309,6 +393,7 @@ class PleRowLayout(BaseModel):
     bits: float
     group_size: int
     symmetric: bool = True
+    codec_id: str = "pt.ple.rtn.v1"
     payload_bytes: int = 0
     rows_per_page: int = 1
     page_bytes: int = PAGE_BYTES
@@ -323,12 +408,15 @@ class PleRowLayout(BaseModel):
         scale_bytes: int = 2,
         zero_bytes: int = 2,
         page_bytes: int = PAGE_BYTES,
+        codec_id: str = "pt.ple.rtn.v1",
     ) -> "PleRowLayout":
         # A group must never span rows: each row has to decode independently.
         group_size = min(group_size, row_width) if group_size > 0 else row_width
         payload = sum(
             span.length
-            for span in section_spans([1, row_width], bits, group_size, symmetric, scale_bytes, zero_bytes)
+            for span in section_spans(
+                [1, row_width], bits, group_size, symmetric, scale_bytes, zero_bytes
+            )
         )
 
         if payload > page_bytes:
@@ -343,6 +431,7 @@ class PleRowLayout(BaseModel):
             bits=bits,
             group_size=group_size,
             symmetric=symmetric,
+            codec_id=codec_id,
             payload_bytes=payload,
             rows_per_page=rows_per_page,
             page_bytes=page_bytes,
@@ -365,6 +454,15 @@ class PleRowLayout(BaseModel):
         return pages * self.page_bytes
 
 
+class PleShardMapping(BaseModel):
+    """Logical source rows mapped into a compact physical PLE table."""
+
+    shard_index: int
+    logical_first_row: int
+    physical_first_row: int
+    num_rows: int
+
+
 class PleIndex(BaseModel):
     """Everything needed to resolve a token n-gram to table rows.
 
@@ -374,28 +472,52 @@ class PleIndex(BaseModel):
 
     ngram_size: int
     num_heads: int
+    heads_per_ngram: int = Field(
+        description="Number of independently hashed heads for each order from bigram through ngram_size"
+    )
     head_offsets: List[int] = Field(description="Cumulative row offset per head")
     head_vocab_sizes: List[int] = Field(description="Per-head hash modulus (distinct primes)")
     layer_multipliers: List[int] = Field(description="Hash constants, one per n-gram position")
-    total_rows: int
+    total_rows: int = Field(description="Logical source-table row count")
+    physical_rows: int = Field(description="Rows physically included in this package")
+    shards: List["PleShardMapping"] = Field(default_factory=list)
     row: PleRowLayout
     source_layer: int = Field(description="Layer index the PLE block belongs to")
 
     @property
     def total_bytes(self) -> int:
-        return self.row.bytes_for(self.total_rows)
+        return self.row.bytes_for(self.physical_rows)
+
+    def physical_row_id(self, logical_row_id: int) -> int:
+        """Translate a logical hash row to the compact package row address."""
+        for shard in self.shards:
+            if shard.logical_first_row <= logical_row_id < shard.logical_first_row + shard.num_rows:
+                return shard.physical_first_row + (logical_row_id - shard.logical_first_row)
+        raise KeyError(f"logical PLE row {logical_row_id} is not present in this package")
 
     def row_id(self, head: int, tokens: List[int]) -> int:
         """Resolve one head's row for an n-gram of token ids.
 
-        Mirrors the reference implementation: a multiplicative-XOR hash reduced
-        modulo this head's prime, biased by the head's row offset.
+        Mirrors Qwen4ExpTextNGramEmbedding: the first ``heads_per_ngram``
+        heads hash bigrams, the next group hashes trigrams, and so on. Hash
+        position zero is the current token, followed by previous tokens.
+        Arithmetic wraps as signed int64 before ``remainder``.
         """
         if head < 0 or head >= self.num_heads:
             raise IndexError(f"head {head} out of range [0, {self.num_heads})")
+        ngram_order = 2 + head // self.heads_per_ngram
+        if len(tokens) < ngram_order:
+            raise ValueError(f"head {head} requires {ngram_order} tokens, got {len(tokens)}")
+
+        def signed_int64(value: int) -> int:
+            value &= 0xFFFFFFFFFFFFFFFF
+            return value - (1 << 64) if value >= (1 << 63) else value
+
+        current_first = reversed(tokens[-ngram_order:])
         acc = 0
-        for position, token in enumerate(tokens[-self.ngram_size:]):
-            acc ^= (token * self.layer_multipliers[position]) & 0xFFFFFFFFFFFFFFFF
+        for position, token in enumerate(current_first):
+            product = signed_int64(token * self.layer_multipliers[position])
+            acc = signed_int64(acc ^ product)
         return self.head_offsets[head] + (acc % self.head_vocab_sizes[head])
 
     def row_ids(self, tokens: List[int]) -> List[int]:
@@ -412,6 +534,7 @@ class DenseTensorEntry(BaseModel):
     bits: float
     group_size: int
     symmetric: bool
+    codec_id: str = "pt.scalar.rtn.v1"
     num_params: int
     packed_bytes: int
     byte_offset: int = 0
@@ -456,11 +579,16 @@ class PackageManifest(BaseModel):
 
     source_model: str
     source_revision: Optional[str] = None
+    source: Optional[SourceProvenance] = None
     architecture: str = ""
+    build_profile: str = "full"
+    complete_model: bool = True
 
     features: List[str] = Field(default_factory=list)
     precision_map_name: str = ""
     precision_map: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+    codecs: Dict[str, CodecSpec] = Field(default_factory=dict)
+    regions: Dict[str, RegionIntegrity] = Field(default_factory=dict)
 
     totals: PackageTotals = Field(default_factory=PackageTotals)
     dense: List[DenseTensorEntry] = Field(default_factory=list)

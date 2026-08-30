@@ -8,6 +8,8 @@ per-record accounting must agree exactly with the R0 audit's amortized
 if they disagree one of them is wrong.
 """
 
+import random
+
 import pytest
 
 from pockettitan.audit import (
@@ -36,16 +38,16 @@ from pockettitan.package import (
 )
 
 # --- Ground truth for the PT-Q4E package ----------------------------------- #
-EXPERT_RECORD_PAYLOAD = 2_611_200        # 2.49 MiB, one contiguous read
-EXPERT_RECORD_STRIDE = 2_613_248         # page-aligned
+EXPERT_RECORD_PAYLOAD = 2_611_200  # 2.49 MiB, one contiguous read
+EXPERT_RECORD_STRIDE = 2_613_248  # page-aligned
 NUM_EXPERT_RECORDS = 24_576
 EXPERT_BANK_BYTES = 64_223_182_848
-AUDIT_EXPERT_BYTES = 64_172_851_200      # R0's independent estimate
+AUDIT_EXPERT_BYTES = 64_172_851_200  # R0's independent estimate
 PLE_TOTAL_ROWS = 320_001_536
-PLE_ROW_PAYLOAD = 82          # 160 weights at 4 storage bits + one fp16 scale
+PLE_ROW_PAYLOAD = 82  # 160 weights at 4 storage bits + one fp16 scale
 PLE_ROWS_PER_PAGE = 49
 PLE_TABLE_BYTES = 26_749_517_824
-DROPPED_PARAMS = 3_056_081_904           # vision + MTP
+DROPPED_PARAMS = 3_056_081_904  # vision + MTP
 
 
 @pytest.fixture(scope="module")
@@ -56,6 +58,7 @@ def qwen_plan(qwen_scan):
 # --------------------------------------------------------------------------- #
 # Expert record layout
 # --------------------------------------------------------------------------- #
+
 
 def test_expert_record_layout(qwen_plan):
     layout = qwen_plan.manifest.expert_layout
@@ -130,7 +133,11 @@ def test_section_offsets_are_contiguous(qwen_plan):
         for span in projection.spans:
             assert span.offset == cursor
             cursor += span.length
-        assert {s.section for s in projection.spans} == {Section.PACKED, Section.SCALES, Section.ZEROS}
+        assert {s.section for s in projection.spans} == {
+            Section.PACKED,
+            Section.SCALES,
+            Section.ZEROS,
+        }
 
 
 def test_symmetric_projection_has_no_zeros():
@@ -153,6 +160,7 @@ def test_fp16_projection_has_no_quant_metadata():
 # PLE row store
 # --------------------------------------------------------------------------- #
 
+
 def test_ple_row_layout(qwen_plan):
     ple = qwen_plan.ple
     assert ple is not None
@@ -167,8 +175,15 @@ def test_ple_row_layout(qwen_plan):
 def test_ple_rows_never_straddle_a_page(qwen_plan):
     """A row that spans two pages doubles the cost of every lookup."""
     row = qwen_plan.ple.row
-    boundaries = (0, 1, PLE_ROWS_PER_PAGE - 1, PLE_ROWS_PER_PAGE, PLE_ROWS_PER_PAGE + 1,
-                  2 * PLE_ROWS_PER_PAGE, PLE_TOTAL_ROWS - 1)
+    boundaries = (
+        0,
+        1,
+        PLE_ROWS_PER_PAGE - 1,
+        PLE_ROWS_PER_PAGE,
+        PLE_ROWS_PER_PAGE + 1,
+        2 * PLE_ROWS_PER_PAGE,
+        PLE_TOTAL_ROWS - 1,
+    )
     for row_id in boundaries:
         start = row.row_offset(row_id)
         assert start // PAGE_BYTES == (start + row.payload_bytes - 1) // PAGE_BYTES
@@ -176,12 +191,15 @@ def test_ple_rows_never_straddle_a_page(qwen_plan):
     assert row.waste_fraction < 0.02
 
 
-@pytest.mark.parametrize("width,bits,expected_payload", [
-    (160, 4, 82),      # 80 packed + 2 scale
-    (160, 3, 82),      # 3-bit stores as 4-bit
-    (160, 2, 42),
-    (256, 8, 258),
-])
+@pytest.mark.parametrize(
+    "width,bits,expected_payload",
+    [
+        (160, 4, 82),  # 80 packed + 2 scale
+        (160, 3, 82),  # 3-bit stores as 4-bit
+        (160, 2, 42),
+        (256, 8, 258),
+    ],
+)
 def test_ple_row_packing(width, bits, expected_payload):
     row = PleRowLayout.build(width, bits, group_size=width, symmetric=True)
     assert row.payload_bytes == expected_payload
@@ -207,8 +225,22 @@ def test_ple_shards_tile_the_table_without_gaps(qwen_plan):
 def test_ple_index_hash_and_padding(qwen_plan):
     """Rebuild the index with the real constants and check the hash is sane."""
     head_vocab = [
-        20000003, 20000023, 20000033, 20000047, 20000059, 20000063, 20000069, 20000077,
-        20000081, 20000093, 20000107, 20000147, 20000153, 20000159, 20000161, 20000171,
+        20000003,
+        20000023,
+        20000033,
+        20000047,
+        20000059,
+        20000063,
+        20000069,
+        20000077,
+        20000081,
+        20000093,
+        20000107,
+        20000147,
+        20000153,
+        20000159,
+        20000161,
+        20000171,
     ]
     head_offsets = [0]
     for size in head_vocab[:-1]:
@@ -217,6 +249,7 @@ def test_ple_index_hash_and_padding(qwen_plan):
 
     index = build_ple_index(qwen_plan.ple, 3, head_offsets, head_vocab, multipliers)
     assert index.num_heads == 16
+    assert index.heads_per_ngram == 8
     assert index.total_rows == PLE_TOTAL_ROWS
 
     rows = index.row_ids([101, 202, 303])
@@ -233,18 +266,95 @@ def test_ple_index_hash_and_padding(qwen_plan):
     assert index.total_rows - addressable == 90, "vocab padding to a multiple of 128"
 
 
+def test_ple_hash_matches_pinned_transformers_reference_for_1000_ngrams(qwen_plan):
+    """Independent parity with Qwen4ExpTextNGramEmbedding.forward.
+
+    Reference pinned from Hugging Face Transformers' Qwen4-Exp implementation
+    and checkpoint revision de4b8e4d43b917e7706784d8bb445c9af86a3540.
+    """
+    head_vocab = [
+        20000003,
+        20000023,
+        20000033,
+        20000047,
+        20000059,
+        20000063,
+        20000069,
+        20000077,
+        20000081,
+        20000093,
+        20000107,
+        20000147,
+        20000153,
+        20000159,
+        20000161,
+        20000171,
+    ]
+    head_offsets = [
+        0,
+        20000003,
+        40000026,
+        60000059,
+        80000106,
+        100000165,
+        120000228,
+        140000297,
+        160000374,
+        180000455,
+        200000548,
+        220000655,
+        240000802,
+        260000955,
+        280001114,
+        300001275,
+    ]
+    multipliers = [23703573157769, 20109073645365, 8052911324071]
+    index = build_ple_index(qwen_plan.ple, 3, head_offsets, head_vocab, multipliers)
+
+    mask = (1 << 64) - 1
+
+    def signed_int64(value):
+        value &= mask
+        return value - (1 << 64) if value >= (1 << 63) else value
+
+    def reference(tokens):
+        result = []
+        for ngram_order in (2, 3):
+            mixed = signed_int64(tokens[-1] * multipliers[0])
+            for position in range(1, ngram_order):
+                product = signed_int64(tokens[-1 - position] * multipliers[position])
+                mixed = signed_int64(mixed ^ product)
+            start = (ngram_order - 2) * 8
+            for head in range(start, start + 8):
+                result.append(head_offsets[head] + mixed % head_vocab[head])
+        return result
+
+    generator = random.Random(0x50C4E7)
+    for _ in range(1_000):
+        tokens = [generator.randrange(248_320) for _ in range(3)]
+        assert index.row_ids(tokens) == reference(tokens)
+
+    # First-order head groups are intentionally different: changing the oldest
+    # token affects trigram heads but cannot affect bigram heads.
+    original = index.row_ids([11, 22, 33])
+    changed = index.row_ids([44, 22, 33])
+    assert original[:8] == changed[:8]
+    assert original[8:] != changed[8:]
+
+
 def test_build_ple_index_rejects_inconsistent_tables(qwen_plan):
     with pytest.raises(PlanError, match="disagree"):
         build_ple_index(qwen_plan.ple, 3, [0, 10], [10], [1, 2, 3])
     with pytest.raises(PlanError, match="multipliers"):
         build_ple_index(qwen_plan.ple, 3, [0], [10], [1])
     with pytest.raises(PlanError, match="table holds"):
-        build_ple_index(qwen_plan.ple, 3, [0], [10**12], [1, 2, 3])
+        build_ple_index(qwen_plan.ple, 3, [0, 10], [10, 10**12], [1, 2, 3])
 
 
 # --------------------------------------------------------------------------- #
 # Capability filtering and totals
 # --------------------------------------------------------------------------- #
+
 
 def test_capability_filter_drops_vision_and_mtp(qwen_plan):
     names = {item.address.name for item in qwen_plan.dense}
@@ -259,6 +369,61 @@ def test_dense_excludes_cold_tier_components(qwen_plan):
     assert Component.PLE_TABLE not in components
     assert Component.ROUTER in components
     assert Component.GDN_ATTN in components
+
+
+def test_ple_structural_metadata_is_not_quantized(qwen_plan):
+    structural = {
+        "layer_multipliers",
+        "ngram_heads_offsets",
+        "ngram_heads_vocab_sizes",
+    }
+    dense_names = {item.address.name for item in qwen_plan.dense}
+    index_names = {item.name.rsplit(".", 1)[-1] for item in qwen_plan.ple.index_tensors}
+    assert index_names == structural
+    assert not any(name.rsplit(".", 1)[-1] in structural for name in dense_names)
+
+
+def test_canary_profile_is_compact_and_deterministic(qwen_scan):
+    canary = plan_package(
+        qwen_scan,
+        precision_map=PrecisionMap.pt_q4e(),
+        build_profile="canary",
+    )
+
+    assert canary.manifest.build_profile == "canary"
+    assert not canary.manifest.complete_model
+
+    # One lexicographically stable representative per dense component.
+    dense_components = [item.component for item in canary.dense]
+    assert len(dense_components) == len(set(dense_components))
+
+    assert {(item.layer, item.expert) for item in canary.experts} == {
+        (0, 0),
+        (0, 255),
+        (0, 511),
+        (47, 0),
+        (47, 255),
+        (47, 511),
+    }
+    layout = canary.manifest.expert_layout
+    assert layout.num_records == 6
+    assert [entry.record_index for entry in layout.records] == list(range(6))
+    assert [entry.byte_offset for entry in layout.records] == [
+        index * layout.record.stride for index in range(6)
+    ]
+
+    assert [item.shard_index for item in canary.ple.shards] == [0, 127]
+    assert canary.ple.total_rows < canary.ple.logical_total_rows
+    assert canary.manifest.totals.ple_bytes == canary.ple.row.bytes_for(canary.ple.total_rows)
+    assert (
+        canary.source_read_bytes
+        < plan_package(qwen_scan, precision_map=PrecisionMap.pt_q4e()).source_read_bytes
+    )
+
+
+def test_unknown_build_profile_is_rejected(qwen_scan):
+    with pytest.raises(PlanError, match="unknown build profile"):
+        plan_package(qwen_scan, build_profile="nightly")
 
 
 def test_routers_stay_fp16_in_the_plan(qwen_plan):
@@ -315,6 +480,7 @@ def test_plan_with_vision_keeps_vision(qwen_scan):
 # Expert slicing
 # --------------------------------------------------------------------------- #
 
+
 def test_slices_cover_every_expert(qwen_scan):
     slices = build_expert_slices(qwen_scan.tensors, num_experts=512)
     assert len(slices) == NUM_EXPERT_RECORDS
@@ -332,7 +498,8 @@ def test_slices_are_contiguous_and_disjoint_within_a_bank(qwen_scan):
         assert current.byte_start == previous.byte_end
 
     bank = next(
-        t for t in qwen_scan.tensors.values()
+        t
+        for t in qwen_scan.tensors.values()
         if t.name == "model.language_model.layers.0.mlp.experts.gate_up_proj"
     )
     assert gate_up[0].byte_start == bank.byte_start
@@ -343,9 +510,13 @@ def test_slices_are_contiguous_and_disjoint_within_a_bank(qwen_scan):
 def test_slice_expert_from_bank_rejects_wrong_topology():
     bank = TensorAddress(
         name="model.layers.0.mlp.experts.gate_up_proj",
-        shard="s.safetensors", dtype="BF16", shape=[512, 8, 4],
-        byte_start=100, byte_end=100 + 512 * 8 * 4 * 2,
-        num_params=512 * 8 * 4, size_bytes=512 * 8 * 4 * 2,
+        shard="s.safetensors",
+        dtype="BF16",
+        shape=[512, 8, 4],
+        byte_start=100,
+        byte_end=100 + 512 * 8 * 4 * 2,
+        num_params=512 * 8 * 4,
+        size_bytes=512 * 8 * 4 * 2,
     )
     assert slice_expert_from_bank(bank, 0, 512).byte_start == 100
     with pytest.raises(SliceError, match="declares 256 experts"):
@@ -357,8 +528,13 @@ def test_slice_expert_from_bank_rejects_wrong_topology():
 def test_slice_expert_from_bank_rejects_non_bank_tensor():
     flat = TensorAddress(
         name="model.layers.0.mlp.experts.gate_up_proj",
-        shard="s.safetensors", dtype="BF16", shape=[512],
-        byte_start=0, byte_end=1024, num_params=512, size_bytes=1024,
+        shard="s.safetensors",
+        dtype="BF16",
+        shape=[512],
+        byte_start=0,
+        byte_end=1024,
+        num_params=512,
+        size_bytes=1024,
     )
     with pytest.raises(SliceError, match="needs >= 2 dims"):
         slice_expert_from_bank(flat, 0, 512)
@@ -375,6 +551,7 @@ def test_projection_signature_rejects_mixed_geometry(qwen_scan):
 # --------------------------------------------------------------------------- #
 # Local checkpoint end-to-end planning
 # --------------------------------------------------------------------------- #
+
 
 def test_plan_local_fused_moe(dummy_moe_model):
     scan = scan_checkpoint(str(dummy_moe_model))
@@ -416,23 +593,45 @@ def test_planning_reads_no_weights(qwen_scan, qwen_plan):
 # Layout arithmetic
 # --------------------------------------------------------------------------- #
 
-@pytest.mark.parametrize("value,alignment,expected", [
-    (0, 4096, 0), (1, 4096, 4096), (4096, 4096, 4096), (4097, 4096, 8192), (100, 1, 100),
-])
+
+@pytest.mark.parametrize(
+    "value,alignment,expected",
+    [
+        (0, 4096, 0),
+        (1, 4096, 4096),
+        (4096, 4096, 4096),
+        (4097, 4096, 8192),
+        (100, 1, 100),
+    ],
+)
 def test_align_up(value, alignment, expected):
     assert align_up(value, alignment) == expected
 
 
-@pytest.mark.parametrize("elements,bits,expected", [
-    (8, 1, 1), (8, 2, 2), (8, 4, 4), (8, 16, 16), (3, 4, 2),
-])
+@pytest.mark.parametrize(
+    "elements,bits,expected",
+    [
+        (8, 1, 1),
+        (8, 2, 2),
+        (8, 4, 4),
+        (8, 16, 16),
+        (3, 4, 2),
+    ],
+)
 def test_packed_bytes(elements, bits, expected):
     assert packed_bytes(elements, bits) == expected
 
 
-@pytest.mark.parametrize("elements,group,expected", [
-    (128, 128, 1), (129, 128, 2), (100, 128, 1), (100, -1, 1), (256, 64, 4),
-])
+@pytest.mark.parametrize(
+    "elements,group,expected",
+    [
+        (128, 128, 1),
+        (129, 128, 2),
+        (100, 128, 1),
+        (100, -1, 1),
+        (256, 64, 4),
+    ],
+)
 def test_num_groups(elements, group, expected):
     assert num_groups(elements, group) == expected
 
@@ -440,6 +639,7 @@ def test_num_groups(elements, group, expected):
 # --------------------------------------------------------------------------- #
 # Live verification against the source checkpoint
 # --------------------------------------------------------------------------- #
+
 
 @pytest.mark.network
 def test_expert_slices_decode_from_live_checkpoint(qwen_scan):
@@ -484,6 +684,7 @@ def test_expert_slices_decode_from_live_checkpoint(qwen_scan):
 # --------------------------------------------------------------------------- #
 # Rendering
 # --------------------------------------------------------------------------- #
+
 
 def _render(plan) -> str:
     import io
