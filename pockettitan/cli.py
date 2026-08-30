@@ -934,6 +934,7 @@ def sim(
     bits: float = typer.Option(4.0, "--bits", "-b", help="Nominal bits per weight (4.0 or 2.0)"),
     ssd_bw: float = typer.Option(3.5, "--ssd-bw", help="SSD bandwidth in GB/s"),
     capacities: str = typer.Option("512,1024,2048,2880,4096,5437", "--capacities", help="Comma-separated cache capacities in expert slots"),
+    trace_file: Optional[Path] = typer.Option(None, "--trace", "-t", help="Path to real routing trace file (.jsonl / .jsonl.gz)"),
     json_output: bool = typer.Option(False, "--json", help="Output raw JSON instead of formatted tables"),
     output: Optional[Path] = typer.Option(None, "--output", "-o", help="Write report JSON to file"),
 ):
@@ -945,12 +946,7 @@ def sim(
         render_simulation_report,
         run_capacity_sweep,
     )
-
-    try:
-        dist_enum = DistributionType(distribution.lower())
-    except ValueError:
-        console.print(f"[bold red]Invalid distribution '{distribution}'.[/bold red] Choose from: zipf, uniform, sticky")
-        raise typer.Exit(code=1)
+    from pockettitan.profiler.trace import TraceReader
 
     try:
         cap_list = [int(c.strip()) for c in capacities.split(",") if c.strip()]
@@ -959,21 +955,35 @@ def sim(
         raise typer.Exit(code=1)
 
     hw = HardwareProfile(ssd_bandwidth_gbps=ssd_bw)
-    
-    if not json_output:
-        console.print(
-            f"[bold green]Simulating MoE Expert Paging[/bold green] "
-            f"[dim]({tokens} tokens, dist={dist_enum.value}, alpha={alpha}, bits={bits}b, ssd={ssd_bw} GB/s)[/dim]"
-        )
 
-    trace = generate_synthetic_trace(
-        num_tokens=tokens,
-        num_layers=48,
-        num_experts=512,
-        top_k=10,
-        distribution=dist_enum,
-        alpha=alpha,
-    )
+    if trace_file is not None:
+        if not trace_file.exists():
+            console.print(f"[bold red]Trace file not found:[/bold red] {trace_file}")
+            raise typer.Exit(code=1)
+        if not json_output:
+            console.print(f"[bold green]Replaying Real MoE Trace:[/bold green] [cyan]{trace_file}[/cyan]")
+        trace = TraceReader(trace_file).read_all_events()
+    else:
+        try:
+            dist_enum = DistributionType(distribution.lower())
+        except ValueError:
+            console.print(f"[bold red]Invalid distribution '{distribution}'.[/bold red] Choose from: zipf, uniform, sticky")
+            raise typer.Exit(code=1)
+
+        if not json_output:
+            console.print(
+                f"[bold green]Simulating Synthetic MoE Trace[/bold green] "
+                f"[dim]({tokens} tokens, dist={dist_enum.value}, alpha={alpha}, bits={bits}b, ssd={ssd_bw} GB/s)[/dim]"
+            )
+
+        trace = generate_synthetic_trace(
+            num_tokens=tokens,
+            num_layers=48,
+            num_experts=512,
+            top_k=10,
+            distribution=dist_enum,
+            alpha=alpha,
+        )
 
     report = run_capacity_sweep(
         events=trace,
@@ -992,6 +1002,74 @@ def sim(
         render_simulation_report(console, report)
         if output is not None:
             console.print(f"\n[dim]Simulation report written to {output}[/dim]")
+
+
+profile_app = typer.Typer(
+    help="R3: MoE Routing Profiler — generate prompt suites and analyze routing traces."
+)
+app.add_typer(profile_app, name="profile")
+
+
+@profile_app.command("prompts")
+def profile_prompts(
+    samples_per_task: int = typer.Option(5, "--samples", "-n", help="Number of prompt samples per task category"),
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="File to write JSON benchmark suite to"),
+):
+    """Generate standardized benchmark prompts across the 5 canonical tasks."""
+    from pockettitan.profiler.prompts import generate_benchmark_suite
+
+    prompts = generate_benchmark_suite(num_samples_per_task=samples_per_task)
+    data = [p.model_dump() for p in prompts]
+
+    if output is not None:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        console.print(f"[bold green]Generated {len(prompts)} benchmark prompts -> {output}[/bold green]")
+    else:
+        table = Table(title="[bold green]PocketTitan Benchmark Prompts (R3)[/bold green]", show_header=True)
+        table.add_column("Prompt ID", style="cyan")
+        table.add_column("Task Category", style="magenta")
+        table.add_column("User Prompt Excerpt", style="white")
+
+        for p in prompts:
+            excerpt = p.user_prompt[:80] + "..." if len(p.user_prompt) > 80 else p.user_prompt
+            table.add_row(p.prompt_id, p.task_type.value, excerpt)
+
+        console.print(table)
+
+
+@profile_app.command("analyze")
+def profile_analyze(
+    trace_file: Path = typer.Argument(..., help="Path to routing trace file (.jsonl / .jsonl.gz)"),
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Write metrics JSON to file"),
+):
+    """Compute comprehensive Gini skew, entropy, and cross-layer overlap metrics from a trace file."""
+    from pockettitan.profiler.trace import TraceReader, analyze_routing_trace
+
+    if not trace_file.exists():
+        console.print(f"[bold red]Trace file not found:[/bold red] {trace_file}")
+        raise typer.Exit(code=1)
+
+    events = TraceReader(trace_file).read_all_events()
+    metrics = analyze_routing_trace(events)
+
+    table = Table(title=f"[bold green]MoE Routing Profile: {trace_file.name}[/bold green]", show_header=True)
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", style="green")
+
+    table.add_row("Total Tokens", f"{metrics.total_tokens:,}")
+    table.add_row("Total Routing Events", f"{metrics.total_events:,}")
+    table.add_row("Unique Experts Activated", f"{metrics.unique_experts_accessed:,}")
+    table.add_row("Expert Gini Coefficient (Skew)", f"{metrics.gini_coefficient:.4f}")
+    table.add_row("Mean Router Entropy", f"{metrics.mean_router_entropy:.4f}")
+    table.add_row("Cross-Layer Top-K Overlap", f"{metrics.cross_layer_overlap_mean * 100:.2f}%")
+
+    console.print(table)
+
+    if output is not None:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(metrics.model_dump_json(indent=2), encoding="utf-8")
+        console.print(f"\n[dim]Analysis written to {output}[/dim]")
 
 
 if __name__ == "__main__":

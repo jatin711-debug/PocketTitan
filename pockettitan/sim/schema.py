@@ -16,14 +16,32 @@ class DistributionType(str, Enum):
 class RoutingEvent(BaseModel):
     """A single expert routing activation during a forward pass."""
     
-    token_id: int
-    layer_idx: int
-    slot_idx: int  # 0 .. top_k-1
-    expert_idx: int  # 0 .. num_experts-1
+    token_id: int = Field(alias="tok", default=0)
+    layer_idx: int = Field(alias="layer", default=0)
+    slot_idx: int = Field(alias="slot", default=0)  # 0 .. top_k-1
+    expert_idx: int = Field(alias="expert", default=0)  # 0 .. num_experts-1
     weight: float = 1.0
     router_entropy: float = 0.0
     prompt_id: int = 0
     phase: str = "decode"  # "prefill" or "decode"
+
+    model_config = {"populate_by_name": True}
+
+    @property
+    def tok(self) -> int:
+        return self.token_id
+
+    @property
+    def layer(self) -> int:
+        return self.layer_idx
+
+    @property
+    def slot(self) -> int:
+        return self.slot_idx
+
+    @property
+    def expert(self) -> int:
+        return self.expert_idx
 
 
 class TraceSummary(BaseModel):

@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: PocketTitan Agent <pockettitan@research.local>
+Date: Sun, 30 Aug 2026 00:00:00 +0000
+Subject: [PATCH] feat: add routing trace logger for PocketTitan MoE profiling (R3)
+
+Appends (token_id, layer_id, expert_id, routing_weight) to a JSONL stream
+specified by LLAMA_ROUTING_TRACE_PATH during MoE top-k gate execution.
+---
+ src/llama-context.cpp | 48 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 48 insertions(+)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 1000000..2000000 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -10,6 +10,10 @@
+ #include <cmath>
+ #include <cstring>
+ #include <fstream>
++#include <mutex>
++#include <cstdlib>
++#include <chrono>
++#include <iomanip>
+ 
++namespace pockettitan {
++    static std::ofstream g_trace_out;
++    static std::mutex    g_trace_mutex;
++    static bool          g_trace_initialized = false;
++    static int64_t       g_token_counter = 0;
++
++    static void log_routing_event(int layer_idx, int top_k, const int32_t * expert_ids, const float * weights) {
++        const char * path = std::getenv("LLAMA_ROUTING_TRACE_PATH");
++        if (!path) return;
++
++        std::lock_guard<std::mutex> lock(g_trace_mutex);
++        if (!g_trace_initialized) {
++            g_trace_out.open(path, std::ios::app);
++            g_trace_initialized = true;
++        }
++        if (!g_trace_out.is_open()) return;
++
++        float entropy = 0.0f;
++        for (int i = 0; i < top_k; ++i) {
++            if (weights[i] > 1e-6f) {
++                entropy -= weights[i] * std::log2(weights[i]);
++            }
++        }
++
++        for (int rank = 0; rank < top_k; ++rank) {
++            g_trace_out << "{\"tok\":" << g_token_counter
++                        << ",\"layer\":" << layer_idx
++                        << ",\"slot\":" << rank
++                        << ",\"expert\":" << expert_ids[rank]
++                        << ",\"weight\":" << std::fixed << std::setprecision(6) << weights[rank]
++                        << ",\"rank\":" << rank
++                        << ",\"router_entropy\":" << entropy
++                        << ",\"phase\":\"decode\"}\n";
++        }
++    }
++
++    static void increment_token() {
++        std::lock_guard<std::mutex> lock(g_trace_mutex);
++        g_token_counter++;
++    }
++}
++
+-- 
+2.45.0
