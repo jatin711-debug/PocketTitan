@@ -638,6 +638,7 @@ def plan(
         "--revision",
         help="Immutable Hugging Face commit SHA (resolved automatically when omitted)",
     ),
+    profile: str = typer.Option("full", "--profile", help="Build profile: canary or full"),
     precision: str = typer.Option(
         "pt-q4e",
         "--precision",
@@ -665,13 +666,15 @@ def plan(
     Reads only checkpoint headers. No weights are fetched, so the byte-exact
     layout can be reviewed before a multi-hundred-gigabyte build starts.
     """
+    profile = profile.strip().lower()
+    if profile not in ("canary", "full"):
+        console.print(f"[bold red]Invalid --profile '{profile}'. Must be 'canary' or 'full'.[/bold red]")
+        raise typer.Exit(code=1)
+
     try:
         selected = [Capability(f.strip().lower()) for f in features.split(",") if f.strip()]
-    except ValueError:
-        console.print(
-            f"[bold red]Invalid --features '{features}'.[/bold red] Valid values: "
-            + ", ".join(c.value for c in Capability)
-        )
+    except ValueError as e:
+        console.print(f"[bold red]Invalid option value:[/bold red] {escape(str(e))}")
         raise typer.Exit(code=1)
 
     try:
@@ -683,7 +686,7 @@ def plan(
     if not json_output:
         console.print(
             f"[bold green]Planning package for [cyan]{model}[/cyan][/bold green] "
-            f"[dim](precision={precision_map.name}, features={','.join(c.value for c in selected)})[/dim]"
+            f"[dim](profile={profile}, precision={precision_map.name}, features={','.join(c.value for c in selected)})[/dim]"
         )
 
     try:
@@ -699,6 +702,7 @@ def plan(
             scan,
             precision_map=precision_map,
             features=selected,
+            build_profile=profile,
             expert_alignment=alignment,
             pockettitan_version=__version__,
         )
