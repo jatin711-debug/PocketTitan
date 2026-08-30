@@ -29,22 +29,22 @@ class ParetoBitAllocator:
     ) -> HeterogeneousPrecisionMap:
         """Assign precision per tensor optimizing error/bitrate trade-off."""
         scores = [compute_tensor_sensitivity(t, model_meta) for t in tensor_addresses]
-        
+
         assigned_configs: Dict[str, QuantConfig] = {}
         total_param_bits = 0.0
         total_params = 0
-        
+
         for t, s in zip(tensor_addresses, scores):
             num_p = t.num_params
             total_params += num_p
-            
+
             # Rule 1: High sensitivity -> FP16 / 8-bit
             if s.sensitivity >= 50.0 or s.recommended_min_bits == 16:
                 cfg = QuantConfig(method=QuantMethod.RTN, bits=16, group_size=-1)
                 assigned_configs[t.name] = cfg
                 total_param_bits += num_p * 16.0
                 continue
-                
+
             if s.sensitivity >= 20.0:
                 # Moderate-high (embeddings, lm_head)
                 bits = 8 if self.target_bpw >= 3.0 else 4
@@ -52,9 +52,11 @@ class ParetoBitAllocator:
                 assigned_configs[t.name] = cfg
                 total_param_bits += num_p * bits
                 continue
-                
+
             # Rule 2: Attention layers
-            if "attn" in t.name or any(q in t.name for q in ["q_proj", "k_proj", "v_proj", "o_proj"]):
+            if "attn" in t.name or any(
+                q in t.name for q in ["q_proj", "k_proj", "v_proj", "o_proj"]
+            ):
                 if self.target_bpw <= 2.2:
                     bits = 2
                 elif self.target_bpw <= 3.5:
@@ -93,7 +95,7 @@ class ParetoBitAllocator:
             total_param_bits += num_p * bits
 
         effective_bpw = total_param_bits / max(1, total_params)
-        
+
         return HeterogeneousPrecisionMap(
             model_id_or_path=model_id_or_path,
             target_bpw=self.target_bpw,

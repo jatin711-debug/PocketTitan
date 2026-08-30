@@ -41,6 +41,7 @@ _LAYER_RE = re.compile(r"\.layers\.(\d+)\.")
 # Precision
 # --------------------------------------------------------------------------- #
 
+
 def effective_bits(
     nominal_bits: float,
     group_size: int = 128,
@@ -88,7 +89,9 @@ class PrecisionMap(BaseModel):
         return self.entry_for(component).effective
 
     @classmethod
-    def uniform(cls, bits: float, group_size: int = 128, name: Optional[str] = None) -> "PrecisionMap":
+    def uniform(
+        cls, bits: float, group_size: int = 128, name: Optional[str] = None
+    ) -> "PrecisionMap":
         """Uniform precision, except routers and norms which stay fp16."""
         return cls(
             name=name or f"uniform-{bits}b",
@@ -161,6 +164,7 @@ def get_precision_preset(name: str) -> PrecisionMap:
 # Geometry inference
 # --------------------------------------------------------------------------- #
 
+
 def text_config(config: Dict[str, Any]) -> Dict[str, Any]:
     """Return the language-model sub-config, tolerating flat and nested layouts."""
     return config.get("text_config", config)
@@ -216,13 +220,16 @@ def infer_expert_geometry(
     Handles both fused ``(num_experts, ...)`` layouts and per-expert tensors.
     """
     cfg = text_config(scan.config)
-    num_experts = cfg.get("num_experts") or cfg.get("n_routed_experts") or cfg.get("num_local_experts")
+    num_experts = (
+        cfg.get("num_experts") or cfg.get("n_routed_experts") or cfg.get("num_local_experts")
+    )
     top_k = cfg.get("num_experts_per_tok") or cfg.get("num_experts_per_token")
     if not num_experts or not top_k:
         return None
 
     expert_tensors = [
-        t for t in scan.tensors.values()
+        t
+        for t in scan.tensors.values()
         if classify_tensor(t.name).component is Component.EXPERTS_ROUTED
     ]
     if not expert_tensors:
@@ -234,7 +241,8 @@ def infer_expert_geometry(
     # Size one expert from a single layer, so the result is independent of depth.
     reference_layer = min(layers) if layers else None
     in_layer = [
-        t for t in expert_tensors
+        t
+        for t in expert_tensors
         if reference_layer is None or _layer_index(t.name) == reference_layer
     ]
     layer_params = sum(t.num_params for t in in_layer)
@@ -252,7 +260,8 @@ def infer_expert_geometry(
 def infer_ple_geometry(scan: ShardHeaderScan) -> Optional[PleGeometry]:
     """Recover n-gram table geometry: row width, row count, and heads per token."""
     table_tensors = [
-        t for t in scan.tensors.values()
+        t
+        for t in scan.tensors.values()
         if classify_tensor(t.name).component is Component.PLE_TABLE and len(t.shape) == 2
     ]
     if not table_tensors:
@@ -271,6 +280,7 @@ def infer_ple_geometry(scan: ShardHeaderScan) -> Optional[PleGeometry]:
 # --------------------------------------------------------------------------- #
 # Activation budget
 # --------------------------------------------------------------------------- #
+
 
 class ActivationBudget(BaseModel):
     """Parameters read to produce one token, per component."""
@@ -342,6 +352,7 @@ def build_activation_budget(
 # Storage budget
 # --------------------------------------------------------------------------- #
 
+
 class ComponentStorage(BaseModel):
     component: Component
     capability: Capability
@@ -403,6 +414,7 @@ def build_storage_budget(
 # --------------------------------------------------------------------------- #
 # State budget
 # --------------------------------------------------------------------------- #
+
 
 class StateBudget(BaseModel):
     """KV cache, recurrent state, and sparse-attention indexer footprint."""
@@ -481,6 +493,7 @@ def build_state_budget(
 # --------------------------------------------------------------------------- #
 # Roofline
 # --------------------------------------------------------------------------- #
+
 
 class RooflineRow(BaseModel):
     hit_rate: float
@@ -563,6 +576,7 @@ def build_roofline(
 # Top-level report object
 # --------------------------------------------------------------------------- #
 
+
 class AuditReport(BaseModel):
     """Everything R0 produces for one checkpoint under one precision map."""
 
@@ -628,9 +642,7 @@ def build_audit_report(
     expert_geometry = infer_expert_geometry(scan, breakdown)
     ple_geometry = infer_ple_geometry(scan)
 
-    activation = build_activation_budget(
-        scan, breakdown, features, expert_geometry, ple_geometry
-    )
+    activation = build_activation_budget(scan, breakdown, features, expert_geometry, ple_geometry)
     storage = build_storage_budget(breakdown, precision_map, features)
     state = build_state_budget(scan)
 

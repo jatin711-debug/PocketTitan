@@ -2,19 +2,14 @@
 
 import json
 import struct
-import pytest
-from pathlib import Path
-import torch
 
 from pockettitan.config import MemoryBudgetConfig, QuantConfig, QuantMethod
 from pockettitan.metadata.safetensors_header import (
     parse_safetensors_header_from_bytes,
-    parse_local_safetensors_header,
 )
 from pockettitan.metadata.repo import extract_moe_specs
 from pockettitan.scheduler.budget import (
     compute_work_unit_bounds,
-    estimate_tensor_vram_requirement,
     get_hardware_profile,
 )
 
@@ -31,7 +26,7 @@ def test_parse_safetensors_header_from_bytes():
     header_len = len(json_bytes)
     prefix = struct.pack("<Q", header_len)
     raw_payload = prefix + json_bytes + b"\x00" * 1024
-    
+
     parsed_dict, total_header_bytes = parse_safetensors_header_from_bytes(raw_payload)
     assert total_header_bytes == 8 + header_len
     assert "model.layers.0.weight" in parsed_dict
@@ -71,16 +66,18 @@ def test_hardware_profile():
 
 
 def test_work_unit_bounds_tiling():
-    budget = MemoryBudgetConfig(max_vram_mb=3500.0, runtime_reserve_mb=500.0, safety_margin_mb=500.0)
+    budget = MemoryBudgetConfig(
+        max_vram_mb=3500.0, runtime_reserve_mb=500.0, safety_margin_mb=500.0
+    )
     cfg = QuantConfig(method=QuantMethod.HQQ, bits=2, group_size=128)
-    
+
     # 1. Moderate matrix: 4096 x 4096 in float16 (32MB) -> should fit in single pass
     moderate_shape = [4096, 4096]
     bounds_mod = compute_work_unit_bounds(moderate_shape, budget, cfg, source_dtype="float16")
     assert bounds_mod["needs_tiling"] is False
     assert bounds_mod["num_tiles"] == 1
     assert bounds_mod["estimated_vram_per_tile_mb"] < budget.usable_vram_mb
-    
+
     # 2. Giant matrix: 129280 x 7168 in float16 (1.73 GB) -> should be tiled
     giant_shape = [129280, 7168]
     bounds_giant = compute_work_unit_bounds(giant_shape, budget, cfg, source_dtype="float16")

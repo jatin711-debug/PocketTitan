@@ -32,6 +32,7 @@ classifiers = [
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
+    "ruff>=0.6.0",
 ]
 
 [project.scripts]
@@ -43,8 +44,17 @@ include = ["pockettitan*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_default_fixture_loop_scope = "function"
 markers = [
     "network: hits the Hugging Face CDN; deselected by default, run with `-m network`",
     "gpu: requires a CUDA device; deselected by default, run with `-m gpu`",
 ]
 addopts = "-m 'not network and not gpu'"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+ignore = ["E501"]

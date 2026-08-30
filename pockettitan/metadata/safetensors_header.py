@@ -14,7 +14,7 @@ class RedirectRangeHandler(urllib.request.HTTPRedirectHandler):
         new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
         if new_req is None:
             return None
-            
+
         # Copy critical streaming headers across redirect hops
         for header_name in ["Range", "Authorization", "User-Agent"]:
             val = req.get_header(header_name, None)
@@ -45,7 +45,7 @@ def parse_local_safetensors_header(file_path: Union[str, Path]) -> Tuple[Dict[st
         header_len_bytes = f.read(8)
         if len(header_len_bytes) < 8:
             raise ValueError(f"File {path} is smaller than 8 bytes, invalid Safetensors.")
-        
+
         header_length = struct.unpack("<Q", header_len_bytes)[0]
         header_json_bytes = f.read(header_length)
         if len(header_json_bytes) < header_length:
@@ -65,21 +65,21 @@ def parse_remote_safetensors_header(
     req_headers = {"User-Agent": "PocketTitan/0.1.0", "Range": f"bytes=0-{probe_size - 1}"}
     if headers:
         req_headers.update(headers)
-        
+
     req = urllib.request.Request(url, headers=req_headers)
     with opener.open(req, timeout=15) as resp:
         chunk = resp.read()
-        
+
     if len(chunk) < 8:
         raise ValueError(f"Remote Safetensors file {url} returned less than 8 bytes")
-        
+
     header_length = struct.unpack("<Q", chunk[:8])[0]
     total_header_bytes = 8 + header_length
-    
+
     if len(chunk) >= total_header_bytes:
         header_json_str = chunk[8:total_header_bytes].decode("utf-8")
         return json.loads(header_json_str), total_header_bytes
-        
+
     # If header exceeded 128KB, fetch full header range
     full_headers = dict(req_headers)
     full_headers["Range"] = f"bytes=8-{total_header_bytes - 1}"
@@ -106,14 +106,14 @@ def fetch_remote_bytes(
     }
     if headers:
         req_headers.update(headers)
-        
+
     total_expected = (byte_end - byte_start) + 1
     req = urllib.request.Request(url, headers=req_headers)
-    
+
     with opener.open(req, timeout=timeout) as resp:
         if chunk_callback is None:
             return resp.read()
-            
+
         chunks = []
         chunk_size = 4 * 1024 * 1024  # 4 MiB buffer
         while True:

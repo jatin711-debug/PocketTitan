@@ -3,9 +3,8 @@
 import json
 from pathlib import Path
 import shutil
-from typing import Dict, Union
+from typing import Union
 import safetensors.torch
-import torch
 
 from pockettitan.exporters.base import BaseExporter, ExportResult
 
@@ -16,7 +15,7 @@ class VLLMExporter(BaseExporter):
     def export(self, output_path: Union[str, Path]) -> ExportResult:
         out_dir = Path(output_path)
         out_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # 1. Copy and patch config.json
         config_path = self.checkpoint_dir / "config.json"
         if config_path.exists():
@@ -33,14 +32,14 @@ class VLLMExporter(BaseExporter):
         shard_files = list(self.checkpoint_dir.glob("*.safetensors"))
         total_size = 0
         total_tensors = 0
-        
+
         for sf in shard_files:
             dest = out_dir / sf.name
             shutil.copy2(sf, dest)
             total_size += dest.stat().st_size
             with safetensors.torch.safe_open(str(dest), framework="pt") as f:
                 total_tensors += len(f.keys())
-                
+
         index_file = self.checkpoint_dir / "model.safetensors.index.json"
         if index_file.exists():
             shutil.copy2(index_file, out_dir / "model.safetensors.index.json")

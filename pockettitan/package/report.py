@@ -44,7 +44,9 @@ def render_regions(plan: BuildPlan) -> Table:
     table.add_column("Bytes", justify="right", style="white")
 
     totals = plan.manifest.totals
-    table.add_row("dense/", "VRAM-resident core", f"{len(plan.dense):,}", fmt_bytes(totals.dense_bytes))
+    table.add_row(
+        "dense/", "VRAM-resident core", f"{len(plan.dense):,}", fmt_bytes(totals.dense_bytes)
+    )
 
     layout = plan.manifest.expert_layout
     if layout is not None:
@@ -65,7 +67,12 @@ def render_regions(plan: BuildPlan) -> Table:
         )
 
     table.add_section()
-    table.add_row("[bold]TOTAL[/bold]", "", f"[bold]{plan.num_work_items:,}[/bold]", f"[bold]{fmt_bytes(totals.total_bytes)}[/bold]")
+    table.add_row(
+        "[bold]TOTAL[/bold]",
+        "",
+        f"[bold]{plan.num_work_items:,}[/bold]",
+        f"[bold]{fmt_bytes(totals.total_bytes)}[/bold]",
+    )
     return table
 
 
@@ -99,8 +106,11 @@ def render_expert_record(plan: BuildPlan) -> Optional[Table]:
     record = layout.record
     table.add_section()
     table.add_row(
-        "[bold]RECORD[/bold]", f"{record.num_params:,} params", "",
-        "0", f"[bold]{fmt_bytes(record.payload_bytes)}[/bold]",
+        "[bold]RECORD[/bold]",
+        f"{record.num_params:,} params",
+        "",
+        "0",
+        f"[bold]{fmt_bytes(record.payload_bytes)}[/bold]",
         f"stride {record.stride:,} (+{record.padding_bytes:,} pad, {record.alignment}B aligned)",
     )
     return table

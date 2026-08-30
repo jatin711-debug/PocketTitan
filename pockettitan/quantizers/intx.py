@@ -3,7 +3,7 @@
 from typing import Optional
 import torch
 
-from pockettitan.config import QuantConfig, QuantMethod
+from pockettitan.config import QuantConfig
 from pockettitan.quantizers.base import BaseQuantizer, QuantizerCapabilities, QuantizedResult
 from pockettitan.quantizers.rtn import RTNQuantizer
 

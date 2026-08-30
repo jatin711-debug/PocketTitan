@@ -186,7 +186,8 @@ class ComponentBreakdown(BaseModel):
 
     stats: Dict[Component, ComponentStats] = Field(default_factory=dict)
     unclassified: List[str] = Field(
-        default_factory=list, description="Tensors that fell through to OTHER; review before trusting a new architecture"
+        default_factory=list,
+        description="Tensors that fell through to OTHER; review before trusting a new architecture",
     )
 
     @property
@@ -210,7 +211,9 @@ class ComponentBreakdown(BaseModel):
         """Parameters removed when only ``capabilities`` are enabled."""
         enabled = set(capabilities)
         return {
-            c: s.params for c, s in self.stats.items() if s.capability not in enabled and s.params > 0
+            c: s.params
+            for c, s in self.stats.items()
+            if s.capability not in enabled and s.params > 0
         }
 
     def ordered(self) -> List[ComponentStats]:

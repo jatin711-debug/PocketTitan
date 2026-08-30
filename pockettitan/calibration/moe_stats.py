@@ -1,6 +1,6 @@
 """MoE router calibration and per-expert token dispatch statistics."""
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict
 import torch
 
 from pockettitan.calibration.hessian import HessianAccumulator
@@ -20,7 +20,7 @@ class MoERouterCalibrator:
         self.top_k = top_k
         self.hidden_dim = hidden_dim
         self.device = device
-        
+
         # Per-expert Hessian accumulators
         self.expert_hessians: Dict[int, HessianAccumulator] = {
             e: HessianAccumulator(hidden_dim, device=device) for e in range(num_experts)
@@ -32,13 +32,13 @@ class MoERouterCalibrator:
         # x: [num_tokens, hidden_dim]
         x_2d = x.view(-1, self.hidden_dim).float()
         w_gate = router_weights.float()
-        
+
         # Compute router logits: [num_tokens, num_experts]
         logits = torch.matmul(x_2d, w_gate.t())
-        
+
         # Top-k selection
         topk_weights, topk_indices = torch.topk(logits, k=self.top_k, dim=-1)
-        
+
         for e in range(self.num_experts):
             # Find tokens assigned to expert e
             mask = (topk_indices == e).any(dim=-1)

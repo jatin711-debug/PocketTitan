@@ -1,7 +1,7 @@
 """Tensor Layout Adapters for decomposing diverse tensor geometries into legal 2D quantization units."""
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import List
 import torch
 
 
@@ -85,7 +85,9 @@ def get_layout_adapter(name: str, shape: List[int], dtype_str: str = "F16") -> T
     """Factory creating appropriate TensorLayoutAdapter based on tensor dimensions and naming."""
     if len(shape) == 2:
         return Dense2DLayout(name, shape, dtype_str)
-    elif len(shape) == 3 and any(k in name for k in ["expert", "mlp.experts", "gate_up_proj", "down_proj", "w1", "w2", "w3"]):
+    elif len(shape) == 3 and any(
+        k in name for k in ["expert", "mlp.experts", "gate_up_proj", "down_proj", "w1", "w2", "w3"]
+    ):
         return FusedExperts3DLayout(name, shape, dtype_str)
     elif len(shape) >= 3:
         return ConvLayout(name, shape, dtype_str)

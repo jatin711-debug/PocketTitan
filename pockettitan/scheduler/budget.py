@@ -31,6 +31,7 @@ class HardwareProfile(BaseModel):
 def get_system_ram_info() -> Tuple[float, float]:
     """Get system RAM info reliably on Windows and Linux without third-party deps."""
     if os.name == "nt":
+
         class MEMORYSTATUSEX(ctypes.Structure):
             _fields_ = [
                 ("dwLength", ctypes.c_ulong),
@@ -43,6 +44,7 @@ def get_system_ram_info() -> Tuple[float, float]:
                 ("ullAvailVirtual", ctypes.c_ulonglong),
                 ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
             ]
+
         stat = MEMORYSTATUSEX()
         stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
         if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
@@ -75,7 +77,7 @@ def get_hardware_profile() -> HardwareProfile:
     """Scan and return full system hardware capability and memory profile."""
     cuda_avail = torch.cuda.is_available()
     devices = []
-    
+
     if cuda_avail:
         for i in range(torch.cuda.device_count()):
             props = torch.cuda.get_device_properties(i)
@@ -89,10 +91,10 @@ def get_hardware_profile() -> HardwareProfile:
                     compute_capability=(props.major, props.minor),
                 )
             )
-            
+
     total_ram, free_ram = get_system_ram_info()
     free_disk = get_disk_free_mb(".")
-    
+
     return HardwareProfile(
         cuda_available=cuda_avail,
         devices=devices,
@@ -106,10 +108,10 @@ def apply_cuda_memory_fraction(budget: MemoryBudgetConfig, device_id: int = 0) -
     """Set hard CUDA memory fraction to enforce user VRAM ceiling at driver level."""
     if not torch.cuda.is_available() or device_id >= torch.cuda.device_count():
         return None
-        
+
     props = torch.cuda.get_device_properties(device_id)
     total_mb = props.total_memory / (1024 * 1024)
-    
+
     fraction = min(1.0, max(0.05, budget.max_vram_mb / total_mb))
     try:
         torch.cuda.set_per_process_memory_fraction(fraction, device_id)
@@ -197,7 +199,7 @@ def compute_work_unit_bounds(
         group_size=quant_config.group_size,
     )
     usable_vram_mb = budget.usable_vram_mb
-    
+
     if len(matrix_shape) != 2:
         return {
             "needs_tiling": False,
@@ -206,9 +208,9 @@ def compute_work_unit_bounds(
             "estimated_vram_per_tile_mb": round(full_vram_req_mb, 2),
             "total_matrix_vram_mb": round(full_vram_req_mb, 2),
         }
-        
+
     out_features, in_features = matrix_shape[0], matrix_shape[1]
-    
+
     if full_vram_req_mb <= usable_vram_mb:
         return {
             "needs_tiling": False,
@@ -217,7 +219,7 @@ def compute_work_unit_bounds(
             "estimated_vram_per_tile_mb": round(full_vram_req_mb, 2),
             "total_matrix_vram_mb": round(full_vram_req_mb, 2),
         }
-        
+
     # Calculate exact memory consumption per row, including group padding.
     dtype_bytes = source_dtype_bytes(source_dtype)
     pad_factor = group_padding_factor(in_features, quant_config.group_size)
@@ -227,18 +229,18 @@ def compute_work_unit_bounds(
     packed_bytes_per_row = (in_features * quant_config.bits) / 8 + (in_features / 128) * 4
     total_bytes_per_row = source_bytes_per_row + working_bytes_per_row + packed_bytes_per_row
     vram_per_row_mb = total_bytes_per_row / (1024 * 1024)
-    
+
     # Target 80% of usable VRAM per tile for high stability
     target_tile_vram_mb = usable_vram_mb * 0.80
     raw_tile_rows = max(32, int(target_tile_vram_mb / max(1e-6, vram_per_row_mb)))
-    
+
     # Align tile_rows to 64 for optimal GPU tensor-core throughput
     tile_rows = max(64, (raw_tile_rows // 64) * 64)
     tile_rows = min(out_features, tile_rows)
-    
+
     num_tiles = math.ceil(out_features / tile_rows)
     est_tile_vram_mb = tile_rows * vram_per_row_mb
-    
+
     return {
         "needs_tiling": True,
         "tile_rows": tile_rows,

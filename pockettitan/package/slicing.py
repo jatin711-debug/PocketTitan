@@ -97,7 +97,9 @@ def _element_bytes(address: TensorAddress) -> float:
     return address.size_bytes / address.num_params
 
 
-def slice_expert_from_bank(address: TensorAddress, expert_index: int, num_experts: int) -> SourceSlice:
+def slice_expert_from_bank(
+    address: TensorAddress, expert_index: int, num_experts: int
+) -> SourceSlice:
     """Address one expert inside a fused ``(num_experts, ...)`` bank tensor.
 
     Raises:
@@ -189,7 +191,9 @@ def build_expert_slices(
         Slices ordered layer-major then expert-major, matching bank order.
     """
     banks = expert_bank_tensors(tensors)
-    target_layers = sorted(banks) if layers is None else [l for l in layers if l in banks]
+    target_layers = (
+        sorted(banks) if layers is None else [layer for layer in layers if layer in banks]
+    )
     target_experts = range(num_experts) if experts is None else experts
 
     out: List[ExpertSlice] = []

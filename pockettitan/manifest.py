@@ -3,7 +3,7 @@
 import json
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union
 from pydantic import BaseModel, Field
 
 
@@ -39,7 +39,11 @@ class JobManifest(BaseModel):
         return self.completed_tensors >= self.total_tensors
 
     def get_pending_tensors(self) -> List[str]:
-        return [name for name, rec in self.records.items() if rec.status in (TensorStatus.PENDING, TensorStatus.FAILED)]
+        return [
+            name
+            for name, rec in self.records.items()
+            if rec.status in (TensorStatus.PENDING, TensorStatus.FAILED)
+        ]
 
 
 class ManifestManager:
@@ -62,10 +66,10 @@ class ManifestManager:
         """Atomically write manifest to disk using temporary file."""
         self.output_dir.mkdir(parents=True, exist_ok=True)
         tmp_file = self.output_dir / "pockettitan_manifest.json.tmp"
-        
+
         with open(tmp_file, "w", encoding="utf-8") as f:
             f.write(manifest.model_dump_json(indent=2))
-            
+
         if tmp_file.exists():
             tmp_file.replace(self.manifest_file)
 
@@ -81,7 +85,7 @@ class ManifestManager:
         records = {}
         for name, shard in tensor_names_with_shards:
             records[name] = TensorJobRecord(name=name, shard=shard, status=TensorStatus.PENDING)
-            
+
         manifest = JobManifest(
             model_id_or_path=model_id_or_path,
             output_dir=str(self.output_dir),

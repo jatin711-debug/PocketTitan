@@ -24,10 +24,11 @@ from pockettitan.audit import (
     get_precision_preset,
     scan_checkpoint,
 )
+
 # --- Ground truth: Qwen/Qwen3.8-Flash-Next @ de4b8e4d ----------------------- #
 TOTAL_PARAMS = 179_999_981_459
 TOTAL_BYTES = 359_999_963_128
-TEXT_ONLY_CORE = 125_743_653_795          # matches llama.cpp's reported 125.74 B
+TEXT_ONLY_CORE = 125_743_653_795  # matches llama.cpp's reported 125.74 B
 ACTIVATED_PER_TOKEN = 6_671_300_515
 EXPERT_PARAMS_PER_TOKEN = 2_359_296_000
 
@@ -55,6 +56,7 @@ def qwen_report(qwen_scan):
 # --------------------------------------------------------------------------- #
 # Golden: the R0 gate
 # --------------------------------------------------------------------------- #
+
 
 def test_fixture_shape(qwen_scan):
     assert qwen_scan.num_tensors == 1658
@@ -91,7 +93,10 @@ def test_text_only_core_matches_llama_cpp(qwen_report):
     assert qwen_report.lm_core_params == TEXT_ONLY_CORE
     assert round(qwen_report.lm_core_params / 1e9, 2) == 125.74
     # The table is still text capability; it is merely stored separately.
-    assert qwen_report.enabled_params - qwen_report.lm_core_params == COMPONENT_PARAMS[Component.PLE_TABLE]
+    assert (
+        qwen_report.enabled_params - qwen_report.lm_core_params
+        == COMPONENT_PARAMS[Component.PLE_TABLE]
+    )
 
 
 def test_capability_stripping_totals(qwen_report):
@@ -193,6 +198,7 @@ def test_roofline_2bit_halves_traffic(qwen_scan):
 # Unit: precision arithmetic
 # --------------------------------------------------------------------------- #
 
+
 @pytest.mark.parametrize(
     "bits,group,symmetric,expected",
     [
@@ -232,12 +238,16 @@ def test_uniform_preset_still_protects_routers():
 # Unit: taxonomy
 # --------------------------------------------------------------------------- #
 
+
 @pytest.mark.parametrize(
     "name,expected",
     [
         ("model.language_model.layers.7.mlp.experts.gate_up_proj", Component.EXPERTS_ROUTED),
         ("model.layers.3.mlp.experts.11.down_proj.weight", Component.EXPERTS_ROUTED),
-        ("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_9.weight", Component.PLE_TABLE),
+        (
+            "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_9.weight",
+            Component.PLE_TABLE,
+        ),
         ("model.language_model.layers.1.ple.key_proj.weight", Component.PLE_PROJ),
         ("model.language_model.layers.7.mlp.gate.weight", Component.ROUTER),
         ("model.language_model.layers.7.mlp.shared_expert_gate.weight", Component.ROUTER),
@@ -266,7 +276,10 @@ def test_vision_and_mtp_are_droppable_capabilities():
 def test_cold_tier_assignment():
     """Only experts and the n-gram table belong on NVMe."""
     assert classify_tensor("model.layers.0.mlp.experts.gate_up_proj").tier is Tier.NVME_COLD
-    assert classify_tensor("m.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight").tier is Tier.NVME_COLD
+    assert (
+        classify_tensor("m.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight").tier
+        is Tier.NVME_COLD
+    )
     assert classify_tensor("model.layers.3.self_attn.q_proj.weight").tier is Tier.VRAM_HOT
     assert classify_tensor("model.embed_tokens.weight").tier is Tier.RAM_WARM
 
@@ -274,6 +287,7 @@ def test_cold_tier_assignment():
 # --------------------------------------------------------------------------- #
 # Unit: scanner behaviour on real files
 # --------------------------------------------------------------------------- #
+
 
 def test_scan_local_checkpoint(dummy_transformer_model):
     scan = scan_checkpoint(str(dummy_transformer_model))
@@ -323,6 +337,7 @@ def test_total_size_mismatch_is_reported(dummy_transformer_model):
 # --------------------------------------------------------------------------- #
 # Unit: rendering
 # --------------------------------------------------------------------------- #
+
 
 def test_render_report_smoke(qwen_report):
     """Exercise every table in the render path; a KeyError here would only ever

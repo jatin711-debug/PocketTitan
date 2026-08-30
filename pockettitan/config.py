@@ -2,9 +2,8 @@
 
 from enum import Enum
 import math
-from pathlib import Path
 import re
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Union
 from pydantic import BaseModel, Field
 
 
@@ -28,43 +27,47 @@ class QuantMethod(str, Enum):
 
 # --- Custom Domain Exceptions ---
 
+
 class UnsupportedSourceDTypeError(Exception):
     """Raised when an unrecognized source data type is encountered."""
+
     pass
 
 
 class CalibrationRequiredError(Exception):
     """Raised when an algorithm (e.g., GPTQ, AWQ) requires calibration data that was not provided."""
+
     pass
 
 
 class InfeasibleBudgetError(Exception):
     """Raised when a matrix cannot be legally tiled within the configured memory budget."""
+
     pass
 
 
 def parse_memory_to_mb(val: Union[str, float, int]) -> float:
     """Parse user memory string into MiB float.
-    
+
     Supports: "4GB", "4GiB", "4G", "2048MB", "2048MiB", "2048M", "1.5GB", "1500", 1500
     """
     if isinstance(val, (int, float)):
         return float(val)
-        
+
     s = str(val).strip().upper()
     if not s:
         return 3584.0
-        
+
     match = re.match(r"^([0-9.]+)\s*([A-Z]*)$", s)
     if not match:
         try:
             return float(s)
         except ValueError:
             return 3584.0
-            
+
     num = float(match.group(1))
     unit = match.group(2)
-    
+
     if unit in ["GB", "GIB", "G"]:
         return num * 1024.0
     elif unit in ["TB", "TIB", "T"]:
@@ -80,11 +83,22 @@ def parse_memory_to_mb(val: Union[str, float, int]) -> float:
 
 class MemoryBudgetConfig(BaseModel):
     """Memory budget specifications in Megabytes."""
-    max_vram_mb: float = Field(default=3584.0, description="Hard cap on CUDA VRAM in MiB (default ~3.5 GiB for 4GB GPUs)")
-    runtime_reserve_mb: float = Field(default=512.0, description="Reserved for PyTorch/CUDA runtime overhead in MiB")
-    safety_margin_mb: float = Field(default=384.0, description="Safety buffer before triggering OOM in MiB")
-    max_source_cache_mb: float = Field(default=10240.0, description="Max local disk cache for source shards (default 10 GiB)")
-    max_cpu_staging_mb: float = Field(default=2048.0, description="Max pinned host CPU staging buffer in MiB")
+
+    max_vram_mb: float = Field(
+        default=3584.0, description="Hard cap on CUDA VRAM in MiB (default ~3.5 GiB for 4GB GPUs)"
+    )
+    runtime_reserve_mb: float = Field(
+        default=512.0, description="Reserved for PyTorch/CUDA runtime overhead in MiB"
+    )
+    safety_margin_mb: float = Field(
+        default=384.0, description="Safety buffer before triggering OOM in MiB"
+    )
+    max_source_cache_mb: float = Field(
+        default=10240.0, description="Max local disk cache for source shards (default 10 GiB)"
+    )
+    max_cpu_staging_mb: float = Field(
+        default=2048.0, description="Max pinned host CPU staging buffer in MiB"
+    )
 
     @property
     def usable_vram_mb(self) -> float:
@@ -98,9 +112,13 @@ class MemoryBudgetConfig(BaseModel):
 
 class QuantConfig(BaseModel):
     """Configuration for quantization backends."""
+
     method: QuantMethod = Field(default=QuantMethod.HQQ, description="Quantization algorithm")
     bits: int = Field(default=2, description="Target bit-width (e.g. 1, 2, 3, 4, 8)")
-    group_size: int = Field(default=128, description="Group size for groupwise quantization (-1 for channel/tensor-wise)")
+    group_size: int = Field(
+        default=128,
+        description="Group size for groupwise quantization (-1 for channel/tensor-wise)",
+    )
     symmetric: bool = Field(default=False, description="Symmetric vs asymmetric quantization")
     scale_dtype: str = Field(default="float16", description="Data type for quantization scales")
     zero_dtype: str = Field(default="float16", description="Data type for quantization zero-points")
@@ -109,11 +127,20 @@ class QuantConfig(BaseModel):
 
 class StorageAccounting(BaseModel):
     """Scientific storage accounting distinguishing theoretical, payload, and on-disk metrics."""
-    theoretical_bpw: float = Field(description="Information-theoretic entropy limit (e.g. 1.585 for ternary)")
-    payload_bpw: float = Field(description="Bit-width of physical packed tensor elements (e.g. 2.0)")
-    metadata_bpw: float = Field(description="Overhead of scales, zero-points, and codebooks in bits/weight")
+
+    theoretical_bpw: float = Field(
+        description="Information-theoretic entropy limit (e.g. 1.585 for ternary)"
+    )
+    payload_bpw: float = Field(
+        description="Bit-width of physical packed tensor elements (e.g. 2.0)"
+    )
+    metadata_bpw: float = Field(
+        description="Overhead of scales, zero-points, and codebooks in bits/weight"
+    )
     on_disk_bpw: float = Field(description="Actual physical storage on disk per parameter")
-    compression_ratio: float = Field(description="Compression factor relative to FP16 source baseline")
+    compression_ratio: float = Field(
+        description="Compression factor relative to FP16 source baseline"
+    )
 
     @classmethod
     def compute(
@@ -156,6 +183,7 @@ class StorageAccounting(BaseModel):
 
 class TensorAddress(BaseModel):
     """Virtual address mapping for a tensor in a sharded checkpoint."""
+
     name: str
     shard: str
     dtype: str
@@ -168,6 +196,7 @@ class TensorAddress(BaseModel):
 
 class ModelMetadata(BaseModel):
     """Normalized metadata for any LLM architecture."""
+
     architecture: str
     num_hidden_layers: int
     hidden_size: int

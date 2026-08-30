@@ -1,7 +1,6 @@
 """Generic Transformer layer structural analyzer and tensor classifier."""
 
-import re
-from typing import Dict, List, Optional
+from typing import List, Optional
 from pydantic import BaseModel
 
 from pockettitan.config import TensorAddress
@@ -37,16 +36,26 @@ def parse_transformer_layer_structure(
 ) -> TransformerLayerStructure:
     """Classify all tensors belonging to a transformer layer into standard roles."""
     struct = TransformerLayerStructure(layer_idx=layer_idx)
-    
+
     for t in layer_tensors:
         name_lower = t.name.lower()
-        
+
         # Norms
-        if "input_layernorm" in name_lower or "attn_norm" in name_lower or "ln_1" in name_lower or "norm1" in name_lower:
+        if (
+            "input_layernorm" in name_lower
+            or "attn_norm" in name_lower
+            or "ln_1" in name_lower
+            or "norm1" in name_lower
+        ):
             struct.input_layernorm = t
-        elif "post_attention_layernorm" in name_lower or "ffn_norm" in name_lower or "ln_2" in name_lower or "norm2" in name_lower:
+        elif (
+            "post_attention_layernorm" in name_lower
+            or "ffn_norm" in name_lower
+            or "ln_2" in name_lower
+            or "norm2" in name_lower
+        ):
             struct.post_attention_layernorm = t
-            
+
         # Attention
         elif "q_proj" in name_lower or "query" in name_lower or "wq" in name_lower:
             struct.attention.q_proj = t
@@ -54,11 +63,17 @@ def parse_transformer_layer_structure(
             struct.attention.k_proj = t
         elif "v_proj" in name_lower or "value" in name_lower or "wv" in name_lower:
             struct.attention.v_proj = t
-        elif "o_proj" in name_lower or "out_proj" in name_lower or "wo" in name_lower or "dense" in name_lower and "attn" in name_lower:
+        elif (
+            "o_proj" in name_lower
+            or "out_proj" in name_lower
+            or "wo" in name_lower
+            or "dense" in name_lower
+            and "attn" in name_lower
+        ):
             struct.attention.o_proj = t
         elif "qkv" in name_lower or "w_qkv" in name_lower:
             struct.attention.qkv_fused = t
-            
+
         # Dense MLP (non-expert)
         elif not any(exp in name_lower for exp in ["expert", "experts"]):
             if struct.mlp is None:
@@ -75,5 +90,5 @@ def parse_transformer_layer_structure(
                 struct.other_tensors.append(t)
         else:
             struct.other_tensors.append(t)
-            
+
     return struct

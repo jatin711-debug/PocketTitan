@@ -4,7 +4,13 @@ import pytest
 import torch
 
 from pockettitan.config import MemoryBudgetConfig, QuantConfig, QuantMethod
-from pockettitan.quantizers import RTNQuantizer, TernaryQuantizer, HQQQuantizer
+from pockettitan.quantizers import HQQQuantizer, RTNQuantizer, TernaryQuantizer, get_quantizer
+from pockettitan.scheduler.budget import (
+    compute_work_unit_bounds,
+    estimate_tensor_vram_requirement,
+    group_padding_factor,
+    source_dtype_bytes,
+)
 from pockettitan.scheduler.tiler import MatrixTiler
 
 
@@ -13,7 +19,7 @@ def test_tiled_vs_untiled_mathematical_parity(method):
     """Verify that tiled execution produces identical results to monolithic execution."""
     torch.manual_seed(123)
     w = torch.randn(1024, 2048, dtype=torch.float16) * 0.05
-    
+
     cfg = QuantConfig(method=method, bits=2, group_size=128)
     if method == QuantMethod.RTN:
         quantizer = RTNQuantizer(cfg)
@@ -21,17 +27,19 @@ def test_tiled_vs_untiled_mathematical_parity(method):
         quantizer = TernaryQuantizer(cfg)
     else:
         quantizer = HQQQuantizer(cfg, max_iters=10)
-        
+
     # 1. Monolithic untiled baseline
     res_untiled = quantizer.quantize(w.clone())
     deq_untiled = quantizer.dequantize(res_untiled)
-    
+
     # 2. Constrained budget forcing 4 tiles
-    tight_budget = MemoryBudgetConfig(max_vram_mb=100.0, runtime_reserve_mb=10.0, safety_margin_mb=10.0)
+    tight_budget = MemoryBudgetConfig(
+        max_vram_mb=100.0, runtime_reserve_mb=10.0, safety_margin_mb=10.0
+    )
     tiler = MatrixTiler(tight_budget)
     res_tiled, _ = tiler.quantize_matrix(w.clone(), quantizer=quantizer, target_device="cpu")
     deq_tiled = quantizer.dequantize(res_tiled)
-    
+
     # Mathematical parity check
     diff = torch.max(torch.abs(deq_untiled.float() - deq_tiled.float())).item()
     assert diff < 1e-4, f"Tiled and untiled outputs differ by {diff} for {method}"
@@ -42,34 +50,40 @@ def test_tiled_vs_untiled_mathematical_parity(method):
 # Group padding and VRAM estimation (R1 T1.7)
 # --------------------------------------------------------------------------- #
 
-from pockettitan.quantizers import get_quantizer
-from pockettitan.scheduler.budget import (
-    compute_work_unit_bounds,
-    estimate_tensor_vram_requirement,
-    group_padding_factor,
-    source_dtype_bytes,
-)
-
 # The n-gram shard that OOM'd the pipeline: (2500012, 160) BF16.
 PLE_SHARD_SHAPE = [2500012, 160]
 
 
-@pytest.mark.parametrize("in_features,group_size,expected", [
-    (2560, 128, 1.0),
-    (160, 160, 1.0),
-    (160, 128, 1.6),      # pads 160 -> 256
-    (160, 0, 1.0),        # per-tensor scaling: no padding
-    (160, -1, 1.0),
-    (129, 128, 256 / 129),
-])
+@pytest.mark.parametrize(
+    "in_features,group_size,expected",
+    [
+        (2560, 128, 1.0),
+        (160, 160, 1.0),
+        (160, 128, 1.6),  # pads 160 -> 256
+        (160, 0, 1.0),  # per-tensor scaling: no padding
+        (160, -1, 1.0),
+        (129, 128, 256 / 129),
+    ],
+)
 def test_group_padding_factor(in_features, group_size, expected):
     assert group_padding_factor(in_features, group_size) == pytest.approx(expected)
 
 
-@pytest.mark.parametrize("dtype,expected", [
-    ("BF16", 2), ("F16", 2), ("float16", 2), ("F32", 4), ("float32", 4),
-    ("F8_E4M3", 1), ("FLOAT8_E5M2", 1), ("I8", 1), ("U8", 1), ("I64", 8),
-])
+@pytest.mark.parametrize(
+    "dtype,expected",
+    [
+        ("BF16", 2),
+        ("F16", 2),
+        ("float16", 2),
+        ("F32", 4),
+        ("float32", 4),
+        ("F8_E4M3", 1),
+        ("FLOAT8_E5M2", 1),
+        ("I8", 1),
+        ("U8", 1),
+        ("I64", 8),
+    ],
+)
 def test_source_dtype_bytes(dtype, expected):
     assert source_dtype_bytes(dtype) == expected
 
@@ -118,20 +132,34 @@ def test_tighter_group_size_needs_fewer_tiles():
     wm = quantizer.capabilities.workspace_multiplier
 
     padded = compute_work_unit_bounds(
-        PLE_SHARD_SHAPE, budget,
-        QuantConfig(method=QuantMethod.TERNARY, bits=2, group_size=128), "BF16", wm,
+        PLE_SHARD_SHAPE,
+        budget,
+        QuantConfig(method=QuantMethod.TERNARY, bits=2, group_size=128),
+        "BF16",
+        wm,
     )
     aligned = compute_work_unit_bounds(
-        PLE_SHARD_SHAPE, budget,
-        QuantConfig(method=QuantMethod.TERNARY, bits=2, group_size=160), "BF16", wm,
+        PLE_SHARD_SHAPE,
+        budget,
+        QuantConfig(method=QuantMethod.TERNARY, bits=2, group_size=160),
+        "BF16",
+        wm,
     )
     assert aligned["num_tiles"] < padded["num_tiles"]
 
 
-@pytest.mark.parametrize("method", [
-    QuantMethod.TERNARY, QuantMethod.RTN, QuantMethod.INTX, QuantMethod.HQQ,
-    QuantMethod.GPTQ, QuantMethod.AWQ, QuantMethod.AUTOROUND,
-])
+@pytest.mark.parametrize(
+    "method",
+    [
+        QuantMethod.TERNARY,
+        QuantMethod.RTN,
+        QuantMethod.INTX,
+        QuantMethod.HQQ,
+        QuantMethod.GPTQ,
+        QuantMethod.AWQ,
+        QuantMethod.AUTOROUND,
+    ],
+)
 def test_declared_workspace_multiplier_is_not_optimistic(method):
     """Declared multipliers must exceed measured peaks, or the tiler will OOM.
 
@@ -140,8 +168,12 @@ def test_declared_workspace_multiplier_is_not_optimistic(method):
     under-declared by 3-6x.
     """
     measured = {
-        QuantMethod.TERNARY: 6.51, QuantMethod.RTN: 6.05, QuantMethod.INTX: 6.05,
-        QuantMethod.HQQ: 12.09, QuantMethod.GPTQ: 12.39, QuantMethod.AWQ: 14.09,
+        QuantMethod.TERNARY: 6.51,
+        QuantMethod.RTN: 6.05,
+        QuantMethod.INTX: 6.05,
+        QuantMethod.HQQ: 12.09,
+        QuantMethod.GPTQ: 12.39,
+        QuantMethod.AWQ: 14.09,
         QuantMethod.AUTOROUND: 34.06,
     }
     quantizer = get_quantizer(QuantConfig(method=method, bits=4, group_size=128))
@@ -162,5 +194,9 @@ def test_ple_shard_tile_fits_real_vram():
     )
 
     tile = torch.randn(bounds["tile_rows"], 160, dtype=torch.bfloat16) * 0.02
-    _, peak_mb = MatrixTiler(budget).quantize_matrix(tile, quantizer=quantizer, target_device="cuda")
-    assert peak_mb < budget.usable_vram_mb, f"peak {peak_mb:.0f} MiB exceeded {budget.usable_vram_mb:.0f} MiB"
+    _, peak_mb = MatrixTiler(budget).quantize_matrix(
+        tile, quantizer=quantizer, target_device="cuda"
+    )
+    assert peak_mb < budget.usable_vram_mb, (
+        f"peak {peak_mb:.0f} MiB exceeded {budget.usable_vram_mb:.0f} MiB"
+    )

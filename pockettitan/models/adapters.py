@@ -1,7 +1,7 @@
 """Model Architecture Adapters for extracting structural topologies across diverse LLM families."""
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Tuple
 
 
 class BaseModelAdapter(ABC):
@@ -34,13 +34,20 @@ class BaseModelAdapter(ABC):
 
     def extract_source_dtype(self) -> Tuple[str, bool]:
         """Extract source dtype string and whether it is FP8 format.
-        
+
         Returns:
             (source_dtype_str, is_fp8)
         """
         dtype = self.config.get("torch_dtype", self.raw_config.get("torch_dtype", "bfloat16"))
         dtype_str = str(dtype).replace("torch.", "")
-        is_fp8 = dtype_str.upper() in ["FP8", "FLOAT8", "F8_E4M3", "F8_E5M2", "FLOAT8_E4M3FN", "FLOAT8_E5M2"]
+        is_fp8 = dtype_str.upper() in [
+            "FP8",
+            "FLOAT8",
+            "F8_E4M3",
+            "F8_E5M2",
+            "FLOAT8_E4M3FN",
+            "FLOAT8_E5M2",
+        ]
         return dtype_str, is_fp8
 
 
@@ -53,7 +60,9 @@ class GenericAdapter(BaseModelAdapter):
 
     def extract_dimensions(self) -> Dict[str, Any]:
         hidden_size = self.config.get("hidden_size", self.config.get("d_model", 4096))
-        num_layers = self.config.get("num_hidden_layers", self.config.get("n_layer", self.config.get("num_layers", 32)))
+        num_layers = self.config.get(
+            "num_hidden_layers", self.config.get("n_layer", self.config.get("num_layers", 32))
+        )
         num_heads = self.config.get("num_attention_heads", self.config.get("n_head", 32))
         num_kv_heads = self.config.get("num_key_value_heads", num_heads)
         intermediate_size = self.config.get("intermediate_size", self.config.get("n_inner", None))
@@ -118,24 +127,42 @@ class GLM5NextAdapter(BaseModelAdapter):
     def extract_moe_topology(self) -> Dict[str, Any]:
         cfg = self.config
         is_moe = self.is_moe_architecture()
-        num_experts = cfg.get("n_routed_experts", cfg.get("num_experts", cfg.get("num_local_experts", None)))
-        num_experts_per_tok = cfg.get("num_experts_per_tok", cfg.get("top_k", cfg.get("moe_top_k", None)))
-        expert_intermediate_size = cfg.get("moe_intermediate_size", cfg.get("expert_intermediate_size", None))
+        num_experts = cfg.get(
+            "n_routed_experts", cfg.get("num_experts", cfg.get("num_local_experts", None))
+        )
+        num_experts_per_tok = cfg.get(
+            "num_experts_per_tok", cfg.get("top_k", cfg.get("moe_top_k", None))
+        )
+        expert_intermediate_size = cfg.get(
+            "moe_intermediate_size", cfg.get("expert_intermediate_size", None)
+        )
         shared_expert_intermediate_size = cfg.get("shared_expert_intermediate_size", None)
         first_k_dense_replace = cfg.get("first_k_dense_replace", 0)
 
         # In GLM architectures, shared experts can be defined by num_shared_experts
         num_shared = cfg.get("n_shared_experts", cfg.get("num_shared_experts", 0))
-        if num_shared > 0 and shared_expert_intermediate_size is None and expert_intermediate_size is not None:
+        if (
+            num_shared > 0
+            and shared_expert_intermediate_size is None
+            and expert_intermediate_size is not None
+        ):
             shared_expert_intermediate_size = expert_intermediate_size * num_shared
 
         return {
             "is_moe": is_moe,
             "num_experts": int(num_experts) if num_experts is not None else None,
-            "num_experts_per_tok": int(num_experts_per_tok) if num_experts_per_tok is not None else None,
-            "expert_intermediate_size": int(expert_intermediate_size) if expert_intermediate_size is not None else None,
-            "shared_expert_intermediate_size": int(shared_expert_intermediate_size) if shared_expert_intermediate_size is not None else None,
-            "first_k_dense_replace": int(first_k_dense_replace) if first_k_dense_replace is not None else None,
+            "num_experts_per_tok": int(num_experts_per_tok)
+            if num_experts_per_tok is not None
+            else None,
+            "expert_intermediate_size": int(expert_intermediate_size)
+            if expert_intermediate_size is not None
+            else None,
+            "shared_expert_intermediate_size": int(shared_expert_intermediate_size)
+            if shared_expert_intermediate_size is not None
+            else None,
+            "first_k_dense_replace": int(first_k_dense_replace)
+            if first_k_dense_replace is not None
+            else None,
         }
 
 
@@ -164,16 +191,22 @@ class DeepSeekAdapter(BaseModelAdapter):
         }
 
     def is_moe_architecture(self) -> bool:
-        return self.config.get("n_routed_experts") is not None or self.config.get("n_shared_experts") is not None
+        return (
+            self.config.get("n_routed_experts") is not None
+            or self.config.get("n_shared_experts") is not None
+        )
 
     def extract_moe_topology(self) -> Dict[str, Any]:
         cfg = self.config
         num_experts = cfg.get("n_routed_experts", 256)
         num_experts_per_tok = cfg.get("num_experts_per_tok", 8)
         expert_intermediate_size = cfg.get("moe_intermediate_size", 2048)
-        
+
         num_shared = cfg.get("n_shared_experts", 1)
-        shared_size = cfg.get("shared_expert_intermediate_size", expert_intermediate_size * num_shared if expert_intermediate_size else None)
+        shared_size = cfg.get(
+            "shared_expert_intermediate_size",
+            expert_intermediate_size * num_shared if expert_intermediate_size else None,
+        )
         first_k_dense_replace = cfg.get("first_k_dense_replace", 3)
 
         return {
@@ -219,7 +252,7 @@ class QwenMoEAdapter(BaseModelAdapter):
         num_experts_per_tok = cfg.get("num_experts_per_tok", cfg.get("moe_num_experts_per_tok", 4))
         expert_intermediate_size = cfg.get("moe_intermediate_size", 1408)
         shared_size = cfg.get("shared_expert_intermediate_size", None)
-        
+
         return {
             "is_moe": True,
             "num_experts": int(num_experts),
@@ -255,7 +288,10 @@ class MixtralAdapter(BaseModelAdapter):
         }
 
     def is_moe_architecture(self) -> bool:
-        return self.config.get("num_local_experts") is not None or self.config.get("num_experts") is not None
+        return (
+            self.config.get("num_local_experts") is not None
+            or self.config.get("num_experts") is not None
+        )
 
     def extract_moe_topology(self) -> Dict[str, Any]:
         cfg = self.config
@@ -282,11 +318,20 @@ def get_model_adapter(config: Dict[str, Any]) -> BaseModelAdapter:
         return GLM5NextAdapter(config)
 
     # 2. DeepSeek check
-    if "deepseek" in arch_str or "deepseek" in model_type or "n_routed_experts" in config or "n_shared_experts" in config:
+    if (
+        "deepseek" in arch_str
+        or "deepseek" in model_type
+        or "n_routed_experts" in config
+        or "n_shared_experts" in config
+    ):
         return DeepSeekAdapter(config)
 
     # 3. Qwen MoE check
-    if "qwen2moe" in arch_str or "qwen2_moe" in model_type or ("qwen" in model_type and ("num_experts" in config or "moe_num_experts" in config)):
+    if (
+        "qwen2moe" in arch_str
+        or "qwen2_moe" in model_type
+        or ("qwen" in model_type and ("num_experts" in config or "moe_num_experts" in config))
+    ):
         return QwenMoEAdapter(config)
 
     # 4. Mixtral check
@@ -299,4 +344,3 @@ def get_model_adapter(config: Dict[str, Any]) -> BaseModelAdapter:
 
     # Fallback to GenericAdapter
     return GenericAdapter(config)
-

@@ -1,11 +1,10 @@
 """Half-Quadratic Quantization (HQQ) Backend with Proximal Coordinate Descent."""
 
-import math
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from pockettitan.config import QuantConfig, QuantMethod
+from pockettitan.config import QuantConfig
 from pockettitan.quantizers.base import BaseQuantizer, QuantizerCapabilities, QuantizedResult
 from pockettitan.quantizers.rtn import RTNQuantizer
 
@@ -42,45 +41,49 @@ class HQQQuantizer(BaseQuantizer):
         orig_shape = weight.shape
         orig_dtype = weight.dtype
         device = str(weight.device)
-        
+
         w_2d = weight.view(-1, orig_shape[-1]).to(torch.float32)
         out_features, in_features = w_2d.shape
         group_size = self.config.group_size if self.config.group_size > 0 else in_features
-        
+
         pad_k = (group_size - (in_features % group_size)) % group_size
         padded_in_features = in_features + pad_k
         if pad_k > 0:
             w_2d = F.pad(w_2d, (0, pad_k))
-            
+
         num_groups = padded_in_features // group_size
         bits = self.config.bits
         max_int = (1 << bits) - 1
-        
+
         w_grouped = w_2d.view(out_features, num_groups, group_size)
-        
+
         # 1. Initialize scales and zeros with RTN
         w_min = torch.amin(w_grouped, dim=-1, keepdim=True)
         w_max = torch.amax(w_grouped, dim=-1, keepdim=True)
         scales = torch.clamp((w_max - w_min) / float(max_int), min=1e-8)
         zeros = torch.clamp(torch.round(-w_min / scales), 0, max_int)
-        
+
         # 2. Proximal Coordinate Descent Loop
         for _ in range(self.max_iters):
             q_grouped = torch.clamp(torch.round(w_grouped / scales) + zeros, 0, max_int)
             deq_centered = q_grouped - zeros
-            
+
             numerator = torch.sum(w_grouped * deq_centered, dim=-1, keepdim=True)
-            denominator = torch.clamp(torch.sum(deq_centered ** 2, dim=-1, keepdim=True), min=1e-8)
+            denominator = torch.clamp(torch.sum(deq_centered**2, dim=-1, keepdim=True), min=1e-8)
             scales = torch.clamp(numerator / denominator, min=1e-8)
-            
+
             q_scaled = q_grouped * scales
-            zeros = torch.clamp(torch.round(torch.mean(q_scaled - w_grouped, dim=-1, keepdim=True) / scales), 0, max_int)
+            zeros = torch.clamp(
+                torch.round(torch.mean(q_scaled - w_grouped, dim=-1, keepdim=True) / scales),
+                0,
+                max_int,
+            )
 
         q_grouped = torch.clamp(torch.round(w_grouped / scales) + zeros, 0, max_int)
         q_flat = q_grouped.view(out_features, padded_in_features).to(torch.uint8)
-        
+
         packed_weights = RTNQuantizer._pack_tensor(q_flat, bits)
-        
+
         return QuantizedResult(
             packed_weights=packed_weights,
             scales=scales.squeeze(-1).to(torch.float16),
@@ -98,18 +101,24 @@ class HQQQuantizer(BaseQuantizer):
         out_features = orig_shape[0]
         in_features = orig_shape[1] if len(orig_shape) > 1 else 1
         bits = quantized.quant_config.bits
-        group_size = quantized.quant_config.group_size if quantized.quant_config.group_size > 0 else in_features
-        
+        group_size = (
+            quantized.quant_config.group_size
+            if quantized.quant_config.group_size > 0
+            else in_features
+        )
+
         pad_k = (group_size - (in_features % group_size)) % group_size
         padded_in_features = in_features + pad_k
-        
-        unpacked = RTNQuantizer._unpack_tensor(quantized.packed_weights, bits, (out_features, padded_in_features))
+
+        unpacked = RTNQuantizer._unpack_tensor(
+            quantized.packed_weights, bits, (out_features, padded_in_features)
+        )
         num_groups = padded_in_features // group_size
-        
+
         q_grouped = unpacked.view(out_features, num_groups, group_size).to(torch.float32)
         scales = quantized.scales.view(out_features, num_groups, 1).to(torch.float32)
         zeros = quantized.zeros.view(out_features, num_groups, 1).to(torch.float32)
-        
+
         w_deq = (q_grouped - zeros) * scales
         w_flat = w_deq.view(out_features, padded_in_features)[:, :in_features]
         return w_flat.view(orig_shape).to(quantized.original_dtype)

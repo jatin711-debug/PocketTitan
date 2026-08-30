@@ -1,11 +1,10 @@
 """Memory-bounded Micro-Tiler executing post-training quantization under hard VRAM budgets."""
 
-import math
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Optional, Tuple
 import torch
 
-from pockettitan.config import MemoryBudgetConfig, QuantConfig, TensorAddress
-from pockettitan.models.layout import Dense2DLayout, FusedExperts3DLayout, get_layout_adapter
+from pockettitan.config import MemoryBudgetConfig, TensorAddress
+from pockettitan.models.layout import FusedExperts3DLayout, get_layout_adapter
 from pockettitan.quantizers.base import BaseQuantizer, QuantizedResult
 from pockettitan.scheduler.budget import compute_work_unit_bounds
 
@@ -26,7 +25,7 @@ class MatrixTiler:
         chunk_callback: Optional[Callable[[int, int], None]] = None,
     ) -> Tuple[QuantizedResult, float]:
         """Stream and quantize a tensor directly from its address without materializing oversized tensors in VRAM.
-        
+
         Calculates work unit row bounds BEFORE moving weights to accelerator memory.
         """
         shape = tensor_addr.shape
@@ -34,19 +33,20 @@ class MatrixTiler:
         dtype_str = tensor_addr.dtype
         layout = get_layout_adapter(name, shape, dtype_str)
         is_local = hasattr(reader, "root_dir")
-        
-        exec_device = target_device if (target_device == "cuda" and torch.cuda.is_available()) else "cpu"
-        
+
+        exec_device = (
+            target_device if (target_device == "cuda" and torch.cuda.is_available()) else "cpu"
+        )
+
         # 1. Handle Fused 3-D Experts Layout ([num_experts, out_features, in_features])
         if isinstance(layout, FusedExperts3DLayout):
             num_experts = layout.get_num_subunits()
-            expert_shape = layout.get_subunit_shape(0)
-            
+
             packed_experts = []
             scale_experts = []
             zero_experts = []
             peak_vram_mb = 0.0
-            
+
             # For local memory-mapped reader, slice directly via safe_open
             if is_local and hasattr(reader, "read_3d_expert_slice"):
                 for exp_idx in range(num_experts):
@@ -81,11 +81,15 @@ class MatrixTiler:
                         zero_experts.append(exp_res.zeros)
                     del exp_tensor, exp_res
                 del full_3d
-                
+
             combined_packed = torch.stack(packed_experts, dim=0)
             combined_scales = torch.stack(scale_experts, dim=0)
-            combined_zeros = torch.stack(zero_experts, dim=0) if zero_experts and zero_experts[0] is not None else None
-            
+            combined_zeros = (
+                torch.stack(zero_experts, dim=0)
+                if zero_experts and zero_experts[0] is not None
+                else None
+            )
+
             res = QuantizedResult(
                 packed_weights=combined_packed,
                 scales=combined_scales,
@@ -94,7 +98,9 @@ class MatrixTiler:
                 quant_config=quantizer.config,
                 original_shape=tuple(shape),
                 original_dtype=torch.float16,
-                bit_width=float(quantizer.config.bits if quantizer.config.method != "ternary" else 1.58),
+                bit_width=float(
+                    quantizer.config.bits if quantizer.config.method != "ternary" else 1.58
+                ),
                 device=exec_device,
             )
             return res, peak_vram_mb
@@ -108,7 +114,7 @@ class MatrixTiler:
             source_dtype=dtype_str,
             workspace_multiplier=quantizer.capabilities.workspace_multiplier,
         )
-        
+
         # If matrix fits within budget without slicing, fetch whole tensor
         if not bounds["needs_tiling"] or bounds["num_tiles"] <= 1:
             tensor_data = reader.read_tensor(tensor_addr, chunk_callback=chunk_callback)
@@ -122,12 +128,12 @@ class MatrixTiler:
         # 3. Memory-Bounded Sliced Streaming
         tile_rows = bounds["tile_rows"]
         num_tiles = bounds["num_tiles"]
-        
+
         packed_tiles = []
         scale_tiles = []
         zero_tiles = []
         peak_vram_mb = 0.0
-        
+
         if is_local and hasattr(reader, "read_slice"):
             for i in range(num_tiles):
                 r_start = i * tile_rows
@@ -165,11 +171,13 @@ class MatrixTiler:
                     zero_tiles.append(tile_res.zeros)
                 del tile_tensor, tile_res
             del full_t
-            
+
         combined_packed = torch.cat(packed_tiles, dim=0)
         combined_scales = torch.cat(scale_tiles, dim=0)
-        combined_zeros = torch.cat(zero_tiles, dim=0) if zero_tiles and zero_tiles[0] is not None else None
-        
+        combined_zeros = (
+            torch.cat(zero_tiles, dim=0) if zero_tiles and zero_tiles[0] is not None else None
+        )
+
         res = QuantizedResult(
             packed_weights=combined_packed,
             scales=combined_scales,
@@ -178,7 +186,9 @@ class MatrixTiler:
             quant_config=quantizer.config,
             original_shape=tuple(shape),
             original_dtype=torch.float16,
-            bit_width=float(quantizer.config.bits if quantizer.config.method != "ternary" else 1.58),
+            bit_width=float(
+                quantizer.config.bits if quantizer.config.method != "ternary" else 1.58
+            ),
             device=exec_device,
         )
         return res, peak_vram_mb
@@ -195,13 +205,15 @@ class MatrixTiler:
         orig_shape = weight.shape
         orig_dtype = weight.dtype
         out_features, in_features = orig_shape[0], orig_shape[1] if len(orig_shape) > 1 else 1
-        
-        exec_device = target_device if (target_device == "cuda" and torch.cuda.is_available()) else "cpu"
-        
+
+        exec_device = (
+            target_device if (target_device == "cuda" and torch.cuda.is_available()) else "cpu"
+        )
+
         if exec_device == "cuda":
             torch.cuda.reset_peak_memory_stats()
             torch.cuda.empty_cache()
-            
+
         bounds = compute_work_unit_bounds(
             matrix_shape=[out_features, in_features],
             budget=self.budget,
@@ -209,16 +221,18 @@ class MatrixTiler:
             source_dtype=str(orig_dtype).replace("torch.", ""),
             workspace_multiplier=quantizer.capabilities.workspace_multiplier,
         )
-        
+
         tile_rows = bounds["tile_rows"]
         num_tiles = bounds["num_tiles"]
-        
-        h_gpu = hessian.to(exec_device) if (hessian is not None and exec_device == "cuda") else hessian
-        
+
+        h_gpu = (
+            hessian.to(exec_device) if (hessian is not None and exec_device == "cuda") else hessian
+        )
+
         if not bounds["needs_tiling"] or num_tiles <= 1:
             w_gpu = weight.to(exec_device)
             res = quantizer.quantize(w_gpu, hessian=h_gpu)
-            
+
             peak_vram_mb = 0.0
             if exec_device == "cuda":
                 peak_vram_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
@@ -237,25 +251,25 @@ class MatrixTiler:
         scale_tiles = []
         zero_tiles = []
         peak_vram_mb = 0.0
-        
+
         for i in range(num_tiles):
             r_start = i * tile_rows
             r_end = min(out_features, (i + 1) * tile_rows)
-            
+
             tile_cpu = weight[r_start:r_end, :]
             tile_gpu = tile_cpu.to(exec_device)
-            
+
             tile_res = quantizer.quantize(tile_gpu, hessian=h_gpu)
-            
+
             if exec_device == "cuda":
                 tile_peak = torch.cuda.max_memory_allocated() / (1024 * 1024)
                 peak_vram_mb = max(peak_vram_mb, tile_peak)
-                
+
             packed_tiles.append(tile_res.packed_weights.cpu())
             scale_tiles.append(tile_res.scales.cpu())
             if tile_res.zeros is not None:
                 zero_tiles.append(tile_res.zeros.cpu())
-                
+
             del tile_gpu, tile_res
             if exec_device == "cuda":
                 torch.cuda.empty_cache()
@@ -266,8 +280,10 @@ class MatrixTiler:
 
         combined_packed = torch.cat(packed_tiles, dim=0)
         combined_scales = torch.cat(scale_tiles, dim=0)
-        combined_zeros = torch.cat(zero_tiles, dim=0) if zero_tiles and zero_tiles[0] is not None else None
-        
+        combined_zeros = (
+            torch.cat(zero_tiles, dim=0) if zero_tiles and zero_tiles[0] is not None else None
+        )
+
         res = QuantizedResult(
             packed_weights=combined_packed,
             scales=combined_scales,
@@ -276,7 +292,9 @@ class MatrixTiler:
             quant_config=quantizer.config,
             original_shape=orig_shape,
             original_dtype=orig_dtype,
-            bit_width=float(quantizer.config.bits if quantizer.config.method != "ternary" else 1.58),
+            bit_width=float(
+                quantizer.config.bits if quantizer.config.method != "ternary" else 1.58
+            ),
             device=exec_device,
         )
         return res, peak_vram_mb

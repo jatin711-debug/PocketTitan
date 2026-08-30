@@ -1,6 +1,5 @@
 """Online Hessian accumulation and activation outlier detector."""
 
-from typing import Optional, Tuple
 import torch
 
 
@@ -18,7 +17,7 @@ class HessianAccumulator:
         """Accumulate activation matrix X of shape [batch, seq_len, in_features] or [N, in_features]."""
         x_2d = x.view(-1, self.in_features).to(self.device, dtype=self.dtype)
         batch_count = x_2d.shape[0]
-        
+
         # In-place symmetric accumulation: H += X^T @ X
         self.hessian.addmm_(x_2d.t(), x_2d)
         self.num_samples += batch_count
@@ -28,9 +27,9 @@ class HessianAccumulator:
         """Return (1/N)*H with ridge dampening on the diagonal for numerical stability."""
         if self.num_samples == 0:
             return torch.eye(self.in_features, dtype=self.dtype, device=self.device)
-            
+
         h_norm = self.hessian / max(1, self.num_samples)
-        
+
         # Add diagonal dampening lambda * mean(diag(H)) * I
         diag_mean = torch.mean(torch.diag(h_norm)).item()
         damp = dampening_lambda * max(1e-5, diag_mean)

@@ -5,7 +5,7 @@ from typing import Dict, List, Optional
 from pydantic import BaseModel, Field
 
 from pockettitan.config import TensorAddress
-from pockettitan.models.generic import AttentionWeights, TransformerLayerStructure
+from pockettitan.models.generic import AttentionWeights
 
 
 class ExpertWeights(BaseModel):
@@ -51,19 +51,23 @@ def parse_moe_layer_structure(
 ) -> MoELayerStructure:
     """Classify all tensors in an MoE layer into router, shared experts, and routed experts."""
     struct = MoELayerStructure(layer_idx=layer_idx)
-    
+
     # Regex pattern to identify expert indices: e.g. .experts.12. or .expert_12. or .experts_12.
     expert_pattern = re.compile(r"experts?[._](\d+)")
-    
+
     for t in layer_tensors:
         name_lower = t.name.lower()
-        
+
         # Norms
         if "input_layernorm" in name_lower or "attn_norm" in name_lower or "ln_1" in name_lower:
             struct.input_layernorm = t
-        elif "post_attention_layernorm" in name_lower or "ffn_norm" in name_lower or "ln_2" in name_lower:
+        elif (
+            "post_attention_layernorm" in name_lower
+            or "ffn_norm" in name_lower
+            or "ln_2" in name_lower
+        ):
             struct.post_attention_layernorm = t
-            
+
         # Attention
         elif "q_proj" in name_lower or "query" in name_lower or "wq" in name_lower:
             struct.attention.q_proj = t
@@ -75,11 +79,14 @@ def parse_moe_layer_structure(
             struct.attention.o_proj = t
         elif "qkv" in name_lower:
             struct.attention.qkv_fused = t
-            
+
         # Router Gate Logits
-        elif any(g in name_lower for g in ["gate.weight", "router.weight", "gate_logits", "router.classifier"]):
+        elif any(
+            g in name_lower
+            for g in ["gate.weight", "router.weight", "gate_logits", "router.classifier"]
+        ):
             struct.router_gate = t
-            
+
         # Shared Experts (DeepSeek, GLM, Qwen-MoE)
         elif "shared_expert" in name_lower or "shared_experts" in name_lower:
             if struct.shared_experts is None:
@@ -92,7 +99,7 @@ def parse_moe_layer_structure(
                 struct.shared_experts.down_proj = t
             else:
                 struct.shared_experts.other_tensors.append(t)
-                
+
         # Routed Experts
         elif "expert" in name_lower:
             match = expert_pattern.search(name_lower)
@@ -100,7 +107,7 @@ def parse_moe_layer_structure(
                 e_idx = int(match.group(1))
                 if e_idx not in struct.routed_experts:
                     struct.routed_experts[e_idx] = ExpertWeights(expert_idx=e_idx)
-                    
+
                 exp = struct.routed_experts[e_idx]
                 if "gate_proj" in name_lower or "w1" in name_lower or "w_gate" in name_lower:
                     exp.gate_proj = t
@@ -116,5 +123,5 @@ def parse_moe_layer_structure(
                 struct.other_tensors.append(t)
         else:
             struct.other_tensors.append(t)
-            
+
     return struct

@@ -20,12 +20,12 @@ from pockettitan.audit.classify import Tier
 DEFAULT_CONTEXTS: Sequence[int] = (2048, 4096, 8192, 32768, 131072)
 
 UNICODE_GLYPHS: Dict[str, str] = {
-    "ok": "✓",       # ✓
-    "warn": "⚠",     # ⚠
-    "bullet": "·",   # ·
-    "arrow": "→",    # →
-    "inf": "∞",      # ∞
-    "times": "×",    # ×
+    "ok": "✓",  # ✓
+    "warn": "⚠",  # ⚠
+    "bullet": "·",  # ·
+    "arrow": "→",  # →
+    "inf": "∞",  # ∞
+    "times": "×",  # ×
 }
 ASCII_GLYPHS: Dict[str, str] = {
     "ok": "OK",
@@ -108,7 +108,9 @@ def render_summary(report: AuditReport, glyphs: Optional[Dict[str, str]] = None)
     ]
 
     if report.discrepancies:
-        lines.append(f"[bold yellow]{g['warn']} {len(report.discrepancies)} discrepancies[/bold yellow]")
+        lines.append(
+            f"[bold yellow]{g['warn']} {len(report.discrepancies)} discrepancies[/bold yellow]"
+        )
         for item in report.discrepancies[:5]:
             lines.append(f"  [yellow]{g['bullet']} {item}[/yellow]")
     else:
@@ -124,7 +126,9 @@ def render_summary(report: AuditReport, glyphs: Optional[Dict[str, str]] = None)
 
 
 def render_components(report: AuditReport, glyphs: Optional[Dict[str, str]] = None) -> Table:
-    table = Table(title="[bold]Component Decomposition[/bold]", show_header=True, header_style="bold")
+    table = Table(
+        title="[bold]Component Decomposition[/bold]", show_header=True, header_style="bold"
+    )
     table.add_column("Component", style="cyan", no_wrap=True)
     table.add_column("Cap", style="dim")
     table.add_column("Tier", no_wrap=True)
@@ -149,7 +153,9 @@ def render_components(report: AuditReport, glyphs: Optional[Dict[str, str]] = No
 
     table.add_section()
     table.add_row(
-        "[bold]TOTAL[/bold]", "", "",
+        "[bold]TOTAL[/bold]",
+        "",
+        "",
         f"[bold]{report.num_tensors:,}[/bold]",
         f"[bold]{total:,}[/bold]",
         "[bold]100.00%[/bold]",
@@ -222,7 +228,8 @@ def render_storage(report: AuditReport, glyphs: Optional[Dict[str, str]] = None)
 
     table.add_section()
     table.add_row(
-        "[bold]TOTAL ON NVMe[/bold]", "",
+        "[bold]TOTAL ON NVMe[/bold]",
+        "",
         f"[bold]{storage.total_params:,}[/bold]",
         f"[bold]{storage.average_bits:.2f}[/bold]",
         f"[bold]{fmt_bytes(storage.total_packed_bytes)}[/bold]",
@@ -232,7 +239,10 @@ def render_storage(report: AuditReport, glyphs: Optional[Dict[str, str]] = None)
         if resident:
             style = _TIER_STYLE[tier]
             table.add_row(
-                f"[dim]  {g['arrow']} resident in {_TIER_LABEL[tier]}[/dim]", "", "", "",
+                f"[dim]  {g['arrow']} resident in {_TIER_LABEL[tier]}[/dim]",
+                "",
+                "",
+                "",
                 f"[{style}]{fmt_bytes(resident)}[/{style}]",
             )
     return table

@@ -1,8 +1,6 @@
 """Unit tests for GGUF and vLLM format exporters."""
 
-import pytest
 import struct
-from pathlib import Path
 
 from pockettitan.config import MemoryBudgetConfig, QuantConfig, QuantMethod
 from pockettitan.exporters.gguf import GGUFExporter
@@ -25,11 +23,11 @@ def test_gguf_and_vllm_export(dummy_transformer_model, tmp_path):
     gguf_output_file = tmp_path / "model.gguf"
     gguf_exporter = GGUFExporter(quantized_dir)
     res_gguf = gguf_exporter.export(gguf_output_file)
-    
+
     assert res_gguf.status == "success"
     assert gguf_output_file.exists()
     assert gguf_output_file.stat().st_size > 0
-    
+
     # Check GGUF Magic Header
     with open(gguf_output_file, "rb") as f:
         magic = f.read(4)
@@ -41,7 +39,7 @@ def test_gguf_and_vllm_export(dummy_transformer_model, tmp_path):
     vllm_output_dir = tmp_path / "vllm_model"
     vllm_exporter = VLLMExporter(quantized_dir)
     res_vllm = vllm_exporter.export(vllm_output_dir)
-    
+
     assert res_vllm.status == "success"
     assert (vllm_output_dir / "config.json").exists()
     assert (vllm_output_dir / "model.safetensors.index.json").exists()

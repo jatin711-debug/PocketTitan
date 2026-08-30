@@ -1,6 +1,5 @@
 """Activation spooling between layers for single-pass forward calibration chaining."""
 
-import os
 import tempfile
 from pathlib import Path
 from typing import Iterator, List, Optional, Union
@@ -16,9 +15,11 @@ class ActivationSpool:
         spool_dir: Optional[Union[str, Path]] = None,
     ):
         self.max_bytes = max_in_memory_mb * 1024 * 1024
-        self.spool_dir = Path(spool_dir) if spool_dir else Path(tempfile.gettempdir()) / "pockettitan_spool"
+        self.spool_dir = (
+            Path(spool_dir) if spool_dir else Path(tempfile.gettempdir()) / "pockettitan_spool"
+        )
         self.spool_dir.mkdir(parents=True, exist_ok=True)
-        
+
         self._in_memory_buffers: List[torch.Tensor] = []
         self._disk_spool_files: List[Path] = []
         self._current_in_memory_bytes = 0
@@ -27,7 +28,7 @@ class ActivationSpool:
         """Add activation batch [batch_size, seq_len, hidden_dim]."""
         x_cpu = x.detach().cpu().contiguous()
         num_bytes = x_cpu.nbytes
-        
+
         if self._current_in_memory_bytes + num_bytes > self.max_bytes:
             # Spool to temporary file
             idx = len(self._disk_spool_files)
@@ -42,7 +43,7 @@ class ActivationSpool:
         """Iterate over all stored activation batches."""
         for buf in self._in_memory_buffers:
             yield buf
-            
+
         for file_path in self._disk_spool_files:
             if file_path.exists():
                 tensor = torch.load(str(file_path), map_location="cpu", weights_only=True)
@@ -52,7 +53,7 @@ class ActivationSpool:
         """Clear memory buffers and delete spooled disk files."""
         self._in_memory_buffers.clear()
         self._current_in_memory_bytes = 0
-        
+
         for file_path in self._disk_spool_files:
             if file_path.exists():
                 try:
