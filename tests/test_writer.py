@@ -8,6 +8,8 @@ imprecise, so an approximate comparison is a sharp test.
 """
 
 import json
+import threading
+import time
 
 import pytest
 import safetensors.torch
@@ -285,6 +287,155 @@ def test_resume_skips_completed_work(dummy_moe_model, tmp_path):
     assert second.items_skipped == plan.num_work_items
     assert second.items_written == 0
     assert second.bytes_written == 0
+
+
+def test_resume_status_counts_committed_items_and_source_bytes(dummy_moe_model, tmp_path):
+    plan, writer, _ = build_package(dummy_moe_model, tmp_path)
+    writer.build()
+
+    status = writer.resume_status()
+
+    assert status.items_completed == plan.num_work_items
+    assert status.total_items == plan.num_work_items
+    assert status.source_bytes_completed == plan.source_read_bytes
+    assert status.total_source_bytes == plan.source_read_bytes
+    assert status.finished
+
+
+def test_resume_status_excludes_uncommitted_work(dummy_moe_model, tmp_path):
+    plan, writer, _ = build_package(dummy_moe_model, tmp_path)
+    writer.build()
+    journal = BuildJournal.model_validate_json(writer.journal_path.read_text(encoding="utf-8"))
+
+    removed_name = journal.dense_done.pop()
+    journal.dense_checksums.pop(removed_name)
+    removed_record = journal.expert_done.pop()
+    journal.expert_checksums.pop(str(removed_record))
+    journal.finished = False
+    writer.journal_path.write_text(journal.model_dump_json(), encoding="utf-8")
+
+    status = writer.resume_status()
+    removed_dense = next(item for item in plan.dense if item.address.name == removed_name)
+    removed_expert = next(item for item in plan.experts if item.record_index == removed_record)
+    expected = (
+        plan.source_read_bytes
+        - removed_dense.address.size_bytes
+        - removed_expert.expert_slice.source_bytes
+    )
+
+    assert status.items_completed == plan.num_work_items - 2
+    assert status.source_bytes_completed == expected
+    assert not status.finished
+
+
+def test_each_dense_tensor_is_committed_before_the_next_download(
+    dummy_transformer_model, tmp_path, monkeypatch
+):
+    """A cancellation may repeat the active tensor, but not earlier dense tensors."""
+    plan, writer, _ = build_package(dummy_transformer_model, tmp_path)
+    original_encode = writer._encode_dense
+    attempted = 0
+
+    def stop_during_second_tensor(item, tensor):
+        nonlocal attempted
+        attempted += 1
+        if attempted == 2:
+            raise RuntimeError("cancelled during second tensor")
+        return original_encode(item, tensor)
+
+    monkeypatch.setattr(writer, "_encode_dense", stop_during_second_tensor)
+    with pytest.raises(RuntimeError, match="cancelled during second tensor"):
+        writer.build()
+
+    journal = BuildJournal.model_validate_json(writer.journal_path.read_text(encoding="utf-8"))
+    assert len(journal.dense_done) == 1
+
+    _, resumed, _ = build_package(dummy_transformer_model, tmp_path)
+    result = resumed.build()
+    assert result.items_skipped == 1
+    assert result.items_written == plan.num_work_items - 1
+
+
+def test_remote_dense_downloads_overlap_with_bounded_staging(
+    dummy_transformer_model, tmp_path, monkeypatch
+):
+    """Three downloaders may run, but their reserved bytes never exceed the cap."""
+    plan = plan_package(
+        scan_checkpoint(str(dummy_transformer_model)),
+        precision_map=TEST_PRECISION,
+    )
+    local = LocalTensorReader(dummy_transformer_model)
+
+    class InstrumentedRemoteReader:
+        def __init__(self):
+            self.active = 0
+            self.max_active = 0
+            self.lock = threading.Lock()
+
+        def read_tensor(self, address, chunk_callback=None, cancel_event=None):
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            try:
+                time.sleep(0.03)
+                if cancel_event is not None and cancel_event.is_set():
+                    raise InterruptedError("cancelled")
+                tensor = local.read_tensor(address)
+                if chunk_callback:
+                    chunk_callback(address.size_bytes, address.size_bytes)
+                return tensor
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+    reader = InstrumentedRemoteReader()
+    budget = MemoryBudgetConfig(max_vram_mb=512, max_cpu_staging_mb=4)
+    writer = PackageWriter(
+        plan,
+        tmp_path / "parallel.ptitan",
+        reader,
+        budget=budget,
+        method=QuantMethod.RTN,
+        device="cpu",
+        download_workers=3,
+    )
+    # This reader is remote-shaped for the prefetch path but uses a local test
+    # fixture, so runtime assets are intentionally outside this test's scope.
+    monkeypatch.setattr(writer, "_copy_runtime_assets", lambda: None)
+    downloaded = []
+
+    result = writer.build(on_bytes=downloaded.append)
+
+    assert reader.max_active >= 2
+    assert result.download_workers == 3
+    assert 0 < result.peak_inflight_source_bytes <= 4 * 1024 * 1024
+    assert sum(downloaded) == plan.source_read_bytes
+
+
+def test_parallel_download_refuses_an_item_larger_than_the_staging_cap(
+    dummy_transformer_model, tmp_path
+):
+    plan = plan_package(
+        scan_checkpoint(str(dummy_transformer_model)),
+        precision_map=TEST_PRECISION,
+    )
+
+    class NeverCalledReader:
+        def read_tensor(self, address, chunk_callback=None, cancel_event=None):
+            raise AssertionError("the staging check must happen before download")
+
+    writer = PackageWriter(
+        plan,
+        tmp_path / "too-small.ptitan",
+        NeverCalledReader(),
+        budget=MemoryBudgetConfig(max_vram_mb=512, max_cpu_staging_mb=0.25),
+        method=QuantMethod.RTN,
+        device="cpu",
+        download_workers=3,
+    )
+
+    with pytest.raises(WriteError, match="max-inflight-source"):
+        writer.build()
 
 
 def test_resume_completes_a_partial_build(dummy_moe_model, tmp_path):

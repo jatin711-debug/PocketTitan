@@ -1,6 +1,7 @@
 """PocketTitan Command Line Interface."""
 
 import json
+import os
 import sys
 from contextlib import nullcontext
 from pathlib import Path
@@ -10,16 +11,33 @@ import typer
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
+from rich.progress import BarColumn, DownloadColumn, Progress, TextColumn, TimeRemainingColumn
 from rich.table import Table
 
 from pockettitan import __version__
 from pockettitan.audit import Capability, build_audit_report, get_precision_preset, scan_checkpoint
 from pockettitan.audit.report import render_report
 from pockettitan.config import MemoryBudgetConfig, QuantConfig, QuantMethod, parse_memory_to_mb
+from pockettitan.domainslice import (
+    CompositeWeightStore,
+    ModelRevision,
+    PocketTitanPageStore,
+    RemoteHuggingFaceStore,
+    WeightPageID,
+    generate_olmoe_text,
+)
+from pockettitan.domainslice.hypothesis import (
+    run_olmoe_block_hypothesis,
+    run_olmoe_full_model_hypothesis,
+    run_olmoe_full_model_reference,
+    run_olmoe_layer_hypothesis,
+    run_olmoe_two_position_generation,
+)
 from pockettitan.export.validator import CheckpointValidator
 from pockettitan.exporters.gguf import GGUFExporter
 from pockettitan.exporters.vllm import VLLMExporter
 from pockettitan.metadata.tensor_index import build_tensor_address_table
+from pockettitan.metadata.repo import resolve_model_revision
 from pockettitan.package import PackageWriter, PtitanValidator, plan_package
 from pockettitan.package.report import render_plan
 from pockettitan.pipeline.layer_pipeline import QuantizationPipeline
@@ -39,6 +57,12 @@ app = typer.Typer(
     help="External-memory post-training quantization engine for extreme-scale LLMs.",
     add_completion=False,
 )
+domainslice_app = typer.Typer(
+    name="domainslice",
+    help="Inspect and demand-page routed experts from immutable checkpoints.",
+    no_args_is_help=True,
+)
+app.add_typer(domainslice_app, name="domainslice")
 
 
 def _configure_stdio_encoding() -> None:
@@ -90,6 +114,934 @@ def format_params(num_params: int) -> str:
     return str(num_params)
 
 
+@domainslice_app.command("inspect")
+def domainslice_inspect(
+    model: str = typer.Argument(..., help="Hugging Face model ID"),
+    revision: Optional[str] = typer.Option(
+        None, "--revision", help="Branch, tag, or immutable checkpoint commit"
+    ),
+):
+    """Resolve an MoE checkpoint and inspect its virtual expert address space."""
+    token = os.environ.get("HF_TOKEN")
+    try:
+        with console.status("[cyan]Resolving immutable model revision..."):
+            commit_sha = resolve_model_revision(model, token=token, revision=revision)
+        model_revision = ModelRevision(repo_id=model, commit_sha=commit_sha)
+        remote = RemoteHuggingFaceStore(model_revision, token=token, max_workers=3)
+        with console.status("[cyan]Reading Safetensors headers (no weight payloads)..."):
+            address_table = remote.address_table
+    except Exception as exc:
+        console.print(f"[bold red]DomainSlice inspection failed:[/bold red] {escape(str(exc))}")
+        raise typer.Exit(code=1) from exc
+
+    metadata = address_table.metadata
+    summary = Table(title="[bold green]DomainSlice Model Address Space[/bold green]")
+    summary.add_column("Field", style="cyan")
+    summary.add_column("Value", style="white")
+    summary.add_row("Repository", model)
+    summary.add_row("Immutable revision", commit_sha)
+    summary.add_row("Architecture", metadata.architecture)
+    summary.add_row("MoE", "yes" if metadata.is_moe else "no")
+    summary.add_row("Layers", str(metadata.num_hidden_layers))
+    summary.add_row("Experts/layer", str(metadata.num_experts or 0))
+    summary.add_row("Experts/token", str(metadata.num_experts_per_tok or 0))
+    summary.add_row("Expert width", str(metadata.expert_intermediate_size or 0))
+    summary.add_row("Checkpoint shards", str(len(metadata.shards)))
+    summary.add_row("Addressed tensors", f"{len(address_table.tensors):,}")
+    summary.add_row("Addressed payload", format_size(address_table.total_bytes))
+    summary.add_row("Authentication", "HF_TOKEN" if token else "anonymous")
+    console.print(summary)
+    if not metadata.is_moe:
+        console.print(
+            "[yellow]This is a dense model. Use sequential layer streaming; routed-expert "
+            "demand paging does not apply.[/yellow]"
+        )
+
+
+@domainslice_app.command("fetch-expert")
+def domainslice_fetch_expert(
+    model: str = typer.Argument(..., help="Hugging Face MoE model ID"),
+    layer: int = typer.Option(..., "--layer", min=0, help="Transformer layer index"),
+    expert: int = typer.Option(..., "--expert", min=0, help="Routed expert index"),
+    cache_dir: Path = typer.Option(..., "--cache-dir", help="Local NVMe page-cache directory"),
+    revision: Optional[str] = typer.Option(
+        None, "--revision", help="Branch, tag, or immutable checkpoint commit"
+    ),
+    download_workers: int = typer.Option(
+        3,
+        "--download-workers",
+        min=1,
+        max=32,
+        help="Parallel projection-range downloads",
+    ),
+    max_cache: str = typer.Option(
+        "50GB", "--max-cache", help="Maximum completed local page-cache size"
+    ),
+):
+    """Fetch one routed expert as an interruption-safe immutable local page."""
+    token = os.environ.get("HF_TOKEN")
+    max_cache_bytes = int(parse_memory_to_mb(max_cache) * 1024 * 1024)
+    store = None
+    handle = None
+    try:
+        console.print("[cyan]1/5[/cyan] Resolving immutable model revision")
+        commit_sha = resolve_model_revision(model, token=token, revision=revision)
+        model_revision = ModelRevision(repo_id=model, commit_sha=commit_sha)
+        page_id = WeightPageID.expert(model_revision, layer, expert)
+        local = PocketTitanPageStore(cache_dir, max_cache_bytes=max_cache_bytes)
+        remote = RemoteHuggingFaceStore(
+            model_revision,
+            token=token,
+            max_workers=download_workers,
+        )
+        store = CompositeWeightStore(local, remote, download_workers=download_workers)
+
+        console.print("[cyan]2/5[/cyan] Looking up the verified local page")
+        local_descriptor = local.resolve(page_id)
+        if local_descriptor is None:
+            console.print("[cyan]3/5[/cyan] Reading checkpoint headers and resolving exact ranges")
+        else:
+            console.print("[cyan]3/5[/cyan] Reusing the cached page descriptor")
+        descriptor = store.resolve(page_id)
+
+        ranges = Table(title=f"Expert page — layer {layer}, expert {expert}")
+        ranges.add_column("Projection", style="cyan")
+        ranges.add_column("Shard")
+        ranges.add_column("Byte range", justify="right")
+        ranges.add_column("Payload", justify="right")
+        for item in descriptor.source_slices:
+            ranges.add_row(
+                item.projection,
+                item.shard,
+                f"{item.byte_start:,}..{item.byte_end - 1:,}",
+                format_size(item.size_bytes),
+            )
+        console.print(ranges)
+
+        console.print("[cyan]4/5[/cyan] Materializing and verifying the expert page")
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            DownloadColumn(),
+            TimeRemainingColumn(),
+            console=console,
+        ) as progress_bar:
+            task = progress_bar.add_task("Exact expert payload", total=descriptor.expected_bytes)
+
+            def report(_stage: str, _item: str, count: int, _total: int) -> None:
+                progress_bar.advance(task, count)
+
+            handle = store.materialize(page_id, progress=report)
+            progress_bar.update(task, completed=descriptor.expected_bytes)
+
+        stats = store.stats()
+        console.print("[cyan]5/5[/cyan] Page committed and cache accounting updated")
+        result = Table(title="[bold green]DomainSlice Fetch Result[/bold green]")
+        result.add_column("Metric", style="cyan")
+        result.add_column("Value", style="white")
+        result.add_row("Repository", model)
+        result.add_row("Immutable revision", commit_sha)
+        result.add_row("Page", page_id.logical_key)
+        result.add_row("Cache", "HIT" if handle.cache_hit else "MISS")
+        result.add_row("Requested payload", format_size(descriptor.expected_bytes))
+        result.add_row("Network payload", format_size(handle.bytes_fetched))
+        result.add_row("Reused partial bytes", format_size(handle.bytes_resumed))
+        result.add_row("Page size", format_size(handle.size_bytes))
+        result.add_row("SHA-256", handle.checksum)
+        result.add_row("Cache occupancy", format_size(stats.cache_occupancy_bytes))
+        result.add_row("Cached pages", str(stats.cached_pages))
+        result.add_row("Elapsed", f"{handle.timings.get('total_seconds', 0.0):.3f} s")
+        result.add_row("Path", str(handle.path.resolve()))
+        console.print(result)
+    except Exception as exc:
+        console.print(f"[bold red]DomainSlice fetch failed:[/bold red] {escape(str(exc))}")
+        raise typer.Exit(code=1) from exc
+    finally:
+        if store is not None:
+            if handle is not None:
+                store.release(handle)
+            store.close()
+
+
+@domainslice_app.command("test-block")
+def domainslice_test_block(
+    model: str = typer.Argument(..., help="Hugging Face OLMoE model ID"),
+    cache_dir: Path = typer.Option(..., "--cache-dir", help="Local NVMe page-cache directory"),
+    layer: int = typer.Option(9, "--layer", min=0, help="MoE layer to test"),
+    tokens: int = typer.Option(1, "--tokens", min=1, max=16, help="Synthetic hidden-state tokens"),
+    seed: int = typer.Option(42, "--seed", help="Deterministic hidden-state seed"),
+    device: str = typer.Option(
+        "cpu", "--device", help="Expert execution device: cpu, cuda, or auto"
+    ),
+    revision: Optional[str] = typer.Option(
+        None, "--revision", help="Branch, tag, or immutable checkpoint commit"
+    ),
+    download_workers: int = typer.Option(
+        3, "--download-workers", min=1, max=32, help="Parallel expert projection downloads"
+    ),
+    max_cache: str = typer.Option(
+        "2GB", "--max-cache", help="Maximum completed local page-cache size"
+    ),
+    output: Optional[Path] = typer.Option(
+        None, "--output", "-o", help="Optional JSON path for the measured result"
+    ),
+):
+    """Compare one real page-backed OLMoE block against Transformers."""
+    token = os.environ.get("HF_TOKEN")
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device not in {"cpu", "cuda"}:
+        raise typer.BadParameter("--device must be cpu, cuda, or auto")
+    max_cache_bytes = int(parse_memory_to_mb(max_cache) * 1024 * 1024)
+    store = None
+    try:
+        commit_sha = resolve_model_revision(model, token=token, revision=revision)
+        model_revision = ModelRevision(repo_id=model, commit_sha=commit_sha)
+        local = PocketTitanPageStore(cache_dir, max_cache_bytes=max_cache_bytes)
+        remote = RemoteHuggingFaceStore(
+            model_revision,
+            token=token,
+            max_workers=download_workers,
+        )
+        store = CompositeWeightStore(local, remote, download_workers=download_workers)
+        console.print(
+            f"[bold cyan]Testing OLMoE layer {layer}[/bold cyan] on {device}; "
+            "the first run faults routed experts and the second must be local."
+        )
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            DownloadColumn(),
+            TimeRemainingColumn(),
+            console=console,
+        ) as progress_bar:
+            task = progress_bar.add_task("Remote expert payload", total=None)
+
+            def report(_stage: str, _item: str, count: int, _total: int) -> None:
+                progress_bar.advance(task, count)
+
+            result = run_olmoe_block_hypothesis(
+                store,
+                remote,
+                layer=layer,
+                tokens=tokens,
+                seed=seed,
+                execution_device=device,
+                progress=report,
+            )
+
+        routing = Table(title="Routing and residency")
+        routing.add_column("Metric", style="cyan")
+        routing.add_column("First run", justify="right")
+        routing.add_column("Warm run", justify="right")
+        routing.add_row("Experts", ", ".join(map(str, result.selected_experts)), "same")
+        routing.add_row("Page faults", str(result.cold.page_faults), str(result.warm.page_faults))
+        routing.add_row("Page hits", str(result.cold.page_hits), str(result.warm.page_hits))
+        routing.add_row(
+            "Remote expert bytes",
+            format_size(result.cold.remote_bytes),
+            format_size(result.warm.remote_bytes),
+        )
+        routing.add_row(
+            "Runtime",
+            f"{result.cold.elapsed_seconds:.3f} s",
+            f"{result.warm.elapsed_seconds:.3f} s",
+        )
+        routing.add_row(
+            "Peak staged projection",
+            format_size(result.cold.peak_projection_bytes),
+            format_size(result.warm.peak_projection_bytes),
+        )
+        console.print(routing)
+
+        parity = Table(title="Transformers parity")
+        parity.add_column("Metric", style="cyan")
+        parity.add_column("Value", justify="right")
+        parity.add_row("Result", "PASS" if result.passed else "FAIL")
+        parity.add_row("Max absolute error", f"{result.max_abs_error:.8f}")
+        parity.add_row("Mean absolute error", f"{result.mean_abs_error:.8f}")
+        parity.add_row("Cosine similarity", f"{result.cosine_similarity:.8f}")
+        parity.add_row("Argmax agreement", f"{result.argmax_agreement:.2%}")
+        parity.add_row("Router payload", format_size(result.router_payload_bytes))
+        parity.add_row("Cache occupancy", format_size(result.cache_occupancy_bytes))
+        if device == "cuda":
+            parity.add_row("Peak CUDA allocation", format_size(result.cold.peak_cuda_bytes))
+        console.print(parity)
+        if output is not None:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(result.model_dump_json(indent=2), encoding="utf-8")
+            console.print(f"[green]Measured result written to[/green] {output.resolve()}")
+        if not result.passed:
+            raise typer.Exit(code=2)
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        console.print(f"[bold red]DomainSlice block test failed:[/bold red] {escape(str(exc))}")
+        raise typer.Exit(code=1) from exc
+    finally:
+        if store is not None:
+            store.close()
+
+
+@domainslice_app.command("test-layer")
+def domainslice_test_layer(
+    model: str = typer.Argument(..., help="Hugging Face OLMoE model ID"),
+    cache_dir: Path = typer.Option(..., "--cache-dir", help="Local NVMe page-cache directory"),
+    layer: int = typer.Option(9, "--layer", min=0, help="Decoder layer to test"),
+    seed: int = typer.Option(42, "--seed", help="Deterministic hidden-state seed"),
+    device: str = typer.Option(
+        "cpu", "--device", help="Layer execution device: cpu, cuda, or auto"
+    ),
+    revision: Optional[str] = typer.Option(
+        None, "--revision", help="Branch, tag, or immutable checkpoint commit"
+    ),
+    download_workers: int = typer.Option(
+        3, "--download-workers", min=1, max=32, help="Parallel range downloads"
+    ),
+    max_cache: str = typer.Option("2GB", "--max-cache", help="Maximum local page cache"),
+    output: Optional[Path] = typer.Option(
+        None, "--output", "-o", help="Optional JSON path for the measured result"
+    ),
+):
+    """Assemble and run one complete OLMoE decoder layer from pages."""
+    token = os.environ.get("HF_TOKEN")
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device not in {"cpu", "cuda"}:
+        raise typer.BadParameter("--device must be cpu, cuda, or auto")
+    max_cache_bytes = int(parse_memory_to_mb(max_cache) * 1024 * 1024)
+    store = None
+    try:
+        commit_sha = resolve_model_revision(model, token=token, revision=revision)
+        model_revision = ModelRevision(repo_id=model, commit_sha=commit_sha)
+        local = PocketTitanPageStore(cache_dir, max_cache_bytes=max_cache_bytes)
+        remote = RemoteHuggingFaceStore(
+            model_revision,
+            token=token,
+            max_workers=download_workers,
+        )
+        store = CompositeWeightStore(local, remote, download_workers=download_workers)
+        console.print(
+            f"[bold cyan]Testing complete OLMoE decoder layer {layer}[/bold cyan] on {device}"
+        )
+        result = run_olmoe_layer_hypothesis(
+            store,
+            remote,
+            layer=layer,
+            seed=seed,
+            execution_device=device,
+        )
+
+        table = Table(title="DomainSlice complete-layer hypothesis")
+        table.add_column("Metric", style="cyan")
+        table.add_column("First", justify="right")
+        table.add_column("Warm", justify="right")
+        table.add_row("Result", "PASS" if result.passed else "FAIL", "deterministic")
+        table.add_row(
+            "Backbone pages",
+            f"{result.backbone.page_faults} faults / {result.backbone.page_hits} hits",
+            "resident",
+        )
+        table.add_row(
+            "Backbone payload", format_size(result.backbone.remote_bytes), "0 B"
+        )
+        table.add_row(
+            "Expert pages",
+            f"{result.first.page_faults} faults / {result.first.page_hits} hits",
+            f"{result.warm.page_faults} faults / {result.warm.page_hits} hits",
+        )
+        table.add_row(
+            "Expert payload",
+            format_size(result.first.remote_bytes),
+            format_size(result.warm.remote_bytes),
+        )
+        table.add_row(
+            "Expert runtime",
+            f"{result.first.elapsed_seconds:.3f} s",
+            f"{result.warm.elapsed_seconds:.3f} s",
+        )
+        table.add_row(
+            "Peak staged projection",
+            format_size(result.first.peak_projection_bytes),
+            format_size(result.warm.peak_projection_bytes),
+        )
+        if device == "cuda":
+            table.add_row(
+                "Peak CUDA allocation",
+                format_size(result.first.peak_cuda_bytes),
+                format_size(result.warm.peak_cuda_bytes),
+            )
+        table.add_row(
+            "Total first remote payload", format_size(result.total_first_remote_bytes), "0 B"
+        )
+        table.add_row(
+            "Warm output delta", f"{result.warm_max_abs_delta:.8f}", "bit-identical"
+        )
+        table.add_row("Selected experts", ", ".join(map(str, result.selected_experts)), "same")
+        table.add_row("Cache occupancy", format_size(result.cache_occupancy_bytes), "same")
+        console.print(table)
+        if output is not None:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(result.model_dump_json(indent=2), encoding="utf-8")
+            console.print(f"[green]Measured result written to[/green] {output.resolve()}")
+        if not result.passed:
+            raise typer.Exit(code=2)
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        console.print(f"[bold red]DomainSlice layer test failed:[/bold red] {escape(str(exc))}")
+        raise typer.Exit(code=1) from exc
+    finally:
+        if store is not None:
+            store.close()
+
+
+@domainslice_app.command("test-model")
+def domainslice_test_model(
+    model: str = typer.Argument(..., help="Hugging Face OLMoE model ID"),
+    cache_dir: Path = typer.Option(..., "--cache-dir", help="Local NVMe page-cache directory"),
+    input_token_id: int = typer.Option(1, "--input-token-id", min=0),
+    device: str = typer.Option(
+        "auto", "--device", help="Sequential execution device: cpu, cuda, or auto"
+    ),
+    revision: Optional[str] = typer.Option(
+        None, "--revision", help="Branch, tag, or immutable checkpoint commit"
+    ),
+    download_workers: int = typer.Option(
+        3, "--download-workers", min=1, max=32, help="Parallel range downloads"
+    ),
+    max_cache: str = typer.Option("4GB", "--max-cache", help="Maximum local page cache"),
+    max_vram: str = typer.Option("3584MB", "--max-vram", help="Measured CUDA budget"),
+    max_ram: str = typer.Option("12GB", "--max-ram", help="Measured process RSS budget"),
+    head_chunk: str = typer.Option(
+        "8MB", "--head-chunk", help="Maximum LM-head projection staged at once"
+    ),
+    output: Optional[Path] = typer.Option(
+        None, "--output", "-o", help="Optional JSON path for the measured result"
+    ),
+):
+    """Run one real token through every OLMoE layer and require warm logits."""
+    token = os.environ.get("HF_TOKEN")
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device not in {"cpu", "cuda"}:
+        raise typer.BadParameter("--device must be cpu, cuda, or auto")
+    max_cache_bytes = int(parse_memory_to_mb(max_cache) * 1024 * 1024)
+    max_vram_mb = parse_memory_to_mb(max_vram)
+    max_ram_mb = parse_memory_to_mb(max_ram)
+    head_chunk_bytes = int(parse_memory_to_mb(head_chunk) * 1024 * 1024)
+    max_vram_bytes = int(max_vram_mb * 1024 * 1024)
+    max_ram_bytes = int(max_ram_mb * 1024 * 1024)
+    if device == "cuda":
+        apply_cuda_memory_fraction(MemoryBudgetConfig(max_vram_mb=max_vram_mb))
+    store = None
+    try:
+        commit_sha = resolve_model_revision(model, token=token, revision=revision)
+        model_revision = ModelRevision(repo_id=model, commit_sha=commit_sha)
+        local = PocketTitanPageStore(cache_dir, max_cache_bytes=max_cache_bytes)
+        remote = RemoteHuggingFaceStore(
+            model_revision,
+            token=token,
+            max_workers=download_workers,
+        )
+        total_layers = remote.address_table.metadata.num_hidden_layers
+        store = CompositeWeightStore(local, remote, download_workers=download_workers)
+        console.print(
+            f"[bold cyan]Testing complete OLMoE model[/bold cyan] on {device}; "
+            f"input token {input_token_id}, VRAM cap {format_size(max_vram_bytes)}, "
+            f"RAM cap {format_size(max_ram_bytes)}"
+        )
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            DownloadColumn(),
+            TimeRemainingColumn(),
+            console=console,
+        ) as progress_bar:
+            task = progress_bar.add_task("Discovering checkpoint", total=None)
+
+            def report(_stage: str, _item: str, count: int, _total: int) -> None:
+                progress_bar.advance(task, count)
+
+            def layer_report(phase: str, item) -> None:
+                progress_bar.update(
+                    task,
+                    description=(
+                        f"{phase}: layer {item.layer + 1}/{total_layers} "
+                        f"({item.experts.page_faults} expert faults, "
+                        f"{item.elapsed_seconds:.1f}s)"
+                    ),
+                )
+
+            result = run_olmoe_full_model_hypothesis(
+                store,
+                remote,
+                input_token_id=input_token_id,
+                execution_device=device,
+                head_chunk_bytes=head_chunk_bytes,
+                max_vram_bytes=max_vram_bytes,
+                max_ram_bytes=max_ram_bytes,
+                progress=report,
+                layer_callback=layer_report,
+            )
+
+        table = Table(title="DomainSlice end-to-end one-token hypothesis")
+        table.add_column("Metric", style="cyan")
+        table.add_column("First", justify="right")
+        table.add_column("Warm", justify="right")
+        table.add_row("Result", "PASS" if result.passed else "FAIL", "exact replay")
+        table.add_row(
+            "Runtime",
+            f"{result.first.elapsed_seconds:.3f} s",
+            f"{result.warm.elapsed_seconds:.3f} s",
+        )
+        table.add_row(
+            "Remote payload",
+            format_size(result.first.total_remote_bytes),
+            format_size(result.warm.total_remote_bytes),
+        )
+        table.add_row(
+            "Global pages",
+            f"{result.first.global_page_faults} faults / {result.first.global_page_hits} hits",
+            f"{result.warm.global_page_faults} faults / {result.warm.global_page_hits} hits",
+        )
+        table.add_row(
+            "Backbone pages",
+            f"{result.first.backbone_page_faults} faults / "
+            f"{result.first.backbone_page_hits} hits",
+            f"{result.warm.backbone_page_faults} faults / "
+            f"{result.warm.backbone_page_hits} hits",
+        )
+        table.add_row(
+            "Expert pages",
+            f"{result.first.expert_page_faults} faults / {result.first.expert_page_hits} hits",
+            f"{result.warm.expert_page_faults} faults / {result.warm.expert_page_hits} hits",
+        )
+        table.add_row(
+            "Logical page bytes",
+            format_size(result.first.logical_page_bytes),
+            format_size(result.warm.logical_page_bytes),
+        )
+        table.add_row(
+            "Peak staged projection",
+            format_size(result.first.peak_projection_bytes),
+            format_size(result.warm.peak_projection_bytes),
+        )
+        table.add_row(
+            "Peak staged LM head",
+            format_size(result.first.peak_head_chunk_bytes),
+            format_size(result.warm.peak_head_chunk_bytes),
+        )
+        table.add_row(
+            "Peak process RSS",
+            format_size(result.first.peak_rss_bytes),
+            format_size(result.warm.peak_rss_bytes),
+        )
+        if device == "cuda":
+            table.add_row(
+                "Peak CUDA allocation",
+                format_size(result.first.peak_cuda_bytes),
+                format_size(result.warm.peak_cuda_bytes),
+            )
+        table.add_row(
+            "Top token",
+            f"{result.first.top_token_id} ({result.first.top_logit:.5f})",
+            f"{result.warm.top_token_id} ({result.warm.top_logit:.5f})",
+        )
+        table.add_row(
+            "Logit delta", f"{result.logits_max_abs_delta:.8f}", "bit-identical"
+        )
+        table.add_row("Cache occupancy", format_size(result.cache_occupancy_bytes), "same")
+        console.print(table)
+        if output is not None:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(result.model_dump_json(indent=2), encoding="utf-8")
+            console.print(f"[green]Measured result written to[/green] {output.resolve()}")
+        if not result.passed:
+            raise typer.Exit(code=2)
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        console.print(f"[bold red]DomainSlice model test failed:[/bold red] {escape(str(exc))}")
+        raise typer.Exit(code=1) from exc
+    finally:
+        if store is not None:
+            store.close()
+
+
+@domainslice_app.command("test-reference")
+def domainslice_test_reference(
+    model: str = typer.Argument(..., help="Hugging Face OLMoE model ID"),
+    cache_dir: Path = typer.Option(..., "--cache-dir", help="Local NVMe page-cache directory"),
+    input_token_id: int = typer.Option(1, "--input-token-id", min=0),
+    device: str = typer.Option("auto", "--device", help="cpu, cuda, or auto"),
+    revision: Optional[str] = typer.Option(None, "--revision"),
+    download_workers: int = typer.Option(3, "--download-workers", min=1, max=32),
+    max_cache: str = typer.Option("4GB", "--max-cache"),
+    max_vram: str = typer.Option("3584MB", "--max-vram"),
+    max_ram: str = typer.Option("12GB", "--max-ram"),
+    head_chunk: str = typer.Option("8MB", "--head-chunk"),
+    output: Optional[Path] = typer.Option(None, "--output", "-o"),
+):
+    """Compare a complete paged forward with official Transformers expert math."""
+    token = os.environ.get("HF_TOKEN")
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device not in {"cpu", "cuda"}:
+        raise typer.BadParameter("--device must be cpu, cuda, or auto")
+    max_cache_bytes = int(parse_memory_to_mb(max_cache) * 1024 * 1024)
+    max_vram_mb = parse_memory_to_mb(max_vram)
+    max_ram_mb = parse_memory_to_mb(max_ram)
+    head_chunk_bytes = int(parse_memory_to_mb(head_chunk) * 1024 * 1024)
+    max_vram_bytes = int(max_vram_mb * 1024 * 1024)
+    max_ram_bytes = int(max_ram_mb * 1024 * 1024)
+    if device == "cuda":
+        apply_cuda_memory_fraction(MemoryBudgetConfig(max_vram_mb=max_vram_mb))
+    store = None
+    try:
+        commit_sha = resolve_model_revision(model, token=token, revision=revision)
+        model_revision = ModelRevision(repo_id=model, commit_sha=commit_sha)
+        local = PocketTitanPageStore(cache_dir, max_cache_bytes=max_cache_bytes)
+        remote = RemoteHuggingFaceStore(
+            model_revision,
+            token=token,
+            max_workers=download_workers,
+        )
+        total_layers = remote.address_table.metadata.num_hidden_layers
+        store = CompositeWeightStore(local, remote, download_workers=download_workers)
+        console.print(
+            "[bold cyan]Comparing PocketTitan with official Transformers experts[/bold cyan]"
+        )
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            DownloadColumn(),
+            TimeRemainingColumn(),
+            console=console,
+        ) as progress_bar:
+            task = progress_bar.add_task("Preparing reference run", total=None)
+
+            def report(_stage: str, _item: str, count: int, _total: int) -> None:
+                progress_bar.advance(task, count)
+
+            def layer_report(phase: str, item) -> None:
+                progress_bar.update(
+                    task,
+                    description=(
+                        f"{phase}: layer {item.layer + 1}/{total_layers} "
+                        f"({item.elapsed_seconds:.1f}s)"
+                    ),
+                )
+
+            result = run_olmoe_full_model_reference(
+                store,
+                remote,
+                input_token_id=input_token_id,
+                execution_device=device,
+                head_chunk_bytes=head_chunk_bytes,
+                max_vram_bytes=max_vram_bytes,
+                max_ram_bytes=max_ram_bytes,
+                progress=report,
+                layer_callback=layer_report,
+            )
+
+        table = Table(title="DomainSlice independent expert-path parity")
+        table.add_column("Metric", style="cyan")
+        table.add_column("PocketTitan", justify="right")
+        table.add_column("Transformers oracle", justify="right")
+        table.add_row("Result", "PASS" if result.passed else "FAIL", "reference")
+        table.add_row(
+            "Runtime",
+            f"{result.candidate.elapsed_seconds:.3f} s",
+            f"{result.oracle.elapsed_seconds:.3f} s",
+        )
+        table.add_row(
+            "Remote payload",
+            format_size(result.candidate.total_remote_bytes),
+            format_size(result.oracle.total_remote_bytes),
+        )
+        table.add_row(
+            "Peak CUDA allocation",
+            format_size(result.candidate.peak_cuda_bytes),
+            format_size(result.oracle.peak_cuda_bytes),
+        )
+        table.add_row(
+            "Peak sampled RSS",
+            format_size(result.candidate.peak_rss_bytes),
+            format_size(result.oracle.peak_rss_bytes),
+        )
+        table.add_row("Maximum error", f"{result.max_abs_error:.8f}", "0 is exact")
+        table.add_row("Mean error", f"{result.mean_abs_error:.8f}", "0 is exact")
+        table.add_row("Cosine similarity", f"{result.cosine_similarity:.8f}", "1 is exact")
+        table.add_row("Argmax agreement", str(result.argmax_agreement), "required")
+        table.add_row("Routing agreement", str(result.routing_agreement), "required")
+        table.add_row("Bit exact", str(result.bit_exact), "strongest gate")
+        console.print(table)
+        if output is not None:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(result.model_dump_json(indent=2), encoding="utf-8")
+            console.print(f"[green]Measured result written to[/green] {output.resolve()}")
+        if not result.passed:
+            raise typer.Exit(code=2)
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        console.print(f"[bold red]DomainSlice reference test failed:[/bold red] {escape(str(exc))}")
+        raise typer.Exit(code=1) from exc
+    finally:
+        if store is not None:
+            store.close()
+
+
+@domainslice_app.command("test-generate")
+def domainslice_test_generate(
+    model: str = typer.Argument(..., help="Hugging Face OLMoE model ID"),
+    cache_dir: Path = typer.Option(..., "--cache-dir", help="Local NVMe page-cache directory"),
+    input_token_id: int = typer.Option(1, "--input-token-id", min=0),
+    device: str = typer.Option("auto", "--device", help="cpu, cuda, or auto"),
+    revision: Optional[str] = typer.Option(None, "--revision"),
+    download_workers: int = typer.Option(3, "--download-workers", min=1, max=32),
+    max_cache: str = typer.Option("4GB", "--max-cache"),
+    max_vram: str = typer.Option("3584MB", "--max-vram"),
+    max_ram: str = typer.Option("12GB", "--max-ram"),
+    head_chunk: str = typer.Option("8MB", "--head-chunk"),
+    output: Optional[Path] = typer.Option(None, "--output", "-o"),
+):
+    """Generate across two KV-cached positions and compare with the HF oracle."""
+    token = os.environ.get("HF_TOKEN")
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device not in {"cpu", "cuda"}:
+        raise typer.BadParameter("--device must be cpu, cuda, or auto")
+    max_cache_bytes = int(parse_memory_to_mb(max_cache) * 1024 * 1024)
+    max_vram_mb = parse_memory_to_mb(max_vram)
+    max_ram_mb = parse_memory_to_mb(max_ram)
+    head_chunk_bytes = int(parse_memory_to_mb(head_chunk) * 1024 * 1024)
+    max_vram_bytes = int(max_vram_mb * 1024 * 1024)
+    max_ram_bytes = int(max_ram_mb * 1024 * 1024)
+    if device == "cuda":
+        apply_cuda_memory_fraction(MemoryBudgetConfig(max_vram_mb=max_vram_mb))
+    store = None
+    try:
+        commit_sha = resolve_model_revision(model, token=token, revision=revision)
+        model_revision = ModelRevision(repo_id=model, commit_sha=commit_sha)
+        local = PocketTitanPageStore(cache_dir, max_cache_bytes=max_cache_bytes)
+        remote = RemoteHuggingFaceStore(
+            model_revision,
+            token=token,
+            max_workers=download_workers,
+        )
+        total_layers = remote.address_table.metadata.num_hidden_layers
+        store = CompositeWeightStore(local, remote, download_workers=download_workers)
+        console.print(
+            "[bold cyan]Testing two-position KV-cached OLMoE generation[/bold cyan]"
+        )
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            DownloadColumn(),
+            TimeRemainingColumn(),
+            console=console,
+        ) as progress_bar:
+            task = progress_bar.add_task("Preparing generation", total=None)
+
+            def report(_stage: str, _item: str, count: int, _total: int) -> None:
+                progress_bar.advance(task, count)
+
+            def layer_report(phase: str, item) -> None:
+                progress_bar.update(
+                    task,
+                    description=(
+                        f"{phase}: layer {item.layer + 1}/{total_layers} "
+                        f"({item.elapsed_seconds:.1f}s)"
+                    ),
+                )
+
+            result = run_olmoe_two_position_generation(
+                store,
+                remote,
+                input_token_id=input_token_id,
+                execution_device=device,
+                head_chunk_bytes=head_chunk_bytes,
+                max_vram_bytes=max_vram_bytes,
+                max_ram_bytes=max_ram_bytes,
+                progress=report,
+                layer_callback=layer_report,
+            )
+
+        table = Table(title="DomainSlice two-position generation")
+        table.add_column("Position", justify="right")
+        table.add_column("Token transition", justify="right")
+        table.add_column("PocketTitan", justify="right")
+        table.add_column("HF oracle", justify="right")
+        table.add_column("Parity", justify="right")
+        for position in result.positions:
+            table.add_row(
+                str(position.position),
+                f"{position.input_token_id} -> {position.predicted_token_id}",
+                f"{position.candidate.elapsed_seconds:.3f}s / "
+                f"{format_size(position.candidate.total_remote_bytes)} remote",
+                f"{position.oracle.elapsed_seconds:.3f}s",
+                "exact" if position.bit_exact else f"err {position.max_abs_error:.6f}",
+            )
+        console.print(table)
+        summary = Table(title="Generation residency")
+        summary.add_column("Metric", style="cyan")
+        summary.add_column("Value", justify="right")
+        summary.add_row("Result", "PASS" if result.passed else "FAIL")
+        summary.add_row("Token IDs", " -> ".join(map(str, result.token_ids)))
+        summary.add_row("New remote payload", format_size(result.candidate_new_remote_bytes))
+        summary.add_row("Final KV cache", format_size(result.final_kv_cache_bytes))
+        summary.add_row("Cache occupancy", format_size(result.cache_occupancy_bytes))
+        summary.add_row(
+            "Peak PocketTitan CUDA",
+            format_size(max(item.candidate.peak_cuda_bytes for item in result.positions)),
+        )
+        summary.add_row(
+            "Peak sampled RSS",
+            format_size(max(item.candidate.peak_rss_bytes for item in result.positions)),
+        )
+        console.print(summary)
+        if output is not None:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(result.model_dump_json(indent=2), encoding="utf-8")
+            console.print(f"[green]Measured result written to[/green] {output.resolve()}")
+        if not result.passed:
+            raise typer.Exit(code=2)
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        console.print(f"[bold red]DomainSlice generation test failed:[/bold red] {escape(str(exc))}")
+        raise typer.Exit(code=1) from exc
+    finally:
+        if store is not None:
+            store.close()
+
+
+@domainslice_app.command("generate")
+def domainslice_generate(
+    model: str = typer.Argument(
+        "allenai/OLMoE-1B-7B-0924-Instruct",
+        help="Hugging Face OLMoE model ID",
+    ),
+    prompt: str = typer.Option(
+        "Explain what a memory hierarchy is in simple terms.",
+        "--prompt",
+        "-p",
+        help="Input text prompt to generate from",
+    ),
+    cache_dir: Path = typer.Option(
+        Path("./olmoe-cache"),
+        "--cache-dir",
+        help="Local NVMe page-cache directory",
+    ),
+    max_new_tokens: int = typer.Option(32, "--max-new-tokens", "-n", min=1, max=1024),
+    temperature: float = typer.Option(0.0, "--temperature", "-t", help="0 = greedy, >0 = sampling"),
+    top_p: float = typer.Option(1.0, "--top-p", help="Nucleus sampling top-p"),
+    chat: bool = typer.Option(True, "--chat/--raw", help="Apply official tokenizer chat template"),
+    device: str = typer.Option("auto", "--device", help="cpu, cuda, or auto"),
+    revision: Optional[str] = typer.Option(None, "--revision"),
+    download_workers: int = typer.Option(3, "--download-workers", min=1, max=32),
+    max_cache: str = typer.Option("14GB", "--max-cache", help="Local NVMe page-cache budget ceiling"),
+    max_vram: str = typer.Option("3584MB", "--max-vram"),
+    head_chunk: str = typer.Option("8MB", "--head-chunk"),
+    fast: bool = typer.Option(True, "--fast/--low-vram", help="Enable resident backbone & in-memory expert cache for 20x-50x speed"),
+    vram_experts: int = typer.Option(144, "--vram-experts", help="Max experts resident in GPU VRAM"),
+    ram_experts: int = typer.Option(384, "--ram-experts", help="Max experts resident in Host RAM"),
+    quantize_ram: bool = typer.Option(False, "--quantize-ram", "--int4-cache", help="Compress Host RAM experts to 4-bit INT4 (3.3 MB each) to fit 100% of model in memory"),
+    quant_bits: int = typer.Option(4, "--quant-bits", help="Bit width for RAM expert compression (e.g. 4)"),
+    commit_routing: bool = typer.Option(False, "--commit-routing", help="Commit to VRAM-resident experts if gating affinity delta <= threshold (CommitMoE)"),
+    commit_threshold: float = typer.Option(0.15, "--commit-threshold", help="Max gating affinity gap to commit to VRAM expert"),
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Optional JSON telemetry output path"),
+):
+    """Generate text from a natural language prompt using on-demand DomainSlice expert paging."""
+    token = os.environ.get("HF_TOKEN")
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device not in {"cpu", "cuda"}:
+        raise typer.BadParameter("--device must be cpu, cuda, or auto")
+
+    max_cache_bytes = int(parse_memory_to_mb(max_cache) * 1024 * 1024)
+    max_vram_mb = parse_memory_to_mb(max_vram)
+    head_chunk_bytes = int(parse_memory_to_mb(head_chunk) * 1024 * 1024)
+
+    if device == "cuda":
+        apply_cuda_memory_fraction(MemoryBudgetConfig(max_vram_mb=max_vram_mb))
+
+    store = None
+    try:
+        commit_sha = resolve_model_revision(model, token=token, revision=revision)
+        model_revision = ModelRevision(repo_id=model, commit_sha=commit_sha)
+        local = PocketTitanPageStore(cache_dir, max_cache_bytes=max_cache_bytes)
+        remote = RemoteHuggingFaceStore(
+            model_revision,
+            token=token,
+            max_workers=download_workers,
+        )
+        store = CompositeWeightStore(local, remote, download_workers=download_workers)
+
+        mode_desc = "FAST-PATH" if fast else "LOW-VRAM"
+        quant_desc = f" · INT{quant_bits}-RAM" if quantize_ram else ""
+        commit_desc = " · COMMIT" if commit_routing else ""
+        console.print(
+            f"[bold cyan]DomainSlice On-Demand Generation: {model}[/bold cyan] "
+            f"([green]{device.upper()}[/green] · [yellow]{mode_desc}{quant_desc}{commit_desc}[/yellow])"
+        )
+        console.print(f"[bold yellow]Prompt:[/bold yellow] {prompt}")
+        sys.stdout.write("Generated Response: ")
+        sys.stdout.flush()
+
+        def stream_chunk(text: str) -> None:
+            sys.stdout.write(text)
+            sys.stdout.flush()
+
+        result = generate_olmoe_text(
+            store,
+            remote,
+            prompt=prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            chat=chat,
+            execution_device=device,
+            head_chunk_bytes=head_chunk_bytes,
+            stream_callback=stream_chunk,
+            resident_backbone=fast,
+            vram_expert_capacity=vram_experts,
+            ram_expert_capacity=ram_experts,
+            quantize_ram=quantize_ram,
+            quant_bits=quant_bits,
+            commit_routing=commit_routing,
+            commit_threshold=commit_threshold,
+        )
+
+        console.print("\n")
+        summary = Table(title="DomainSlice Generation Scorecard")
+        summary.add_column("Metric", style="cyan")
+        summary.add_column("Value", justify="right")
+        for line in result.summary_lines():
+            name, _, val = line.partition(":")
+            if val:
+                summary.add_row(name.strip(), val.strip())
+            else:
+                summary.add_row("Detail", name.strip())
+        console.print(summary)
+
+        if output is not None:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(json.dumps(result.__dict__, indent=2, default=str), encoding="utf-8")
+            console.print(f"[green]Telemetry written to[/green] {output.resolve()}")
+
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        console.print(f"[bold red]DomainSlice generation failed:[/bold red] {escape(str(exc))}")
+        raise typer.Exit(code=1) from exc
+    finally:
+        if store is not None:
+            store.close()
+
+
 @app.command()
 def version():
     """Print PocketTitan version."""
@@ -102,8 +1054,7 @@ def version():
 def hardware():
     """Scan and display local hardware capabilities and memory limits."""
     hw = get_hardware_profile()
-
-    table = Table(title="[bold green]Local Hardware Profile[/bold green]", show_header=True)
+    table = Table(title='Hardware Capabilities')
     table.add_column("Resource", style="cyan", no_wrap=True)
     table.add_column("Details", style="white")
     table.add_column("Available / Capacity", style="magenta")
@@ -743,6 +1694,18 @@ def package(
         False, "--no-resume", help="Rebuild from scratch, ignoring the journal"
     ),
     workers: int = typer.Option(16, "--workers", help="Parallel shard header requests"),
+    download_workers: int = typer.Option(
+        3,
+        "--download-workers",
+        min=1,
+        max=8,
+        help="Concurrent remote tensor downloads feeding the single quantizer",
+    ),
+    max_inflight_source: str = typer.Option(
+        "2048MB",
+        "--max-inflight-source",
+        help="Hard RAM allowance for downloaded/in-flight source tensors",
+    ),
 ):
     """R1: Build a PocketTitan package — capability-filtered, repacked, quantized.
 
@@ -756,7 +1719,10 @@ def package(
         console.print(f"[bold red]{escape(str(e))}[/bold red]")
         raise typer.Exit(code=1)
 
-    budget = MemoryBudgetConfig(max_vram_mb=parse_memory_to_mb(max_vram))
+    budget = MemoryBudgetConfig(
+        max_vram_mb=parse_memory_to_mb(max_vram),
+        max_cpu_staging_mb=parse_memory_to_mb(max_inflight_source),
+    )
     console.print(
         f"[bold green]Packaging [cyan]{model}[/cyan] -> [cyan]{output}[/cyan][/bold green] "
         f"[dim](precision={precision_map.name}, method={method.value}, VRAM cap {budget.max_vram_mb:.0f} MiB)[/dim]"
@@ -797,35 +1763,90 @@ def package(
         method=method,
         device=device,
         resume=not no_resume,
+        download_workers=download_workers,
     )
 
     from rich.progress import (
         BarColumn,
-        DownloadColumn,
         Progress,
+        ProgressColumn,
         TaskProgressColumn,
         TextColumn,
         TimeRemainingColumn,
-        TransferSpeedColumn,
     )
+    from rich.text import Text
+
+    class PipelineDetailColumn(ProgressColumn):
+        """Render byte and work-item tasks without pretending items are bytes."""
+
+        def render(self, task):
+            total = task.total or 0
+            if task.fields.get("unit") == "bytes":
+                speed = task.speed or 0.0
+                suffix = f" · {format_size(speed)}/s" if speed else ""
+                return Text(
+                    f"{format_size(task.completed)} / {format_size(total)}{suffix}",
+                    style="progress.data.speed",
+                )
+            return Text(
+                f"{int(task.completed):,} / {int(total):,} items",
+                style="progress.data.speed",
+            )
 
     console.print()
     try:
+        resume_status = writer.resume_status()
+        if resume_status.items_completed:
+            console.print(
+                "[bold cyan]Resuming:[/bold cyan] "
+                f"{resume_status.items_completed:,}/{resume_status.total_items:,} work items "
+                f"already committed; skipping "
+                f"{format_size(resume_status.source_bytes_completed)} of source reads."
+            )
+        source_is_remote = not scan.is_local
+        active_download_workers = download_workers if source_is_remote else 1
+        console.print(
+            "[dim]Pipeline: "
+            f"{active_download_workers} downloader(s) -> 1 {writer.device.upper()} quantizer "
+            f"-> 1 durable writer · source staging <= "
+            f"{format_size(budget.max_cpu_staging_mb * 1024 * 1024)}[/dim]"
+        )
         with Progress(
             TextColumn("[cyan]{task.description}"),
             BarColumn(),
-            DownloadColumn(),
-            TransferSpeedColumn(),
             TaskProgressColumn(),
+            PipelineDetailColumn(),
             TimeRemainingColumn(),
             console=console,
         ) as progress:
-            task = progress.add_task("Streaming and building...", total=build_plan.source_read_bytes)
+            download_task = (
+                progress.add_task(
+                    f"Downloading ({active_download_workers} workers)",
+                    total=build_plan.source_read_bytes,
+                    completed=resume_status.source_bytes_completed,
+                    unit="bytes",
+                )
+                if source_is_remote
+                else None
+            )
+            process_task = progress.add_task(
+                "Waiting for source tensors...",
+                total=build_plan.num_work_items,
+                completed=resume_status.items_completed,
+                unit="items",
+            )
+
+            def advance_download(delta):
+                if download_task is not None:
+                    progress.update(download_task, advance=delta)
+
             result = writer.build(
                 on_start=lambda region, label: progress.update(
-                    task, description=f"Streaming & quantizing [bold green]{label}[/bold green]"
+                    process_task,
+                    description=f"Quantizing [bold green]{label}[/bold green]",
                 ),
-                on_bytes=lambda delta: progress.update(task, advance=delta),
+                on_item=lambda region, label: progress.update(process_task, advance=1),
+                on_bytes=advance_download if source_is_remote else None,
             )
     except Exception as e:
         console.print(f"[bold red]Build failed:[/bold red] {escape(str(e))}")
@@ -836,6 +1857,8 @@ def package(
         f"\n[bold green]Package written to {output}[/bold green]\n"
         f"  items written {result.items_written:,} · skipped {result.items_skipped:,}\n"
         f"  bytes written {format_size(result.bytes_written)}\n"
+        f"  download workers {result.download_workers} · peak source staging "
+        f"{format_size(result.peak_inflight_source_bytes)}\n"
         f"  peak VRAM {result.peak_vram_mb:.1f} MiB / {budget.usable_vram_mb:.0f} MiB usable\n"
         f"  elapsed {result.elapsed_s:.1f} s"
     )

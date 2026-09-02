@@ -219,6 +219,59 @@ class DeepSeekAdapter(BaseModelAdapter):
         }
 
 
+class OLMoEAdapter(BaseModelAdapter):
+    """Adapter for AllenAI OLMoE checkpoints.
+
+    OLMoE uses the generic-looking ``num_experts`` field, but its expert
+    intermediate width is stored in ``intermediate_size``.  Letting it fall
+    through to the legacy generic-MoE branch incorrectly applies DeepSeek
+    defaults (256 experts and a 2048-wide expert), which in turn produces
+    invalid byte ranges.
+    """
+
+    def extract_architecture_name(self) -> str:
+        archs = self.raw_config.get("architectures", ["OlmoeForCausalLM"])
+        return archs[0] if isinstance(archs, list) and archs else "OlmoeForCausalLM"
+
+    def extract_dimensions(self) -> Dict[str, Any]:
+        cfg = self.config
+        hidden_size = cfg.get("hidden_size", 2048)
+        num_layers = cfg.get("num_hidden_layers", 16)
+        num_heads = cfg.get("num_attention_heads", 16)
+        num_kv_heads = cfg.get("num_key_value_heads", num_heads)
+        intermediate_size = cfg.get("intermediate_size", 1024)
+        vocab_size = cfg.get("vocab_size", 50304)
+        return {
+            "hidden_size": int(hidden_size),
+            "num_hidden_layers": int(num_layers),
+            "num_attention_heads": int(num_heads),
+            "num_key_value_heads": int(num_kv_heads),
+            "intermediate_size": int(intermediate_size),
+            "vocab_size": int(vocab_size),
+        }
+
+    def is_moe_architecture(self) -> bool:
+        return self.config.get("num_experts") is not None
+
+    def extract_moe_topology(self) -> Dict[str, Any]:
+        cfg = self.config
+        num_experts = cfg.get("num_experts")
+        num_experts_per_tok = cfg.get("num_experts_per_tok")
+        intermediate_size = cfg.get("intermediate_size")
+        return {
+            "is_moe": True,
+            "num_experts": int(num_experts) if num_experts is not None else None,
+            "num_experts_per_tok": int(num_experts_per_tok)
+            if num_experts_per_tok is not None
+            else None,
+            "expert_intermediate_size": int(intermediate_size)
+            if intermediate_size is not None
+            else None,
+            "shared_expert_intermediate_size": None,
+            "first_k_dense_replace": None,
+        }
+
+
 class QwenMoEAdapter(BaseModelAdapter):
     """Adapter for Qwen-MoE architectures (Qwen1.5-MoE, Qwen2-MoE, Qwen3.6 MoE)."""
 
@@ -313,11 +366,15 @@ def get_model_adapter(config: Dict[str, Any]) -> BaseModelAdapter:
     arch_str = str(config.get("architectures", [""])).lower()
     model_type = str(config.get("model_type", "")).lower()
 
-    # 1. GLM check
+    # 1. OLMoE check.  This must precede the generic ``num_experts`` branch.
+    if "olmoe" in arch_str or model_type == "olmoe":
+        return OLMoEAdapter(config)
+
+    # 2. GLM check
     if "glm" in arch_str or "glm" in model_type or "text_config" in config:
         return GLM5NextAdapter(config)
 
-    # 2. DeepSeek check
+    # 3. DeepSeek check
     if (
         "deepseek" in arch_str
         or "deepseek" in model_type
@@ -326,7 +383,7 @@ def get_model_adapter(config: Dict[str, Any]) -> BaseModelAdapter:
     ):
         return DeepSeekAdapter(config)
 
-    # 3. Qwen MoE check
+    # 4. Qwen MoE check
     if (
         "qwen2moe" in arch_str
         or "qwen2_moe" in model_type
@@ -334,11 +391,11 @@ def get_model_adapter(config: Dict[str, Any]) -> BaseModelAdapter:
     ):
         return QwenMoEAdapter(config)
 
-    # 4. Mixtral check
+    # 5. Mixtral check
     if "mixtral" in arch_str or "mixtral" in model_type or "num_local_experts" in config:
         return MixtralAdapter(config)
 
-    # 5. Generic MoE check
+    # 6. Generic MoE check
     if any(k in config for k in ["num_experts", "moe_intermediate_size", "num_routed_experts"]):
         return DeepSeekAdapter(config)
 

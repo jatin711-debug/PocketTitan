@@ -22,8 +22,11 @@ import json
 import os
 import shutil
 import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from threading import Event
+from typing import Callable, Deque, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -64,8 +67,8 @@ from pockettitan.scheduler.tiler import MatrixTiler
 
 DENSE_BLOB_NAME = "blob.bin"
 JOURNAL_NAME = "build_journal.json"
-DENSE_BATCH_ITEMS = 8
 EXPERT_BATCH_ITEMS = 64
+SOURCE_STAGING_COPIES = 2
 
 
 class WriteError(RuntimeError):
@@ -99,7 +102,19 @@ class BuildResult(BaseModel):
     items_skipped: int = 0
     bytes_written: int = 0
     peak_vram_mb: float = 0.0
+    peak_inflight_source_bytes: int = 0
+    download_workers: int = 1
     elapsed_s: float = 0.0
+
+
+class ResumeStatus(BaseModel):
+    """Durable work already committed by a compatible build journal."""
+
+    items_completed: int = 0
+    total_items: int = 0
+    source_bytes_completed: int = 0
+    total_source_bytes: int = 0
+    finished: bool = False
 
 
 def plan_fingerprint(plan: BuildPlan) -> str:
@@ -187,6 +202,7 @@ class PackageWriter:
         method: QuantMethod = QuantMethod.RTN,
         device: str = "cuda",
         resume: bool = True,
+        download_workers: int = 1,
     ):
         """
         Args:
@@ -197,6 +213,8 @@ class PackageWriter:
             method: Quantizer backend for every component.
             device: ``cuda`` or ``cpu``; falls back to CPU when CUDA is absent.
             resume: Skip work items already recorded in the journal.
+            download_workers: Concurrent remote tensor range fetches. GPU
+                quantization remains single-lane and VRAM-bounded.
         """
         self.plan = plan
         self.output_dir = Path(output_dir)
@@ -205,6 +223,10 @@ class PackageWriter:
         self.method = method
         self.device = device if (device == "cuda" and torch.cuda.is_available()) else "cpu"
         self.resume = resume
+        if download_workers < 1:
+            raise ValueError("download_workers must be at least 1")
+        self.download_workers = int(download_workers)
+        self._peak_inflight_source_bytes = 0
         self.tiler = MatrixTiler(self.budget)
         self._quantizers: Dict[Tuple[float, int, bool], object] = {}
         for codec in self.plan.manifest.codecs.values():
@@ -288,6 +310,46 @@ class PackageWriter:
             journal.model_dump_json(indent=2).encode("utf-8"),
         )
 
+    def resume_status(self) -> ResumeStatus:
+        """Report source work that a restart will skip.
+
+        The package CLI streams source bytes directly into quantized output and
+        intentionally does not keep a second on-disk source cache.  The durable
+        checkpoint is therefore the set of output work items committed in the
+        journal.  Reporting their source sizes lets a resumed progress bar begin
+        at the real position instead of misleadingly returning to zero.
+        """
+        journal = self._load_journal()
+        dense_done, expert_done, ple_done = journal.as_sets()
+
+        dense_completed = [
+            item for item in self.plan.dense if item.address.name in dense_done
+        ]
+        expert_completed = [
+            item for item in self.plan.experts if item.record_index in expert_done
+        ]
+        ple_completed = (
+            [item for item in self.plan.ple.shards if item.shard_index in ple_done]
+            if self.plan.ple
+            else []
+        )
+
+        source_bytes_completed = sum(item.address.size_bytes for item in dense_completed)
+        source_bytes_completed += sum(
+            item.expert_slice.source_bytes for item in expert_completed
+        )
+        source_bytes_completed += sum(item.address.size_bytes for item in ple_completed)
+
+        return ResumeStatus(
+            items_completed=(
+                len(dense_completed) + len(expert_completed) + len(ple_completed)
+            ),
+            total_items=self.plan.num_work_items,
+            source_bytes_completed=source_bytes_completed,
+            total_source_bytes=self.plan.source_read_bytes,
+            finished=journal.finished,
+        )
+
     def _preflight_disk_space(self) -> None:
         """Require planned region bytes plus 15% headroom on the output volume."""
         probe = self.output_dir
@@ -324,6 +386,83 @@ class PackageWriter:
             # Local: address the parent tensor and slice it zero-copy.
             return self._read_local_slice(source)
         return self.reader.read_tensor(address, chunk_callback=chunk_cb)
+
+    def _iter_dense_tensors(
+        self,
+        pending: Sequence[DenseWorkItem],
+        chunk_cb: Optional[Callable] = None,
+    ) -> Iterator[Tuple[DenseWorkItem, torch.Tensor]]:
+        """Feed one GPU lane from bounded concurrent remote range fetches.
+
+        A source range briefly exists both as downloaded bytes and as a CPU
+        tensor, so each future reserves twice its source byte count. The
+        reservation stays held while the consumer quantizes the tensor; only
+        then may another download enter the pipeline.
+        """
+        is_remote = not hasattr(self.reader, "root_dir")
+        if not is_remote or self.download_workers == 1:
+            for item in pending:
+                yield item, self.reader.read_tensor(item.address, chunk_callback=chunk_cb)
+            return
+
+        staging_limit = int(self.budget.max_cpu_staging_mb * 1024 * 1024)
+        if staging_limit <= 0:
+            raise WriteError("max_cpu_staging_mb must be positive for parallel downloads")
+
+        remaining = iter(pending)
+        next_item = next(remaining, None)
+        inflight: Deque[Tuple[DenseWorkItem, object, int]] = deque()
+        reserved = 0
+        cancel_event = Event()
+        executor = ThreadPoolExecutor(
+            max_workers=self.download_workers,
+            thread_name_prefix="pt-download",
+        )
+
+        def submit_available() -> None:
+            nonlocal next_item, reserved
+            while next_item is not None and len(inflight) < self.download_workers:
+                reservation = max(1, next_item.address.size_bytes * SOURCE_STAGING_COPIES)
+                if reservation > staging_limit:
+                    raise WriteError(
+                        f"{next_item.address.name} needs about "
+                        f"{reservation / (1024 * 1024):.1f} MiB of source staging, "
+                        f"above the {self.budget.max_cpu_staging_mb:.1f} MiB limit. "
+                        "Increase --max-inflight-source or use --download-workers 1."
+                    )
+                if inflight and reserved + reservation > staging_limit:
+                    break
+
+                item = next_item
+                future = executor.submit(
+                    self.reader.read_tensor,
+                    item.address,
+                    chunk_callback=chunk_cb,
+                    cancel_event=cancel_event,
+                )
+                inflight.append((item, future, reservation))
+                reserved += reservation
+                self._peak_inflight_source_bytes = max(
+                    self._peak_inflight_source_bytes, reserved
+                )
+                next_item = next(remaining, None)
+
+        try:
+            submit_available()
+            while inflight:
+                item, future, reservation = inflight.popleft()
+                tensor = future.result()
+                try:
+                    yield item, tensor
+                finally:
+                    del tensor
+                    reserved -= reservation
+                submit_available()
+        finally:
+            cancel_event.set()
+            for _, future, _ in inflight:
+                future.cancel()
+            executor.shutdown(wait=True, cancel_futures=True)
 
     def _read_local_slice(self, source: SourceSlice) -> torch.Tensor:
         """Zero-copy slice out of a memory-mapped local shard."""
@@ -365,38 +504,36 @@ class PackageWriter:
 
         chunk_cb = (lambda n, _: on_bytes(n)) if on_bytes else None
 
-        with open(self.dense_path, "r+b") as blob:
-            for batch in _batches(pending, DENSE_BATCH_ITEMS):
-                committed = []
-                for item in batch:
+        inputs = self._iter_dense_tensors(pending, chunk_cb=chunk_cb)
+        try:
+            with open(self.dense_path, "r+b") as blob:
+                for item, tensor in inputs:
                     if on_start:
                         on_start("dense", item.address.name)
-                    tensor = self.reader.read_tensor(self._address_of(item), chunk_callback=chunk_cb)
                     payload, item_peak = self._encode_dense(item, tensor)
                     peak = max(peak, item_peak)
                     blob.seek(item.byte_offset)
                     blob.write(payload)
                     written += len(payload)
-                    committed.append(
-                        (
-                            item,
-                            ItemChecksum(
-                                value=crc32c_hex(payload),
-                                offset=item.byte_offset,
-                                length=len(payload),
-                            ),
-                        )
+                    checksum = ItemChecksum(
+                        value=crc32c_hex(payload),
+                        offset=item.byte_offset,
+                        length=len(payload),
                     )
-                    del tensor, payload
-                blob.flush()
-                os.fsync(blob.fileno())
-                for item, checksum in committed:
+
+                    # A dense tensor can take minutes to fetch. Commit it before
+                    # the next tensor is consumed so cancellation repeats only
+                    # the item that was actively being processed.
+                    blob.flush()
+                    os.fsync(blob.fileno())
                     journal.dense_done.append(item.address.name)
                     journal.dense_checksums[item.address.name] = checksum
-                self._save_journal(journal)
-                if on_item:
-                    for item, _ in committed:
+                    self._save_journal(journal)
+                    if on_item:
                         on_item("dense", item.address.name)
+                    del tensor, payload
+        finally:
+            inputs.close()
         return written, len(self.plan.dense) - len(pending), peak
 
     def _encode_dense(self, item: DenseWorkItem, tensor: torch.Tensor) -> Tuple[bytes, float]:
@@ -421,7 +558,7 @@ class PackageWriter:
         result, _, peak = self._quantize(matrix, item.bits, item.group_size, item.symmetric)
         return _sections_to_bytes(result, item.spans, item.address.name), peak
 
-    def _materialize_ple_index(self) -> None:
+    def _materialize_ple_index(self, on_bytes: Optional[Callable] = None) -> None:
         """Read exact int64 PLE hash tensors and attach the runtime index.
 
         These values are structural addresses, not model weights. Quantizing one
@@ -441,7 +578,8 @@ class PackageWriter:
             key = next((name for name in expected if address.name.endswith(name)), None)
             if key is None:
                 continue
-            value = self.reader.read_tensor(address)
+            chunk_cb = (lambda n, _: on_bytes(n)) if on_bytes else None
+            value = self.reader.read_tensor(address, chunk_callback=chunk_cb)
             if value.dtype != torch.int64:
                 raise WriteError(
                     f"PLE structural tensor {address.name} must be int64, got {value.dtype}"
@@ -666,7 +804,7 @@ class PackageWriter:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._preflight_disk_space()
         journal = self._load_journal()
-        self._materialize_ple_index()
+        self._materialize_ple_index(on_bytes=on_bytes)
 
         written = skipped = 0
         peak = 0.0
@@ -688,6 +826,10 @@ class PackageWriter:
             items_skipped=skipped,
             bytes_written=written,
             peak_vram_mb=peak,
+            peak_inflight_source_bytes=self._peak_inflight_source_bytes,
+            download_workers=(
+                self.download_workers if not hasattr(self.reader, "root_dir") else 1
+            ),
             elapsed_s=time.perf_counter() - started,
         )
 

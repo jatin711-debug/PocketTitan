@@ -124,6 +124,8 @@ def _fetch_single_shard(
     model_id_or_path: str,
     is_local: bool,
     headers: Optional[Dict[str, str]],
+    revision: Optional[str],
+    strict: bool,
 ) -> Tuple[str, Dict[str, Any], int]:
     """Fetch header for a single shard."""
     if is_local:
@@ -134,10 +136,12 @@ def _fetch_single_shard(
         return shard, header_dict, header_bytes
     else:
         try:
-            url = hf_hub_url(repo_id=model_id_or_path, filename=shard)
+            url = hf_hub_url(repo_id=model_id_or_path, filename=shard, revision=revision)
             header_dict, header_bytes = parse_remote_safetensors_header(url, headers=headers)
             return shard, header_dict, header_bytes
         except Exception:
+            if strict:
+                raise
             return shard, {}, 0
 
 
@@ -148,6 +152,8 @@ def build_tensor_address_table(
     fast_inspect: bool = False,
     max_shards_to_probe: Optional[int] = None,
     max_workers: int = 16,
+    revision: Optional[str] = None,
+    strict: bool = False,
 ) -> TensorAddressTable:
     """Build virtual address table fast using index.json and parallel shard header probes.
 
@@ -160,7 +166,7 @@ def build_tensor_address_table(
         max_shards_to_probe: Explicit limit on number of shards to probe if fast_inspect is active.
         max_workers: Parallel worker thread count for remote HTTP range header requests.
     """
-    model_meta = inspect_model_repository(model_id_or_path, token=token)
+    model_meta = inspect_model_repository(model_id_or_path, token=token, revision=revision)
     table = TensorAddressTable(model_meta)
 
     path = Path(model_id_or_path)
@@ -175,7 +181,15 @@ def build_tensor_address_table(
     num_workers = min(max_workers, max(1, len(target_shards)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
         futures = [
-            executor.submit(_fetch_single_shard, shard, model_id_or_path, is_local, headers)
+            executor.submit(
+                _fetch_single_shard,
+                shard,
+                model_id_or_path,
+                is_local,
+                headers,
+                revision,
+                strict,
+            )
             for shard in target_shards
         ]
 

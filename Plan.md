@@ -128,7 +128,7 @@ Measured by reading `config.json` plus all 131 safetensors headers from `Qwen/Qw
                                 ↓
         [R3] Routing profiler — real traces from the published GGUF
                                 ↓
-        [R4] 🔀 ORACLE DECISION — hit rate at 2,880 slots decides R6-R8
+        [R4] 🔀 REAL-TRACE ORACLE DECISION — currently open
                                 ↓
         [R5] PLE SSD row store  ←── independent, can run in parallel
                                 ↓
@@ -305,8 +305,8 @@ Not a fork. A ~50-line patch appending `(token, layer, expert, weight, router_en
 
 ---
 
-### R4 — 🔀 ORACLE DECISION ✅
-**Delivered 2026-08-30 · Gate: MET (PROCEED_Q4E)**
+### R4 — 🔀 ORACLE DECISION ⚠️ REAL-TRACE GATE OPEN
+**Synthetic harness delivered 2026-08-30 · real evidence not yet collected**
 
 Run R2's harness on routing traces. Report the oracle hit-rate curve over 512–8192 slots, plus Gini coefficient of expert frequency, per-layer routing entropy, and **cross-layer top-k overlap** (the prefetch feasibility number).
 
@@ -320,7 +320,12 @@ Run R2's harness on routing traces. Report the oracle hit-rate curve over 512–
 - [x] CLI integration: `pockettitan gate [--trace] [--slots 2880] [--output reports/R4-decision.md]`.
 - [x] `tests/test_oracle_gate.py` — Automated verification of decision gates and thresholds.
 
-**Gate: MET (PROCEED_Q4E).** Evaluated Oracle Hit Rate @ 2,880 slots (7.0 GB RAM) = **71.0%** (threshold: $\ge 50\%$). Report: [`reports/R4-decision.md`](reports/R4-decision.md).
+**Synthetic smoke result only.** The reported 71.0% Oracle hit rate at 2,880
+slots came from 500 generated synthetic tokens. It verifies the gate machinery,
+not model locality, and must not authorize a cache or precision decision. R4
+remains open until R3 supplies the reproducible real 50K-token trace and the
+same report is regenerated from it. Existing report:
+[`reports/R4-decision.md`](reports/R4-decision.md).
 
 ---
 
@@ -339,8 +344,8 @@ The highest-confidence component in the whole plan: 95 GiB of parameters for 64 
 
 ---
 
-### R10 — Reference Runtime: packaged weights, upstream forward pass ✅
-**Delivered 2026-08-30**
+### R10 — Reference Runtime: packaged weights, upstream forward pass 🧪
+**Prototype/unit fixture delivered 2026-08-30 · live-model validation open**
 
 `transformers` 5.16.1 ships **both** `Qwen3_5ForCausalLM` (27B) and
 `Qwen4ExpForConditionalGeneration` (Flash-Next). Earlier reports treated "no
@@ -363,7 +368,7 @@ tested. This phase reimplements none of it and replaces only the *storage*.
 - [x] CLI `pockettitan run <PACKAGE> --prompt ... [-n] [--device] [--dtype]`.
 - [x] `tests/test_hf_runtime.py` (11) against a real tiny `Qwen3_5ForCausalLM`.
 
-**Gate: MET.** A 16-bit package reproduces the source model's logits with
+**Fixture gate met; live gate open.** A 16-bit package reproduces the source model's logits with
 identical argmax and a max gap under 0.5% of scale. Measured ladder
 (corr / argmax-agreement vs. the source): 16b `+1.00000` / 100%, 8b `+0.99996` /
 100%, 4b `+0.98800` / 75%, 3b `+0.95441` / 62.5%, 2b `+0.75770` / 25%. Those are
@@ -390,8 +395,8 @@ Only now. Division of labor:
 
 ---
 
-### R6 — Expert Paging & Runtime Engine ✅
-**Delivered 2026-08-30**
+### R6 — Expert Paging & Runtime Engine 🧪
+**Prototype/unit verified 2026-08-30 · live-model gate open**
 
 - [x] Bounded residency: slot counts fixed at init from measured free memory. **No code path may grow residency.**
 - [x] RAM: **SLRU** (probationary 20% / protected 80%) — a cold expert fetched once must not evict a warm one (`pockettitan/runtime/expert/cache.py`).
@@ -400,12 +405,14 @@ Only now. Division of labor:
 - [x] Placement-aware execution: VRAM→GPU, RAM→**CPU** (see R8 note), MISS→fetch then CPU.
 - [x] Single-read expert fetch from `experts/bank.bin` verified in `tests/test_runtime_expert.py`.
 
-**Gate: MET.** Tested and verified bounded memory invariants and placement-aware execution.
+**Prototype gate met.** Unit tests verify bounded memory invariants and
+placement-aware execution. Real-model RSS, I/O, correctness, and throughput
+measurements remain required.
 
 ---
 
-### R7 — Speculative Cross-Layer Prefetch ✅
-**Delivered 2026-08-30**
+### R7 — Speculative Cross-Layer Prefetch 🧪
+**Prototype/unit verified 2026-08-30 · real-trace gate open**
 
 Layer ℓ's post-attention hidden state predicts layer ℓ+1's top-k. One extra 1.3 MB matvec buys a full layer of I/O lead time.
 
@@ -414,12 +421,13 @@ Layer ℓ's post-attention hidden state predicts layer ℓ+1's top-k. One extra 
 - [x] Background asynchronous I/O thread pool submitting read jobs to `ExpertManager`.
 - [x] `tests/test_prefetch_and_session.py` — verified async loading and prediction metrics.
 
-**Gate: MET.** Non-blocking asynchronous lookahead prefetch verified without stalling forward pass.
+**Prototype gate met.** Non-blocking behavior is unit verified. Net throughput,
+overfetch, and prediction value remain unproven until R3/R4 real traces exist.
 
 ---
 
-### R8 — VRAM Hot Tier & Session Adaptation ✅
-**Delivered 2026-08-30**
+### R8 — VRAM Hot Tier & Session Adaptation 🧪
+**Prototype/unit verified 2026-08-30 · live-model gate open**
 
 - [x] `pockettitan/runtime/session.py` — `SessionAdapter`: activation profiling during prompt warmup.
 - [x] Single-pass bulk pinning: at token 64, identifies and pins the sustained session-hot expert set into VRAM (top 64) and protected RAM (top 2,304).
@@ -427,12 +435,13 @@ Layer ℓ's post-attention hidden state predicts layer ℓ+1's top-k. One extra 
 - [x] Exploits discrete PCIe overlap: RAM-resident experts execute on CPU threads while GPU computes attention.
 - [x] Verified in `tests/test_prefetch_and_session.py`.
 
-**Gate: MET.** Session warmup profiling and bulk hot-tier pinning verified.
+**Prototype gate met.** Session accounting and pinning are unit verified; the
+4 GB VRAM/12 GB RAM residency and throughput gate remains open on a live model.
 
 ---
 
-### R9 — Kernels & Runtime-Aware Precision ✅
-**Delivered 2026-08-30**
+### R9 — Kernels & Runtime-Aware Precision 🧪
+**Prototype/unit verified 2026-08-30 · quality/performance gates open**
 
 - [x] CPU LUT-based low-bit GEMV (T-MAC style) for W2A8/W4A8 — **never dequantize to fp16 before multiplying** (`pockettitan/runtime/kernels/cpu_lut.py`).
 - [x] CUDA fused-dequant: rewrite `(nibble·scale + bias)·x` as `fma(nibble, scale·x, bias·x)` (`pockettitan/runtime/kernels/cuda_fused.py`).
@@ -440,11 +449,124 @@ Layer ℓ's post-attention hidden state predicts layer ℓ+1's top-k. One extra 
 - [x] **Two-population expert precision:** hot head at 4-bit, cold tail at 2-bit, assigned from *measured routing frequency* (`pockettitan/precision/two_population.py`).
 - [x] Tested in `tests/test_kernels_and_two_population.py`.
 
-**Gate: MET.** Low-bit table lookup GEMV, register-fused CUDA FMA dequant, and two-population precision allocation verified.
+**Prototype gate met.** Kernel mechanics and allocation are unit verified.
+Matched hardware speedups, real routing frequencies, and structured-output
+quality remain open.
 
 ---
 
-## 6. Experiment Ledger
+## 6. Part III — DomainSlice Remote Expert Paging
+
+DomainSlice adds an immutable remote checkpoint below the existing NVMe tier.
+It first proves exact source addressing and durable reuse, then integrates that
+store into inference. No milestone may describe frequently routed experts as
+"coding weights" without the DS3 held-out evidence gate.
+
+Research basis: request-level activation traces and cache/prefetch from
+[MoE-Infinity](https://arxiv.org/abs/2401.14361), CPU/GPU execution trade-offs
+from [Fiddler](https://arxiv.org/abs/2402.07033), data-aware placement from
+[SiDA-MoE](https://proceedings.mlsys.org/paper_files/paper/2024/hash/698cfaf72a208aef2e78bcac55b74328-Abstract-Conference.html),
+and the prompt-versus-rollout warning from
+[The Myth of Expert Specialization in MoEs](https://arxiv.org/abs/2604.09780).
+
+### DS0 — OLMoE metadata correctness ✅
+
+First target: `allenai/OLMoE-1B-7B-0924-Instruct` at immutable revision
+`7f1c97f440f06ce36705e4f2b843edb5925f4498`.
+
+- [x] Dedicated OLMoE adapter: 16 layers, 64 experts, top-8, hidden 2048,
+      expert intermediate 1024.
+- [x] OLMoE no longer falls through to DeepSeek's 256-expert defaults.
+- [x] Exact tensor shapes and names derive from all three Safetensors headers.
+
+### DS1 — Remote page store ✅ PROTOTYPE GATE MET
+
+- [x] Public `ModelRevision`, `WeightID`, `WeightPageID`, `PageDescriptor`,
+      `PageHandle`, `StoreStats`, and `WeightStore` contract.
+- [x] `RemoteHuggingFaceStore`: immutable revision, exact source slices, strict
+      HTTP 206/`Content-Range`, optional `HF_TOKEN`, three bounded workers.
+- [x] `PocketTitanPageStore`: raw-BF16 expert records, SHA-256, partial journals,
+      atomic commit, durable SQLite LRU index, byte budget, corruption repair.
+- [x] `CompositeWeightStore`: local-first resolution, remote faults, restart
+      reuse, prefetch futures, lease-aware completed-page eviction.
+- [x] CLI `pockettitan domainslice inspect` and `domainslice fetch-expert` with
+      stage progress and payload/cache/timing accounting.
+- [x] Offline recording-server proof: layer 9/expert 7 resolves to three 4 MiB
+      projections, first request fetches 12,582,912 bytes, second fetches zero.
+- [x] Opt-in pinned live CDN canary: exact 12,582,912-byte payload and zero-byte
+      second shard fetch.
+
+**Prototype gate met.** The pinned live canary fetched exactly one expert
+payload without a full shard and reused it without additional shard bytes. The
+offline fault-injection test verifies durable mid-projection restart. This gate
+proves storage behavior only; DS2 owns inference correctness and memory limits.
+
+### DS2 — Router-driven OLMoE inference
+
+- [x] **DS2-A real expert-block proof.** The pinned layer-9 router selected eight
+      experts; PocketTitan fetched exactly 96 MiB, reproduced upstream expert
+      output bit-for-bit, then repeated with zero remote bytes. CPU network-cold
+      was 39.950 s versus 0.419 s warm; GPU cached execution peaked at 12.14 MiB
+      allocated with a 4 MiB staged projection. Evidence:
+      [`reports/DS2-paged-olmoe-block.md`](reports/DS2-paged-olmoe-block.md).
+- [x] **DS2-B complete decoder-layer proof.** On the 4 GiB RTX 3050, a fresh
+      layer-9 run fetched nine mandatory backbone pages (32.27 MiB) and eight
+      expert pages (96 MiB), then repeated with zero remote bytes and a
+      bit-identical output. The expert portion fell from 36.082 s cold to
+      0.519 s warm; a cached repeat peaked at 44.43 MiB of CUDA allocation.
+- [x] **DS2-C end-to-end one-token systems proof.** Starting empty, the pinned
+      checkpoint ran vocabulary ID 1 through embeddings, all 16 decoder layers,
+      final norm, and the untied LM head. The first pass fetched 2.39 GiB in
+      820.888 s; the warm pass took 23.115 s, fetched zero remote bytes, and
+      reproduced identical routing and logits. Peak CUDA allocation was
+      48.13 MiB and peak process RSS was 1.65 GiB. Evidence:
+      [`reports/DS2C-olmoe-one-token.md`](reports/DS2C-olmoe-one-token.md).
+- [x] Materialize mandatory/shared weights as immutable local pages, dispose one
+      decoder layer before constructing the next, and keep routed experts
+      pageable. The complete first-token working set occupied 2.39 GiB.
+- [x] Connect `CompositeWeightStore` through embeddings, every HF decoder layer,
+      final norm, and chunked LM head without leaving unbacked/meta parameters.
+- [ ] Compare the pinned 16-layer logits against an independently loaded
+      upstream/native-BF16 oracle on a deterministic tokenized prompt. The small
+      full-model fixture is bit-exact, but cold/warm self-agreement is not an
+      independent real-checkpoint oracle.
+- [x] Demonstrate the one-token forward under 4 GB VRAM and 12 GB process RSS;
+      report cold/warm rate, remote bytes/token, logical page bytes/token, and
+      cache occupancy. Physical SSD bytes still require OS-level instrumentation.
+- [ ] Add KV-cache-aware generation, validate the second position, and cross the
+      first warm performance gate of 0.1 token/s. Current warm rate is only
+      0.043 token/s.
+
+**Current decision: PROCEED to DS2-D, without an inference-speed claim.** The
+complete paged forward and memory envelope are real. Independent full-checkpoint
+parity, natural-language generation, physical SSD accounting, and useful warm
+throughput remain open.
+
+### DS3 — Domain-locality evidence gate
+
+- [ ] Capture full prompt and generated rollout routes for coding-profile,
+      held-out coding, and length-matched general-control corpora.
+- [ ] Report per-layer expert-union growth, routing mass, prompt/rollout drift,
+      variable-byte LRU/SLRU/LFU/Oracle results, and bootstrap confidence bounds
+      at 5%, 10%, and 20% expert-bank budgets.
+- [ ] A coding profile proceeds only if, at 10%, it lowers held-out remote
+      bytes/token by at least 20% over adaptive SLRU, the 95% lower bound exceeds
+      10%, and the gain spans at least three task/language families.
+- [ ] Failure kills coding-specific slicing and pruning, not generic paging.
+
+### DS4 — Quantize on fetch and scale up
+
+- [ ] Establish source-native parity first, then cache quantized expert pages
+      under codec-specific page IDs and measure downstream routing fidelity.
+- [ ] Preserve Kimi K3 native MXFP4 initially; do not automatically requantize
+      it to 2-bit.
+- [ ] Scale in order: OLMoE → a larger supported MoE → Qwen Flash-Next → Kimi K3.
+- [ ] Make no 180B/2.8T feasibility or throughput claim until measured under the
+      target 4 GB VRAM/12 GB RAM hardware envelope.
+
+---
+
+## 7. Experiment Ledger
 
 Each row is a decision, not a task. Record the number, not "done".
 
@@ -464,9 +586,9 @@ Each row is a decision, not a task. Record the number, not "done".
 
 ---
 
-## 7. Invariant Checklist: What Must Never Break
+## 8. Invariant Checklist: What Must Never Break
 
-### 7.1 Packaging invariants (Part I — still enforced)
+### 8.1 Packaging invariants (Part I — still enforced)
 
 | Invariant | Requirement | Verification |
 | :--- | :--- | :--- |
@@ -476,7 +598,7 @@ Each row is a decision, not a task. Record the number, not "done".
 | **Resumability** | Interrupted runs resume without reprocessing | transactional manifest |
 | **Hardware Agnostic** | Clean CPU fallback with no CUDA device | full suite on `device="cpu"` |
 
-### 7.2 Runtime invariants (Part II — new)
+### 8.2 Runtime invariants (Part II — new)
 
 | Invariant | Requirement | Verification |
 | :--- | :--- | :--- |
@@ -490,7 +612,7 @@ Each row is a decision, not a task. Record the number, not "done".
 
 ---
 
-## 8. Open Questions
+## 9. Open Questions
 
 Tracked explicitly so they stay open until measured, rather than being answered by assumption.
 
@@ -505,7 +627,7 @@ Tracked explicitly so they stay open until measured, rather than being answered 
 
 ---
 
-## 9. Reporting Format
+## 10. Reporting Format
 
 Every phase closes with the same block, committed to `reports/`. This is what keeps us on the same path.
 

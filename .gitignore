@@ -98,3 +98,5 @@ qwen*_full/
 qwen*_int8/
 qwen*_q4e/
 qwen*_bf16/
+olmoe-cache/
+*_cache/

@@ -21,6 +21,27 @@ from pockettitan.runtime.hf.weights import (
     PackageWeights,
     WeightNotFound,
 )
+from pockettitan.runtime.hf.olmoe_paged import (
+    ExpertPageTensors,
+    PagedExpertError,
+    PagedExpertMetrics,
+    PagedOlmoeExperts,
+    PagedOlmoeSparseMoeBlock,
+    replace_olmoe_sparse_moe,
+)
+from pockettitan.runtime.hf.olmoe_layer import (
+    BackboneLoadMetrics,
+    PagedLayerError,
+    build_paged_olmoe_decoder_layer,
+    load_raw_tensor_page,
+)
+from pockettitan.runtime.hf.olmoe_model import (
+    PagedModelError,
+    PagedOlmoeOneTokenRunner,
+    SequentialLayerMetrics,
+    SequentialPassMetrics,
+)
+from pockettitan.runtime.hf.olmoe_reference import TransformersOlmoeExpertsFromPages
 
 __all__ = [
     "DEFAULT_HEAD_CHUNK",
@@ -31,6 +52,21 @@ __all__ = [
     "PackagedEmbedding",
     "PackagedLinear",
     "WeightNotFound",
+    "ExpertPageTensors",
+    "PagedExpertError",
+    "PagedExpertMetrics",
+    "PagedOlmoeExperts",
+    "PagedOlmoeSparseMoeBlock",
+    "replace_olmoe_sparse_moe",
+    "BackboneLoadMetrics",
+    "PagedLayerError",
+    "build_paged_olmoe_decoder_layer",
+    "load_raw_tensor_page",
+    "PagedModelError",
+    "PagedOlmoeOneTokenRunner",
+    "SequentialLayerMetrics",
+    "SequentialPassMetrics",
+    "TransformersOlmoeExpertsFromPages",
     "build_causal_lm",
     "generate",
     "load_tokenizer",

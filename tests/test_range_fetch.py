@@ -17,7 +17,11 @@ import numpy as np
 import pytest
 
 from pockettitan.config import TensorAddress, TruncatedTensorError
-from pockettitan.metadata.safetensors_header import IncompleteRangeRead, fetch_remote_bytes
+from pockettitan.metadata.safetensors_header import (
+    IncompleteRangeRead,
+    RangeResponseError,
+    fetch_remote_bytes,
+)
 from pockettitan.streaming.reader import RemoteTensorSliceReader
 
 PAYLOAD = bytes((i * 7 + 3) % 256 for i in range(64 * 1024))
@@ -49,6 +53,7 @@ class _Server:
 
                 self.send_response(206)
                 self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Range", f"bytes {start}-{end}/{len(payload)}")
                 # Advertise the full range: a truncating proxy does not announce it.
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
@@ -78,6 +83,63 @@ def test_a_complete_range_is_returned_verbatim():
     with _Server() as server:
         got = fetch_remote_bytes(server.url, 0, len(PAYLOAD) - 1, timeout=10)
     assert got == PAYLOAD
+
+
+def test_a_server_that_ignores_range_fails_closed():
+    payload = PAYLOAD
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    httpd = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    host, port = httpd.server_address[:2]
+    try:
+        with pytest.raises(RangeResponseError, match="possible full-shard download"):
+            fetch_remote_bytes(f"http://{host}:{port}/shard", 0, 15)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_a_malformed_content_range_fails_closed():
+    payload = PAYLOAD
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            self.send_response(206)
+            self.send_header("Content-Range", "not-a-range")
+            self.end_headers()
+            self.wfile.write(payload[:16])
+
+    httpd = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    host, port = httpd.server_address[:2]
+    try:
+        secret = "hf_do_not_log_this_token"
+        with pytest.raises(RangeResponseError, match="Malformed") as caught:
+            fetch_remote_bytes(
+                f"http://{host}:{port}/shard",
+                0,
+                15,
+                headers={"Authorization": f"Bearer {secret}"},
+            )
+        assert secret not in str(caught.value)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
 
 
 def test_a_truncated_response_resumes_from_where_it_stopped():
@@ -128,6 +190,15 @@ def test_progress_is_reported_once_per_byte_not_once_per_attempt():
         )
     assert sum(n for n, _ in seen) == len(PAYLOAD)
     assert {total for _, total in seen} == {len(PAYLOAD)}
+
+
+def test_range_fetch_can_be_cancelled_before_opening_a_request():
+    cancel = threading.Event()
+    cancel.set()
+    with _Server() as server:
+        with pytest.raises(InterruptedError, match="Cancelled range fetch"):
+            fetch_remote_bytes(server.url, 0, len(PAYLOAD) - 1, cancel_event=cancel)
+        assert server.requests == []
 
 
 # --------------------------------------------------------------------------- #

@@ -117,6 +117,7 @@ class RemoteTensorSliceReader:
         self,
         tensor_addr: TensorAddress,
         chunk_callback: Optional[Callable[[int, int], None]] = None,
+        cancel_event=None,
     ) -> torch.Tensor:
         """Fetch exact tensor bytes over network using HTTP Range header."""
         url = hf_hub_url(
@@ -130,6 +131,7 @@ class RemoteTensorSliceReader:
             byte_end=tensor_addr.byte_end - 1,
             headers=self.headers,
             chunk_callback=chunk_callback,
+            cancel_event=cancel_event,
         )
         return self._bytes_to_tensor(raw_bytes, tensor_addr.dtype, tensor_addr.shape)
 

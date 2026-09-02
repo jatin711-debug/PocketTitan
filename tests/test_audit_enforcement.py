@@ -14,6 +14,7 @@ from pockettitan.config import (
 from pockettitan.models.adapters import (
     DeepSeekAdapter,
     GLM5NextAdapter,
+    OLMoEAdapter,
     get_model_adapter,
 )
 from pockettitan.models.layout import (
@@ -102,6 +103,34 @@ def test_deepseek_and_moe_adapters():
     assert moe["num_experts"] == 256
     assert moe["first_k_dense_replace"] == 3
     assert moe["shared_expert_intermediate_size"] == 2048
+
+
+def test_olmoe_uses_checkpoint_values_instead_of_deepseek_defaults():
+    config = {
+        "architectures": ["OlmoeForCausalLM"],
+        "model_type": "olmoe",
+        "hidden_size": 2048,
+        "num_hidden_layers": 16,
+        "num_attention_heads": 16,
+        "num_key_value_heads": 16,
+        "intermediate_size": 1024,
+        "num_experts": 64,
+        "num_experts_per_tok": 8,
+        "vocab_size": 50304,
+        "torch_dtype": "bfloat16",
+    }
+    adapter = get_model_adapter(config)
+    assert isinstance(adapter, OLMoEAdapter)
+    assert adapter.extract_dimensions()["num_hidden_layers"] == 16
+    assert adapter.extract_dimensions()["hidden_size"] == 2048
+    assert adapter.extract_moe_topology() == {
+        "is_moe": True,
+        "num_experts": 64,
+        "num_experts_per_tok": 8,
+        "expert_intermediate_size": 1024,
+        "shared_expert_intermediate_size": None,
+        "first_k_dense_replace": None,
+    }
 
 
 # ---------------------------------------------------------------------------

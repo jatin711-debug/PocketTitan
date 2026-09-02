@@ -67,6 +67,7 @@ from pockettitan.package.writer import (
     BuildJournal,
     BuildResult,
     PackageWriter,
+    ResumeStatus,
     WriteError,
     plan_fingerprint,
 )
@@ -142,6 +143,7 @@ __all__ = [
     "PackageWriter",
     "BuildJournal",
     "BuildResult",
+    "ResumeStatus",
     "WriteError",
     "plan_fingerprint",
     "DENSE_BLOB_NAME",

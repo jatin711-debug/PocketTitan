@@ -1,10 +1,19 @@
 """Fast binary header parser for Safetensors files (Milestone 0)."""
 
 import json
+import re
 import struct
 import urllib.request
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Optional, Protocol, Tuple, Union
+
+
+class CancellationSignal(Protocol):
+    """Small subset shared by ``threading.Event`` and test doubles."""
+
+    def is_set(self) -> bool: ...
+
+    def wait(self, timeout: Optional[float] = None) -> bool: ...
 
 
 class RedirectRangeHandler(urllib.request.HTTPRedirectHandler):
@@ -21,6 +30,33 @@ class RedirectRangeHandler(urllib.request.HTTPRedirectHandler):
             if val is not None:
                 new_req.add_unredirected_header(header_name, val)
         return new_req
+
+
+class RangeResponseError(ValueError):
+    """An HTTP origin did not honor the exact byte range PocketTitan requested."""
+
+
+_CONTENT_RANGE_RE = re.compile(r"^bytes\s+(\d+)-(\d+)/(?:\d+|\*)$", re.IGNORECASE)
+
+
+def _validate_range_response(response, requested_start: int, requested_end: int) -> None:
+    """Fail closed if a server ignores or rewrites an exact Range request."""
+    status = getattr(response, "status", None) or response.getcode()
+    if status != 206:
+        raise RangeResponseError(
+            f"Remote server ignored byte range [{requested_start}, {requested_end}] "
+            f"and returned HTTP {status}; refusing a possible full-shard download"
+        )
+    value = response.headers.get("Content-Range", "")
+    match = _CONTENT_RANGE_RE.match(value.strip())
+    if match is None:
+        raise RangeResponseError(f"Malformed or missing Content-Range header: {value!r}")
+    actual_start, actual_end = int(match.group(1)), int(match.group(2))
+    if (actual_start, actual_end) != (requested_start, requested_end):
+        raise RangeResponseError(
+            f"Requested bytes [{requested_start}, {requested_end}] but server returned "
+            f"Content-Range [{actual_start}, {actual_end}]"
+        )
 
 
 def parse_safetensors_header_from_bytes(data: bytes) -> Tuple[Dict[str, Any], int]:
@@ -68,6 +104,7 @@ def parse_remote_safetensors_header(
 
     req = urllib.request.Request(url, headers=req_headers)
     with opener.open(req, timeout=15) as resp:
+        _validate_range_response(resp, 0, probe_size - 1)
         chunk = resp.read()
 
     if len(chunk) < 8:
@@ -85,6 +122,7 @@ def parse_remote_safetensors_header(
     full_headers["Range"] = f"bytes=8-{total_header_bytes - 1}"
     full_req = urllib.request.Request(url, headers=full_headers)
     with opener.open(full_req, timeout=15) as full_resp:
+        _validate_range_response(full_resp, 8, total_header_bytes - 1)
         header_json_bytes = full_resp.read()
         header_json_str = header_json_bytes.decode("utf-8")
         return json.loads(header_json_str), total_header_bytes
@@ -92,6 +130,94 @@ def parse_remote_safetensors_header(
 
 class IncompleteRangeRead(IOError):
     """The server returned fewer bytes than the requested range, and retries ran out."""
+
+
+def stream_remote_bytes(
+    url: str,
+    byte_start: int,
+    byte_end: int,
+    write_callback: Callable[[bytes], None],
+    headers: Optional[Dict[str, str]] = None,
+    timeout: int = 60,
+    chunk_callback: Optional[Callable[[int, int], None]] = None,
+    max_attempts: int = 6,
+    backoff_seconds: float = 1.5,
+    cancel_event: Optional[CancellationSignal] = None,
+    chunk_size: int = 8 * 1024 * 1024,
+) -> int:
+    """Stream an exact, resumable HTTP range into a bounded caller-owned sink.
+
+    The sink is invoked once per chunk and is never retained by this function.
+    The response must be ``206`` with an exact ``Content-Range``; accepting a
+    ``200`` here could turn a 12 MiB expert fault into a multi-gigabyte shard
+    download.
+    """
+    import time
+
+    total_expected = (byte_end - byte_start) + 1
+    if total_expected <= 0:
+        return 0
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+
+    opener = urllib.request.build_opener(RedirectRangeHandler)
+    received = 0
+    last_error: Optional[BaseException] = None
+
+    for attempt in range(max_attempts):
+        if cancel_event is not None and cancel_event.is_set():
+            raise InterruptedError(f"Cancelled range fetch for {url}")
+        if received >= total_expected:
+            break
+        if attempt:
+            delay = backoff_seconds * (2 ** (attempt - 1))
+            if cancel_event is not None:
+                if cancel_event.wait(delay):
+                    raise InterruptedError(f"Cancelled range fetch for {url}")
+            else:
+                time.sleep(delay)
+
+        request_start = byte_start + received
+        req_headers = {
+            "User-Agent": "PocketTitan/0.1.0",
+            "Range": f"bytes={request_start}-{byte_end}",
+        }
+        if headers:
+            req_headers.update(headers)
+        request = urllib.request.Request(url, headers=req_headers)
+
+        try:
+            response = opener.open(request, timeout=timeout)
+        except OSError as exc:
+            last_error = exc
+            continue
+
+        with response:
+            _validate_range_response(response, request_start, byte_end)
+            while received < total_expected:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise InterruptedError(f"Cancelled range fetch for {url}")
+                try:
+                    block = response.read(min(chunk_size, total_expected - received))
+                except OSError as exc:
+                    last_error = exc
+                    break
+                if not block:
+                    break
+                # Keep sink failures distinct from network failures: replaying a
+                # block after a disk error would duplicate data.
+                write_callback(block)
+                received += len(block)
+                if chunk_callback is not None:
+                    chunk_callback(len(block), total_expected)
+
+    if received != total_expected:
+        raise IncompleteRangeRead(
+            f"{url}: got {received:,} of {total_expected:,} bytes for range "
+            f"[{byte_start}, {byte_end}] after {max_attempts} attempts"
+            + (f"; last error: {last_error!r}" if last_error else "")
+        )
+    return received
 
 
 def fetch_remote_bytes(
@@ -103,6 +229,7 @@ def fetch_remote_bytes(
     chunk_callback: Optional[Callable[[int, int], None]] = None,
     max_attempts: int = 6,
     backoff_seconds: float = 1.5,
+    cancel_event: Optional[CancellationSignal] = None,
 ) -> bytes:
     """Fetch an exact byte range, resuming rather than truncating.
 
@@ -117,51 +244,20 @@ def fetch_remote_bytes(
     178 MB tensor. Only a genuinely exhausted retry budget raises, and it raises
     saying what went wrong.
     """
-    import time
-
-    opener = urllib.request.build_opener(RedirectRangeHandler)
-    total_expected = (byte_end - byte_start) + 1
-    if total_expected <= 0:
-        return b""
-
-    chunks: list = []
-    received = 0
-    last_error: Optional[BaseException] = None
-
-    for attempt in range(max_attempts):
-        if received >= total_expected:
-            break
-        if attempt:
-            time.sleep(backoff_seconds * (2 ** (attempt - 1)))
-
-        req_headers = {
-            "User-Agent": "PocketTitan/0.1.0",
-            "Range": f"bytes={byte_start + received}-{byte_end}",
-        }
-        if headers:
-            req_headers.update(headers)
-        request = urllib.request.Request(url, headers=req_headers)
-
-        try:
-            with opener.open(request, timeout=timeout) as response:
-                chunk_size = 4 * 1024 * 1024  # 4 MiB
-                while received < total_expected:
-                    block = response.read(min(chunk_size, total_expected - received))
-                    if not block:
-                        break
-                    chunks.append(block)
-                    received += len(block)
-                    if chunk_callback is not None:
-                        chunk_callback(len(block), total_expected)
-        except OSError as exc:  # socket resets, timeouts, truncated TLS records
-            last_error = exc
-
-    if received != total_expected:
-        raise IncompleteRangeRead(
-            f"{url}: got {received:,} of {total_expected:,} bytes for range "
-            f"[{byte_start}, {byte_end}] after {max_attempts} attempts"
-            + (f"; last error: {last_error!r}" if last_error else "")
-        )
+    chunks: list[bytes] = []
+    stream_remote_bytes(
+        url,
+        byte_start,
+        byte_end,
+        chunks.append,
+        headers=headers,
+        timeout=timeout,
+        chunk_callback=chunk_callback,
+        max_attempts=max_attempts,
+        backoff_seconds=backoff_seconds,
+        cancel_event=cancel_event,
+        chunk_size=4 * 1024 * 1024,
+    )
     return b"".join(chunks)
 
 

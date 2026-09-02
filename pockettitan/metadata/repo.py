@@ -17,6 +17,25 @@ def is_remote_repo(model_id_or_path: str) -> bool:
     return not path.exists()
 
 
+def resolve_model_revision(
+    model_id_or_path: str,
+    token: Optional[str] = None,
+    revision: Optional[str] = None,
+) -> str:
+    """Resolve a mutable Hub ref to the immutable commit used for addressing.
+
+    Local directories have no Hub commit.  Their caller-supplied revision is
+    retained, otherwise ``local`` is used as an explicit non-Hub identity.
+    """
+    path = Path(model_id_or_path)
+    if path.exists() and path.is_dir():
+        return revision or "local"
+    info = HfApi(token=token).model_info(repo_id=model_id_or_path, revision=revision)
+    if not info.sha:
+        raise ValueError(f"Hugging Face did not return an immutable revision for {model_id_or_path}")
+    return str(info.sha)
+
+
 def _fetch_remote_json(url: str, token: Optional[str] = None) -> Dict[str, Any]:
     """Fetch remote JSON payload directly into memory via HTTP."""
     headers = {"User-Agent": "PocketTitan/0.1.0"}

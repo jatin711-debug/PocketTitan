@@ -66,6 +66,33 @@ class QuantizedResult:
             total += self.codebook.nbytes
         return total
 
+    def to(self, device: torch.device | str, non_blocking: bool = False) -> "QuantizedResult":
+        dev = torch.device(device) if isinstance(device, str) else device
+        return QuantizedResult(
+            packed_weights=self.packed_weights.to(device=dev, non_blocking=non_blocking),
+            scales=self.scales.to(device=dev, non_blocking=non_blocking),
+            zeros=self.zeros.to(device=dev, non_blocking=non_blocking) if self.zeros is not None else None,
+            codebook=self.codebook.to(device=dev, non_blocking=non_blocking) if self.codebook is not None else None,
+            quant_config=self.quant_config,
+            original_shape=self.original_shape,
+            original_dtype=self.original_dtype,
+            bit_width=self.bit_width,
+            device=str(dev),
+        )
+
+    def pin_memory(self) -> "QuantizedResult":
+        return QuantizedResult(
+            packed_weights=self.packed_weights.pin_memory(),
+            scales=self.scales.pin_memory(),
+            zeros=self.zeros.pin_memory() if self.zeros is not None else None,
+            codebook=self.codebook.pin_memory() if self.codebook is not None else None,
+            quant_config=self.quant_config,
+            original_shape=self.original_shape,
+            original_dtype=self.original_dtype,
+            bit_width=self.bit_width,
+            device=self.device,
+        )
+
     def to_packed_tensors(self, name_prefix: str = "weight") -> Dict[str, torch.Tensor]:
         """Convert quantized result to standard named tensors for Safetensors serialization."""
         base_name = (
