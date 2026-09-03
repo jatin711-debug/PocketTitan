@@ -112,18 +112,53 @@ class RTNQuantizer(BaseQuantizer):
         )
         num_groups = padded_in_features // group_size
 
-        q_grouped = unpacked.view(out_features, num_groups, group_size).to(torch.float32)
-        scales = quantized.scales.view(out_features, num_groups, 1).to(torch.float32)
+        target_dtype = quantized.original_dtype
+        q_grouped = unpacked.view(out_features, num_groups, group_size).to(target_dtype)
+        scales = quantized.scales.view(out_features, num_groups, 1).to(target_dtype)
 
         if quantized.zeros is not None:
-            zeros = quantized.zeros.view(out_features, num_groups, 1).to(torch.float32)
+            zeros = quantized.zeros.view(out_features, num_groups, 1).to(target_dtype)
             w_deq = (q_grouped - zeros) * scales
         else:
             max_int = (1 << bits) - 1
             w_deq = (q_grouped - (max_int // 2)) * scales
 
         w_flat = w_deq.view(out_features, padded_in_features)[:, :in_features]
-        return w_flat.view(orig_shape).to(quantized.original_dtype)
+        return w_flat.reshape(orig_shape)
+
+    def dequantize_to(self, quantized: QuantizedResult, out: torch.Tensor) -> torch.Tensor:
+        """Dequantize directly into an existing pre-allocated output tensor."""
+        orig_shape = quantized.original_shape
+        out_features, in_features = matrix_dims(orig_shape)
+        bits = quantized.quant_config.bits
+        group_size = (
+            quantized.quant_config.group_size
+            if quantized.quant_config.group_size > 0
+            else in_features
+        )
+
+        pad_k = (group_size - (in_features % group_size)) % group_size
+        padded_in_features = in_features + pad_k
+
+        unpacked = self._unpack_tensor(
+            quantized.packed_weights, bits, (out_features, padded_in_features)
+        )
+        num_groups = padded_in_features // group_size
+        target_dtype = out.dtype
+
+        q_grouped = unpacked.view(out_features, num_groups, group_size).to(target_dtype)
+        scales = quantized.scales.view(out_features, num_groups, 1).to(target_dtype)
+
+        if quantized.zeros is not None:
+            zeros = quantized.zeros.view(out_features, num_groups, 1).to(target_dtype)
+            w_deq = (q_grouped - zeros) * scales
+        else:
+            max_int = (1 << bits) - 1
+            w_deq = (q_grouped - (max_int // 2)) * scales
+
+        w_flat = w_deq.view(out_features, padded_in_features)[:, :in_features]
+        out.view(-1).copy_(w_flat.reshape(-1))
+        return out
 
     @staticmethod
     def _pack_tensor(tensor: torch.Tensor, bits: int) -> torch.Tensor:

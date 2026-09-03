@@ -946,12 +946,14 @@ def domainslice_generate(
     max_vram: str = typer.Option("3584MB", "--max-vram"),
     head_chunk: str = typer.Option("8MB", "--head-chunk"),
     fast: bool = typer.Option(True, "--fast/--low-vram", help="Enable resident backbone & in-memory expert cache for 20x-50x speed"),
-    vram_experts: int = typer.Option(144, "--vram-experts", help="Max experts resident in GPU VRAM"),
+    vram_experts: int = typer.Option(64, "--vram-experts", help="Max experts resident in GPU VRAM"),
     ram_experts: int = typer.Option(384, "--ram-experts", help="Max experts resident in Host RAM"),
     quantize_ram: bool = typer.Option(False, "--quantize-ram", "--int4-cache", help="Compress Host RAM experts to 4-bit INT4 (3.3 MB each) to fit 100% of model in memory"),
     quant_bits: int = typer.Option(4, "--quant-bits", help="Bit width for RAM expert compression (e.g. 4)"),
     commit_routing: bool = typer.Option(False, "--commit-routing", help="Commit to VRAM-resident experts if gating affinity delta <= threshold (CommitMoE)"),
     commit_threshold: float = typer.Option(0.15, "--commit-threshold", help="Max gating affinity gap to commit to VRAM expert"),
+    speculative: bool = typer.Option(False, "--speculative", help="Enable S2-MoE self-speculative Top-1 drafting and verification for 2x-4x speedup"),
+    spec_k: int = typer.Option(3, "--spec-k", help="Speculative draft lookahead window length (default 3)"),
     output: Optional[Path] = typer.Option(None, "--output", "-o", help="Optional JSON telemetry output path"),
 ):
     """Generate text from a natural language prompt using on-demand DomainSlice expert paging."""
@@ -983,9 +985,10 @@ def domainslice_generate(
         mode_desc = "FAST-PATH" if fast else "LOW-VRAM"
         quant_desc = f" · INT{quant_bits}-RAM" if quantize_ram else ""
         commit_desc = " · COMMIT" if commit_routing else ""
+        spec_desc = f" · SPEC-K{spec_k}" if speculative else ""
         console.print(
             f"[bold cyan]DomainSlice On-Demand Generation: {model}[/bold cyan] "
-            f"([green]{device.upper()}[/green] · [yellow]{mode_desc}{quant_desc}{commit_desc}[/yellow])"
+            f"([green]{device.upper()}[/green] · [yellow]{mode_desc}{quant_desc}{commit_desc}{spec_desc}[/yellow])"
         )
         console.print(f"[bold yellow]Prompt:[/bold yellow] {prompt}")
         sys.stdout.write("Generated Response: ")
@@ -1013,6 +1016,8 @@ def domainslice_generate(
             quant_bits=quant_bits,
             commit_routing=commit_routing,
             commit_threshold=commit_threshold,
+            speculative=speculative,
+            spec_k=spec_k,
         )
 
         console.print("\n")

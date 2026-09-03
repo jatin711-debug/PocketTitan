@@ -140,3 +140,44 @@ def test_expert_memory_cache_quantize_ram(tmp_path):
     assert cos_sim > 0.95
 
 
+def test_expert_vram_arena_lifecycle():
+    from pockettitan.domainslice.fast_cache import ExpertVRAMArena
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    arena = ExpertVRAMArena(
+        capacity=3,
+        gate_up_shape=(8, 8),
+        down_shape=(8, 4),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+
+    # 1. Allocate 3 slots
+    s0 = arena.allocate_slot((0, 10))
+    s1 = arena.allocate_slot((0, 11))
+    s2 = arena.allocate_slot((1, 5))
+    assert len({s0, s1, s2}) == 3
+    assert len(arena.free_slots) == 0
+
+    # 2. Get views and write in-place
+    gu_v, dn_v = arena.get_views(s0)
+    assert gu_v.shape == (8, 8)
+    assert dn_v.shape == (8, 4)
+    gu_v.fill_(1.5)
+    assert (arena.gate_up_pool[s0] == 1.5).all()
+
+    # 3. Free a slot and reallocate
+    freed = arena.free_slot((0, 11))
+    assert freed == s1
+    assert len(arena.free_slots) == 1
+
+    s_new = arena.allocate_slot((2, 99))
+    assert s_new == s1  # Reuses recycled slot!
+    assert len(arena.free_slots) == 0
+
+    # 4. Reset
+    arena.reset()
+    assert len(arena.free_slots) == 3
+
+
+

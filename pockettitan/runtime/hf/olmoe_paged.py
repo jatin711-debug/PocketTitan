@@ -455,16 +455,36 @@ class PagedOlmoeSparseMoeBlock(nn.Module):
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         flattened = hidden_states.reshape(-1, hidden_dim)
         router_logits, top_k_weights, top_k_index = self.gate(flattened)
+        expert_cache = getattr(self.experts, "expert_cache", None)
         if (
             self.commit_routing
-            and self.experts.expert_cache is not None
-            and hasattr(self.experts.expert_cache, "_vram_cache")
+            and expert_cache is not None
+            and hasattr(expert_cache, "_vram_cache")
         ):
             top_k_index, top_k_weights = self._apply_commit_routing(
                 router_logits, top_k_index, top_k_weights
             )
         self.last_top_k_index = top_k_index.detach()
         self.last_top_k_weights = top_k_weights.detach()
+
+        # APEX Inter-Layer Lookahead: Asynchronously prefetch Layer L+1 candidates on background CUDA stream
+        layer_idx = getattr(self.experts, "layer_idx", None)
+        if (
+            expert_cache is not None
+            and hasattr(expert_cache, "prefetch_batch")
+            and layer_idx is not None
+            and layer_idx < 15
+        ):
+            next_layer = layer_idx + 1
+            predicted_candidates = top_k_index[0].tolist()
+            expert_cache.prefetch_batch(
+                self.experts.model_revision,
+                next_layer,
+                predicted_candidates,
+                target_device=self.experts.execution_device,
+                dtype=self.experts.compute_dtype,
+            )
+
         return self.experts(flattened, top_k_index, top_k_weights).reshape(
             batch_size, sequence_length, hidden_dim
         )

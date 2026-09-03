@@ -56,6 +56,8 @@ class DomainSliceGenerateResult:
     final_kv_cache_bytes: int = 0
     vram_cache_hits: int = 0
     ram_cache_hits: int = 0
+    speculative_drafted: int = 0
+    speculative_accepted: int = 0
 
     def summary_lines(self) -> List[str]:
         lines = [
@@ -70,6 +72,11 @@ class DomainSliceGenerateResult:
         if self.vram_cache_hits > 0 or self.ram_cache_hits > 0:
             lines.append(
                 f"In-memory hits: {self.vram_cache_hits} VRAM (Tier 1) · {self.ram_cache_hits} Host RAM (Tier 2)"
+            )
+        if self.speculative_drafted > 0:
+            rate = 100.0 * self.speculative_accepted / max(1, self.speculative_drafted)
+            lines.append(
+                f"Speculative decoding: {self.speculative_accepted} accepted / {self.speculative_drafted} drafted ({rate:.1f}% acceptance)"
             )
         lines.extend([
             f"Experts executed: {self.experts_executed:,}",
@@ -120,12 +127,14 @@ def generate_olmoe_text(
     config=None,
     resident_backbone: bool = True,
     expert_cache: Optional[Any] = None,
-    vram_expert_capacity: int = 144,
+    vram_expert_capacity: int = 64,
     ram_expert_capacity: int = 384,
     quantize_ram: bool = False,
     quant_bits: int = 4,
     commit_routing: bool = False,
     commit_threshold: float = 0.15,
+    speculative: bool = False,
+    spec_k: int = 3,
 ) -> DomainSliceGenerateResult:
     """Generate multi-token response for a prompt from on-demand paged OLMoE weights."""
     from transformers import AutoTokenizer
@@ -268,36 +277,75 @@ def generate_olmoe_text(
     current_logits = last_logits
     generated_ids: List[int] = []
 
-    for step in range(max_new_tokens):
-        pos = len(prompt_tokens) + step
-        next_tok = _sample_next_token(current_logits, temperature=temperature, top_p=top_p)
+    if speculative and resident_backbone:
+        from pockettitan.domainslice.speculative import SpeculativeMoEDecoder
 
-        if next_tok in eos_token_ids:
-            break
+        spec_decoder = SpeculativeMoEDecoder(runner, spec_k=spec_k, draft_top_k=1)
+        curr_tok = _sample_next_token(current_logits, temperature=temperature, top_p=top_p)
+        if curr_tok not in eos_token_ids:
+            generated_ids.append(curr_tok)
+            chunk = tokenizer.decode([curr_tok], skip_special_tokens=False)
+            if stream_callback is not None:
+                stream_callback(chunk)
+            if token_callback is not None:
+                token_callback(curr_tok, chunk)
 
-        generated_ids.append(next_tok)
-        chunk = tokenizer.decode([next_tok], skip_special_tokens=False)
+        while len(generated_ids) < max_new_tokens:
+            pos = len(prompt_tokens) + len(generated_ids) - 1
+            curr_id = generated_ids[-1]
+            step_res = spec_decoder.generate_step(
+                current_token_id=curr_id,
+                position_id=pos,
+                past_key_values=kv_cache,
+            )
+            hit_eos = False
+            for tok in step_res.accepted_tokens:
+                if tok in eos_token_ids:
+                    hit_eos = True
+                    break
+                generated_ids.append(tok)
+                chunk = tokenizer.decode([tok], skip_special_tokens=False)
+                if stream_callback is not None:
+                    stream_callback(chunk)
+                if token_callback is not None:
+                    token_callback(tok, chunk)
+                if len(generated_ids) >= max_new_tokens:
+                    break
+            if hit_eos:
+                break
+        res.speculative_drafted = spec_decoder.total_drafted
+        res.speculative_accepted = spec_decoder.total_accepted
+    else:
+        for step in range(max_new_tokens):
+            pos = len(prompt_tokens) + step
+            next_tok = _sample_next_token(current_logits, temperature=temperature, top_p=top_p)
 
-        if stream_callback is not None:
-            stream_callback(chunk)
-        if token_callback is not None:
-            token_callback(next_tok, chunk)
+            if next_tok in eos_token_ids:
+                break
 
-        if step == max_new_tokens - 1:
-            break
+            generated_ids.append(next_tok)
+            chunk = tokenizer.decode([next_tok], skip_special_tokens=False)
 
-        current_logits, pass_metrics = runner.run(
-            next_tok,
-            position_id=pos,
-            past_key_values=kv_cache,
-            use_cache=True,
-            layer_callback=(
-                (lambda item, p=pos: layer_callback("decode", p, item))
-                if layer_callback is not None
-                else None
-            ),
-        )
-        accumulate_pass(pass_metrics)
+            if stream_callback is not None:
+                stream_callback(chunk)
+            if token_callback is not None:
+                token_callback(next_tok, chunk)
+
+            if step == max_new_tokens - 1:
+                break
+
+            current_logits, pass_metrics = runner.run(
+                next_tok,
+                position_id=pos,
+                past_key_values=kv_cache,
+                use_cache=True,
+                layer_callback=(
+                    (lambda item, p=pos: layer_callback("decode", p, item))
+                    if layer_callback is not None
+                    else None
+                ),
+            )
+            accumulate_pass(pass_metrics)
 
     res.decode_elapsed_s = time.perf_counter() - decode_start_time
     res.decode_tok_per_s = (
